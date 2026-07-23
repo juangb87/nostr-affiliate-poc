@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
-import hmac
 import json
 import os
 import secrets
+import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 
 from fastapi import Cookie, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
+from nostr_sdk import Client, EventBuilder, Keys, Kind, RelayUrl, Tag
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
@@ -17,11 +19,12 @@ from sqlalchemy.engine import Engine
 APP_SECRET = os.getenv("APP_SECRET", "dev-secret-change-me")
 BASE_URL = os.getenv("BASE_URL", "http://localhost:8000").rstrip("/")
 DEFAULT_DESTINATION = os.getenv("DEFAULT_DESTINATION_URL", "https://example.com/checkout")
+DEFAULT_RELAYS = "wss://nos.lol,wss://relay.damus.io,wss://relay.primal.net"
 
 app = FastAPI(
     title="Nostr Affiliate POC",
-    description="MVP: campaign → enrollment → redirect click → conversion → Nostr-style proof → pending Lightning payout.",
-    version="0.2.0",
+    description="MVP: campaign → enrollment → redirect click → conversion → real Nostr proof → pending Lightning payout.",
+    version="0.3.0",
 )
 
 _ENGINE: Engine | None = None
@@ -34,7 +37,6 @@ def now() -> str:
 
 def database_url() -> str:
     url = os.getenv("DATABASE_URL", "sqlite:///./data/poc.db")
-    # Railway/Postgres providers often expose postgres://; SQLAlchemy wants postgresql+psycopg://.
     if url.startswith("postgres://"):
         url = "postgresql+psycopg://" + url[len("postgres://") :]
     elif url.startswith("postgresql://"):
@@ -69,16 +71,121 @@ def sha(value: str) -> str:
     return "sha256:" + hashlib.sha256(value.encode()).hexdigest()
 
 
-def sign_payload(payload: dict[str, Any]) -> str:
-    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    return hmac.new(APP_SECRET.encode(), raw.encode(), hashlib.sha256).hexdigest()
+def nostr_relays() -> list[str]:
+    raw = os.getenv("NOSTR_RELAYS", DEFAULT_RELAYS)
+    return [r.strip() for r in raw.split(",") if r.strip()]
 
 
-def nostr_event(kind: int, tags: list[list[str]], content: str = "") -> dict[str, Any]:
-    payload = {"kind": kind, "tags": tags, "content": content, "created_at": now()}
-    sig = sign_payload(payload)
-    event_id = hashlib.sha256((json.dumps(payload, sort_keys=True) + sig).encode()).hexdigest()
-    return {"id": event_id, "sig": sig, **payload, "relay_status": "mock_not_published"}
+def nostr_publish_enabled() -> bool:
+    explicit = os.getenv("NOSTR_PUBLISH")
+    if explicit is not None:
+        return explicit.lower() in {"1", "true", "yes", "on"}
+    return bool(os.getenv("NOSTR_PRIVATE_KEY"))
+
+
+def nostr_keys() -> Keys:
+    secret = os.getenv("NOSTR_PRIVATE_KEY")
+    if secret:
+        return Keys.parse(secret)
+    # Deterministic dev key for local tests only. Production should set NOSTR_PRIVATE_KEY.
+    derived = hashlib.sha256((APP_SECRET + ":nostr-dev-key").encode()).hexdigest()
+    return Keys.parse(derived)
+
+
+def build_nostr_event(kind: int, tags: list[list[str]], content: str = "") -> dict[str, Any]:
+    keys = nostr_keys()
+    event = EventBuilder(Kind(kind), content).tags([Tag.parse(t) for t in tags]).sign_with_keys(keys)
+    data = json.loads(event.as_json())
+    data["relay_status"] = "pending_publication" if nostr_publish_enabled() else "signed_not_published"
+    return data
+
+
+async def _publish_event(event_json: dict[str, Any], relays: list[str]) -> list[dict[str, str]]:
+    from nostr_sdk import Event
+
+    client = Client()
+    relay_urls: list[RelayUrl] = []
+    for relay in relays:
+        try:
+            relay_url = RelayUrl.parse(relay)
+            relay_urls.append(relay_url)
+            await client.add_relay(relay_url)
+        except Exception as exc:  # pragma: no cover - depends on external input
+            pass
+    if not relay_urls:
+        return [{"relay": relay, "status": "failed", "error": "invalid relay url"} for relay in relays]
+    try:
+        await client.connect()
+        event = Event.from_json(json.dumps({k: v for k, v in event_json.items() if k != "relay_status"}))
+        output = await asyncio.wait_for(client.send_event_to(relay_urls, event), timeout=12)
+        success = {str(r) for r in output.success}
+        failed = {str(k): str(v) for k, v in output.failed.items()}
+        results = []
+        for relay in relays:
+            if relay in success:
+                results.append({"relay": relay, "status": "published"})
+            else:
+                results.append({"relay": relay, "status": "failed", "error": failed.get(relay, "not acknowledged")})
+        return results
+    except Exception as exc:  # External relays/network can fail; persist the error per relay.
+        return [{"relay": relay, "status": "failed", "error": str(exc)} for relay in relays]
+    finally:
+        await client.shutdown()
+
+
+def publish_event(event_json: dict[str, Any]) -> list[dict[str, str]]:
+    relays = nostr_relays()
+    if not nostr_publish_enabled():
+        return [{"relay": relay, "status": "skipped", "error": "NOSTR_PUBLISH disabled or NOSTR_PRIVATE_KEY missing"} for relay in relays]
+    try:
+        return asyncio.run(_publish_event(event_json, relays))
+    except RuntimeError:
+        # FastAPI sync endpoints normally have no running loop, but keep a safe fallback for test harnesses.
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(_publish_event(event_json, relays))
+        finally:
+            loop.close()
+
+
+def persist_nostr_event(c: Any, event: dict[str, Any], entity_type: str, entity_id: str, relay_results: list[dict[str, str]]) -> None:
+    published_count = sum(1 for r in relay_results if r["status"] == "published")
+    relay_status = "published" if published_count else relay_results[0]["status"] if relay_results else "unknown"
+    event["relay_status"] = relay_status
+    event["relay_results"] = relay_results
+    c.execute(
+        text(
+            """
+            INSERT INTO nostr_events (event_id, kind, pubkey, content, tags_json, event_json,
+            entity_type, entity_id, relay_status, created_at, published_at)
+            VALUES (:event_id, :kind, :pubkey, :content, :tags_json, :event_json,
+            :entity_type, :entity_id, :relay_status, :created_at, :published_at)
+            """
+        ),
+        {
+            "event_id": event["id"],
+            "kind": event["kind"],
+            "pubkey": event["pubkey"],
+            "content": event["content"],
+            "tags_json": json.dumps(event["tags"]),
+            "event_json": json.dumps(event),
+            "entity_type": entity_type,
+            "entity_id": entity_id,
+            "relay_status": relay_status,
+            "created_at": now(),
+            "published_at": now() if published_count else None,
+        },
+    )
+    for r in relay_results:
+        c.execute(
+            text(
+                """
+                INSERT INTO nostr_event_relays (event_id, relay_url, status, error, created_at)
+                VALUES (:event_id, :relay_url, :status, :error, :created_at)
+                """
+            ),
+            {"event_id": event["id"], "relay_url": r["relay"], "status": r["status"], "error": r.get("error"), "created_at": now()},
+        )
 
 
 def init_db() -> None:
@@ -141,9 +248,31 @@ def init_db() -> None:
         nostr_event_json TEXT,
         created_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS nostr_events (
+        event_id TEXT PRIMARY KEY,
+        kind INTEGER NOT NULL,
+        pubkey TEXT NOT NULL,
+        content TEXT NOT NULL,
+        tags_json TEXT NOT NULL,
+        event_json TEXT NOT NULL,
+        entity_type TEXT NOT NULL,
+        entity_id TEXT NOT NULL,
+        relay_status TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        published_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS nostr_event_relays (
+        id INTEGER PRIMARY KEY GENERATED BY DEFAULT AS IDENTITY,
+        event_id TEXT NOT NULL,
+        relay_url TEXT NOT NULL,
+        status TEXT NOT NULL,
+        error TEXT,
+        created_at TEXT NOT NULL
+    );
     """
+    if database_url().startswith("sqlite"):
+        ddl = ddl.replace("id INTEGER PRIMARY KEY GENERATED BY DEFAULT AS IDENTITY", "id INTEGER PRIMARY KEY AUTOINCREMENT")
     with engine().begin() as c:
-        # SQLAlchemy/psycopg executes one statement at a time; split our simple DDL script.
         for stmt in [s.strip() for s in ddl.split(";") if s.strip()]:
             c.execute(text(stmt))
 
@@ -177,9 +306,16 @@ class ConversionIn(BaseModel):
 
 
 @app.get("/health")
-def health() -> dict[str, str]:
+def health() -> dict[str, Any]:
     init_db()
-    return {"ok": "true", "service": "nostr-affiliate-poc", "db": "postgres" if database_url().startswith("postgresql") else "sqlite"}
+    return {
+        "ok": "true",
+        "service": "nostr-affiliate-poc",
+        "db": "postgres" if database_url().startswith("postgresql") else "sqlite",
+        "nostr_pubkey": nostr_keys().public_key().to_hex(),
+        "nostr_publish": nostr_publish_enabled(),
+        "relays": nostr_relays(),
+    }
 
 
 @app.post("/campaigns")
@@ -187,7 +323,7 @@ def create_campaign(body: CampaignIn) -> dict[str, Any]:
     init_db()
     campaign_id = hid("camp")
     terms_hash = sha(body.terms_url)
-    event = nostr_event(
+    event = build_nostr_event(
         39001,
         [
             ["d", campaign_id],
@@ -201,7 +337,9 @@ def create_campaign(body: CampaignIn) -> dict[str, Any]:
         ],
         json.dumps({"name": body.name, "terms_url": body.terms_url}),
     )
+    relay_results = publish_event(event)
     with engine().begin() as c:
+        persist_nostr_event(c, event, "campaign", campaign_id, relay_results)
         c.execute(
             text(
                 """
@@ -224,7 +362,7 @@ def create_campaign(body: CampaignIn) -> dict[str, Any]:
                 "created_at": now(),
             },
         )
-    return {"campaign_id": campaign_id, "nostr_event_id": event["id"], "nostr_event": event}
+    return {"campaign_id": campaign_id, "nostr_event_id": event["id"], "nostr_event": event, "relay_results": relay_results}
 
 
 @app.get("/campaigns/{campaign_id}")
@@ -246,7 +384,7 @@ def create_enrollment(body: EnrollmentIn) -> dict[str, Any]:
         raise HTTPException(404, "campaign not found")
     enrollment_id = hid("enr")
     ref_code = hid("ref")
-    event = nostr_event(
+    event = build_nostr_event(
         39002,
         [
             ["type", "affiliate_enrollment"],
@@ -257,7 +395,9 @@ def create_enrollment(body: EnrollmentIn) -> dict[str, Any]:
         ],
         "",
     )
+    relay_results = publish_event(event)
     with engine().begin() as c:
+        persist_nostr_event(c, event, "enrollment", enrollment_id, relay_results)
         c.execute(
             text(
                 """
@@ -278,7 +418,7 @@ def create_enrollment(body: EnrollmentIn) -> dict[str, Any]:
                 "created_at": now(),
             },
         )
-    return {"enrollment_id": enrollment_id, "ref_code": ref_code, "ref_url": f"{BASE_URL}/r/{ref_code}", "nostr_event_id": event["id"], "nostr_event": event}
+    return {"enrollment_id": enrollment_id, "ref_code": ref_code, "ref_url": f"{BASE_URL}/r/{ref_code}", "nostr_event_id": event["id"], "nostr_event": event, "relay_results": relay_results}
 
 
 @app.get("/r/{ref_code}")
@@ -331,7 +471,7 @@ def create_conversion(body: ConversionIn, bb_click_id: Optional[str] = Cookie(No
         enr = asdict(c.execute(text("SELECT * FROM enrollments WHERE ref_code=:ref"), {"ref": click["ref_code"]}).fetchone())
         commission_sats = round(body.order_total * body.sats_per_usd * int(camp["commission_bps"]) / 10000)
         conversion_id = hid("conv")
-        event = nostr_event(
+        event = build_nostr_event(
             39005,
             [
                 ["type", "affiliate_conversion"],
@@ -345,6 +485,8 @@ def create_conversion(body: ConversionIn, bb_click_id: Optional[str] = Cookie(No
             ],
             "",
         )
+        relay_results = publish_event(event)
+        persist_nostr_event(c, event, "conversion", conversion_id, relay_results)
         c.execute(
             text(
                 """
@@ -392,7 +534,7 @@ def create_conversion(body: ConversionIn, bb_click_id: Optional[str] = Cookie(No
                 "created_at": now(),
             },
         )
-    return {"conversion_id": conversion_id, "affiliate_pubkey": click["affiliate_pubkey"], "commission_sats": commission_sats, "status": "approved", "payout_status": "pending", "nostr_event_id": event["id"], "nostr_event": event}
+    return {"conversion_id": conversion_id, "affiliate_pubkey": click["affiliate_pubkey"], "commission_sats": commission_sats, "status": "approved", "payout_status": "pending", "nostr_event_id": event["id"], "nostr_event": event, "relay_results": relay_results}
 
 
 @app.get("/affiliates/{affiliate_pubkey}")
@@ -416,10 +558,28 @@ def affiliate_summary(affiliate_pubkey: str) -> dict[str, Any]:
 @app.get("/proofs")
 def proofs() -> dict[str, Any]:
     with engine().connect() as c:
+        events = [json.loads(r._mapping["event_json"]) for r in c.execute(text("SELECT event_json FROM nostr_events ORDER BY created_at DESC")).fetchall()]
+    if events:
+        return {"events": events}
+    # Backward-compatible fallback for rows created before nostr_events existed.
+    with engine().connect() as c:
         campaigns = [json.loads(r._mapping["nostr_event_json"]) for r in c.execute(text("SELECT nostr_event_json FROM campaigns ORDER BY created_at DESC")).fetchall()]
         enrollments = [json.loads(r._mapping["nostr_event_json"]) for r in c.execute(text("SELECT nostr_event_json FROM enrollments ORDER BY created_at DESC")).fetchall()]
         conversions = [json.loads(r._mapping["nostr_event_json"]) for r in c.execute(text("SELECT nostr_event_json FROM conversions ORDER BY created_at DESC")).fetchall()]
     return {"events": campaigns + enrollments + conversions}
+
+
+@app.get("/nostr/events/{event_id}")
+def get_nostr_event(event_id: str) -> dict[str, Any]:
+    with engine().connect() as c:
+        event = asdict(c.execute(text("SELECT * FROM nostr_events WHERE event_id=:id"), {"id": event_id}).fetchone())
+        relays = [dict(r._mapping) for r in c.execute(text("SELECT relay_url, status, error, created_at FROM nostr_event_relays WHERE event_id=:id"), {"id": event_id}).fetchall()]
+    if not event:
+        raise HTTPException(404, "nostr event not found")
+    event["event_json"] = json.loads(event["event_json"])
+    event["tags"] = json.loads(event.pop("tags_json"))
+    event["relays"] = relays
+    return event
 
 
 @app.post("/demo")
@@ -456,7 +616,7 @@ def demo() -> dict[str, Any]:
 def home() -> str:
     return """
     <html><head><title>Nostr Affiliate POC</title><style>body{font-family:system-ui;margin:40px;max-width:900px}code,pre{background:#f4f4f4;padding:2px 5px;border-radius:4px}li{margin:8px 0}</style></head>
-    <body><h1>Nostr Affiliate POC</h1><p>Minimal demo: campaign → enrollment → redirect click → conversion → Nostr-style proof → pending Lightning payout.</p>
-    <ul><li><a href='/docs'>API docs</a></li><li><form method='post' action='/demo'><button>Run demo flow</button></form></li><li><a href='/proofs'>View Nostr-style proof events</a></li><li><a href='/health'>Health</a></li></ul>
-    <p>Events are HMAC-signed mock Nostr events for the MVP. Next step: publish to real relays and add Lightning payout integration.</p></body></html>
+    <body><h1>Nostr Affiliate POC</h1><p>Minimal demo: campaign → enrollment → redirect click → conversion → real Nostr proof → pending Lightning payout.</p>
+    <ul><li><a href='/docs'>API docs</a></li><li><form method='post' action='/demo'><button>Run demo flow</button></form></li><li><a href='/proofs'>View Nostr proof events</a></li><li><a href='/health'>Health</a></li></ul>
+    <p>Events are real Nostr events signed with Schnorr keys. If NOSTR_PUBLISH=true, the app publishes them to configured public relays.</p></body></html>
     """
