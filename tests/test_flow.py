@@ -24,3 +24,12 @@ def test_demo_flow_creates_conversion_and_proof(tmp_path, monkeypatch):
     detail = client.get(f"/nostr/events/{data['conversion']['nostr_event_id']}")
     assert detail.status_code == 200
     assert detail.json()['event_id'] == data['conversion']['nostr_event_id']
+    dashboard = client.get('/dashboard')
+    assert dashboard.status_code == 200
+    assert 'Nostr Affiliate POC Dashboard' in dashboard.text
+    dashboard_data = client.get('/dashboard/data')
+    assert dashboard_data.status_code == 200
+    assert dashboard_data.json()['counts']['conversions'] >= 1
+    click = client.post('/clicks/simulate', json={'ref_code': data['enrollment']['ref_code']})
+    assert click.status_code == 200
+    assert click.json()['click_id'].startswith('clk_')

@@ -305,6 +305,10 @@ class ConversionIn(BaseModel):
     sats_per_usd: int = 2500
 
 
+class SimulateClickIn(BaseModel):
+    ref_code: str
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     init_db()
@@ -537,6 +541,68 @@ def create_conversion(body: ConversionIn, bb_click_id: Optional[str] = Cookie(No
     return {"conversion_id": conversion_id, "affiliate_pubkey": click["affiliate_pubkey"], "commission_sats": commission_sats, "status": "approved", "payout_status": "pending", "nostr_event_id": event["id"], "nostr_event": event, "relay_results": relay_results}
 
 
+@app.post("/clicks/simulate")
+def simulate_click(body: SimulateClickIn) -> dict[str, Any]:
+    """Dashboard helper: create a click without following a browser redirect."""
+    init_db()
+    with engine().begin() as c:
+        enr = asdict(c.execute(text("SELECT * FROM enrollments WHERE ref_code=:ref"), {"ref": body.ref_code}).fetchone())
+        if not enr:
+            raise HTTPException(404, "ref code not found")
+        camp = asdict(c.execute(text("SELECT * FROM campaigns WHERE id=:id"), {"id": enr["campaign_id"]}).fetchone())
+        click_id = hid("clk")
+        c.execute(
+            text(
+                """
+                INSERT INTO clicks (id, ref_code, campaign_id, affiliate_pubkey, ip_hash,
+                user_agent_hash, landing_url, created_at)
+                VALUES (:id, :ref_code, :campaign_id, :affiliate_pubkey, :ip_hash,
+                :user_agent_hash, :landing_url, :created_at)
+                """
+            ),
+            {
+                "id": click_id,
+                "ref_code": body.ref_code,
+                "campaign_id": enr["campaign_id"],
+                "affiliate_pubkey": enr["affiliate_pubkey"],
+                "ip_hash": sha("dashboard-demo-ip"),
+                "user_agent_hash": sha("dashboard-demo-ua"),
+                "landing_url": camp["destination_url"],
+                "created_at": now(),
+            },
+        )
+    sep = "&" if "?" in camp["destination_url"] else "?"
+    redirect_url = f"{camp['destination_url']}{sep}bb_click_id={click_id}&bb_ref={body.ref_code}"
+    return {"click_id": click_id, "ref_code": body.ref_code, "campaign_id": enr["campaign_id"], "affiliate_pubkey": enr["affiliate_pubkey"], "redirect_url": redirect_url}
+
+
+@app.get("/dashboard/data")
+def dashboard_data() -> dict[str, Any]:
+    init_db()
+    with engine().connect() as c:
+        counts = {
+            "campaigns": c.execute(text("SELECT COUNT(*) FROM campaigns")).scalar_one(),
+            "enrollments": c.execute(text("SELECT COUNT(*) FROM enrollments")).scalar_one(),
+            "clicks": c.execute(text("SELECT COUNT(*) FROM clicks")).scalar_one(),
+            "conversions": c.execute(text("SELECT COUNT(*) FROM conversions")).scalar_one(),
+            "pending_sats": c.execute(text("SELECT COALESCE(SUM(amount_sats), 0) FROM payouts WHERE status='pending'")).scalar_one(),
+            "nostr_events": c.execute(text("SELECT COUNT(*) FROM nostr_events")).scalar_one(),
+            "published_events": c.execute(text("SELECT COUNT(*) FROM nostr_events WHERE relay_status='published'")).scalar_one(),
+        }
+        campaigns = [dict(r._mapping) for r in c.execute(text("SELECT id, merchant_pubkey, name, commission_bps, window_days, destination_url, nostr_event_id, created_at FROM campaigns ORDER BY created_at DESC LIMIT 10")).fetchall()]
+        enrollments = [dict(r._mapping) for r in c.execute(text("SELECT id, campaign_id, affiliate_pubkey, lightning_address, ref_code, nostr_event_id, created_at FROM enrollments ORDER BY created_at DESC LIMIT 10")).fetchall()]
+        clicks = [dict(r._mapping) for r in c.execute(text("SELECT id, ref_code, campaign_id, affiliate_pubkey, landing_url, created_at FROM clicks ORDER BY created_at DESC LIMIT 10")).fetchall()]
+        conversions = [dict(r._mapping) for r in c.execute(text("SELECT id, click_id, campaign_id, affiliate_pubkey, order_total, currency, commission_sats, status, nostr_event_id, created_at FROM conversions ORDER BY created_at DESC LIMIT 10")).fetchall()]
+        events = [dict(r._mapping) for r in c.execute(text("SELECT event_id, kind, pubkey, entity_type, entity_id, relay_status, created_at, published_at FROM nostr_events ORDER BY created_at DESC LIMIT 12")).fetchall()]
+        relay_rows = [dict(r._mapping) for r in c.execute(text("SELECT event_id, relay_url, status, error, created_at FROM nostr_event_relays ORDER BY created_at DESC LIMIT 60")).fetchall()]
+    relays_by_event: dict[str, list[dict[str, Any]]] = {}
+    for row in relay_rows:
+        relays_by_event.setdefault(row["event_id"], []).append(row)
+    for event in events:
+        event["relays"] = relays_by_event.get(event["event_id"], [])
+    return {"health": health(), "counts": counts, "campaigns": campaigns, "enrollments": enrollments, "clicks": clicks, "conversions": conversions, "events": events}
+
+
 @app.get("/affiliates/{affiliate_pubkey}")
 def affiliate_summary(affiliate_pubkey: str) -> dict[str, Any]:
     with engine().connect() as c:
@@ -612,11 +678,156 @@ def demo() -> dict[str, Any]:
     return {"campaign": campaign, "enrollment": enrollment, "click_id": click_id, "conversion": conversion, "affiliate": affiliate_summary("affiliate_pubkey_demo")}
 
 
+
+DASHBOARD_HTML = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Nostr Affiliate POC Dashboard</title>
+  <style>
+    :root { --black:#151615; --orange:#FC6A42; --gray:#E3E3D7; --blue:#6082DB; --yellow:#F9C441; --card:#20211f; --muted:#a8aa9e; --ok:#75d68a; --bad:#ff8585; }
+    * { box-sizing:border-box; }
+    body { margin:0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; background: radial-gradient(circle at top left, rgba(252,106,66,.25), transparent 32rem), var(--black); color:#fff; }
+    header { padding:32px clamp(18px,4vw,56px); border-bottom:1px solid rgba(227,227,215,.12); display:flex; justify-content:space-between; gap:20px; align-items:flex-start; }
+    h1,h2,h3 { font-family: Unbounded, Inter, ui-sans-serif, system-ui, sans-serif; letter-spacing:-.04em; margin:0; }
+    h1 { font-size:clamp(32px,5vw,64px); line-height:.95; max-width:820px; }
+    h2 { font-size:22px; margin-bottom:14px; }
+    p { color:var(--muted); line-height:1.55; }
+    a { color:var(--yellow); }
+    main { padding:28px clamp(18px,4vw,56px) 60px; display:grid; gap:22px; }
+    .pill { display:inline-flex; align-items:center; gap:8px; border:1px solid rgba(227,227,215,.15); background:rgba(227,227,215,.06); border-radius:999px; padding:8px 12px; color:var(--gray); font-size:13px; }
+    .grid { display:grid; grid-template-columns:repeat(12,1fr); gap:18px; }
+    .card { background:linear-gradient(180deg, rgba(255,255,255,.07), rgba(255,255,255,.035)); border:1px solid rgba(227,227,215,.12); border-radius:22px; padding:20px; box-shadow:0 20px 60px rgba(0,0,0,.24); }
+    .span-3{grid-column:span 3}.span-4{grid-column:span 4}.span-5{grid-column:span 5}.span-7{grid-column:span 7}.span-8{grid-column:span 8}.span-12{grid-column:span 12}
+    .metric { font-size:34px; font-weight:800; margin-top:8px; }
+    .label { color:var(--muted); font-size:13px; }
+    input, button, select { width:100%; border:1px solid rgba(227,227,215,.18); border-radius:14px; padding:12px 13px; background:#111210; color:#fff; font:inherit; }
+    button { cursor:pointer; background:var(--orange); border-color:var(--orange); color:#151615; font-weight:800; transition:.15s transform ease; }
+    button:hover { transform:translateY(-1px); }
+    button.secondary { background:rgba(227,227,215,.08); color:var(--gray); border-color:rgba(227,227,215,.18); }
+    .row { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin:10px 0; }
+    pre { max-height:360px; overflow:auto; background:#0b0c0b; border:1px solid rgba(227,227,215,.12); border-radius:16px; padding:14px; color:#dfe2d1; font-size:12px; white-space:pre-wrap; word-break:break-word; }
+    table { width:100%; border-collapse:collapse; font-size:13px; }
+    th,td { text-align:left; padding:10px 8px; border-bottom:1px solid rgba(227,227,215,.09); vertical-align:top; }
+    th { color:var(--muted); font-weight:600; }
+    code { color:#fff; background:rgba(227,227,215,.09); padding:2px 5px; border-radius:6px; }
+    .status { display:inline-block; padding:4px 8px; border-radius:999px; font-size:12px; background:rgba(227,227,215,.1); }
+    .published { background:rgba(117,214,138,.18); color:var(--ok); }
+    .failed { background:rgba(255,133,133,.18); color:var(--bad); }
+    .skipped { background:rgba(249,196,65,.18); color:var(--yellow); }
+    .flow { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
+    .flow span { padding:10px 12px; background:rgba(96,130,219,.16); border:1px solid rgba(96,130,219,.28); border-radius:14px; }
+    .toast { position:fixed; right:20px; bottom:20px; max-width:420px; padding:14px 16px; border-radius:16px; background:#fff; color:#151615; box-shadow:0 20px 60px rgba(0,0,0,.35); display:none; }
+    @media (max-width: 900px){ .span-3,.span-4,.span-5,.span-7,.span-8{grid-column:span 12}.row{grid-template-columns:1fr} header{display:block} }
+  </style>
+</head>
+<body>
+<header>
+  <div>
+    <div class="pill">⚡ Bumbei x Nostr affiliate proof POC</div>
+    <h1>Affiliate identity, attribution proofs & Lightning-ready payouts.</h1>
+    <p>Demo dashboard para crear campañas, enrolar afiliados, simular clicks/conversiones y ver eventos Nostr publicados en relays públicos.</p>
+  </div>
+  <div class="pill" id="health-pill">Loading…</div>
+</header>
+<main>
+  <section class="grid" id="metrics"></section>
+  <section class="card span-12">
+    <h2>End-to-end flow</h2>
+    <div class="flow"><span>Campaign</span>→<span>Enrollment</span>→<span>Click</span>→<span>Conversion</span>→<span>Nostr proof</span>→<span>Pending sats</span></div>
+  </section>
+  <section class="grid">
+    <div class="card span-4">
+      <h2>1. Create campaign</h2>
+      <div class="row"><input id="merchant" value="merchant_pubkey_demo" placeholder="merchant pubkey"><input id="campaignName" value="Bumbei BTC Rewards" placeholder="campaign name"></div>
+      <div class="row"><input id="commission" type="number" value="800" placeholder="bps"><input id="windowDays" type="number" value="30" placeholder="window days"></div>
+      <input id="destination" value="https://example.com/checkout" placeholder="destination URL">
+      <p><button onclick="createCampaign()">Create campaign + publish Nostr event</button></p>
+    </div>
+    <div class="card span-4">
+      <h2>2. Enroll affiliate</h2>
+      <input id="campaignId" placeholder="campaign_id from step 1">
+      <div class="row"><input id="affiliate" value="affiliate_pubkey_demo" placeholder="affiliate pubkey"><input id="lightning" value="affiliate@getalby.com" placeholder="Lightning address"></div>
+      <p><button onclick="createEnrollment()">Enroll + generate ref link</button></p>
+      <p id="refBox" class="label"></p>
+    </div>
+    <div class="card span-4">
+      <h2>3. Click + conversion</h2>
+      <input id="refCode" placeholder="ref_code from enrollment">
+      <p><button class="secondary" onclick="simulateClick()">Simulate click</button></p>
+      <input id="clickId" placeholder="click_id">
+      <div class="row"><input id="orderTotal" type="number" value="100"><input id="satsUsd" type="number" value="2500"></div>
+      <p><button onclick="createConversion()">Create conversion proof</button></p>
+    </div>
+  </section>
+  <section class="grid">
+    <div class="card span-7"><h2>Recent Nostr events</h2><div id="events"></div></div>
+    <div class="card span-5"><h2>Latest result</h2><pre id="result">Run a flow or click “Run full demo”.</pre><button class="secondary" onclick="runDemo()">Run full demo</button></div>
+  </section>
+  <section class="grid">
+    <div class="card span-6"><h2>Campaigns</h2><div id="campaigns"></div></div>
+    <div class="card span-6"><h2>Conversions</h2><div id="conversions"></div></div>
+  </section>
+</main>
+<div id="toast" class="toast"></div>
+<script>
+const $ = id => document.getElementById(id);
+function toast(msg){ const t=$('toast'); t.textContent=msg; t.style.display='block'; setTimeout(()=>t.style.display='none',3500); }
+function show(obj){ $('result').textContent = JSON.stringify(obj, null, 2); }
+async function api(path, opts={}){
+  const res = await fetch(path, {headers:{'content-type':'application/json'}, ...opts});
+  const data = await res.json().catch(()=>({error:'non-json response'}));
+  if(!res.ok) throw new Error(data.detail || data.error || res.statusText);
+  return data;
+}
+function short(x){ return x ? String(x).slice(0,10)+'…'+String(x).slice(-6) : ''; }
+function status(s){ return `<span class="status ${s}">${s}</span>`; }
+function table(rows, cols){ if(!rows?.length) return '<p class="label">No rows yet.</p>'; return `<table><thead><tr>${cols.map(c=>`<th>${c[0]}</th>`).join('')}</tr></thead><tbody>${rows.map(r=>`<tr>${cols.map(c=>`<td>${c[2]?c[2](r[c[1]],r):r[c[1]]??''}</td>`).join('')}</tr>`).join('')}</tbody></table>`; }
+async function refresh(){
+  const data = await api('/dashboard/data');
+  $('health-pill').textContent = `${data.health.db} · Nostr publish ${data.health.nostr_publish ? 'on' : 'off'}`;
+  const metrics = [['Campaigns',data.counts.campaigns],['Enrollments',data.counts.enrollments],['Clicks',data.counts.clicks],['Conversions',data.counts.conversions],['Pending sats',data.counts.pending_sats],['Published events',data.counts.published_events]];
+  $('metrics').innerHTML = metrics.map(m=>`<div class="card span-3"><div class="label">${m[0]}</div><div class="metric">${m[1]}</div></div>`).join('');
+  $('campaigns').innerHTML = table(data.campaigns, [['ID','id',v=>`<code>${v}</code>`],['Name','name'],['bps','commission_bps'],['Event','nostr_event_id',v=>`<a href="/nostr/events/${v}">${short(v)}</a>`]]);
+  $('conversions').innerHTML = table(data.conversions, [['ID','id',v=>`<code>${v}</code>`],['Affiliate','affiliate_pubkey',short],['sats','commission_sats'],['Event','nostr_event_id',v=>`<a href="/nostr/events/${v}">${short(v)}</a>`]]);
+  $('events').innerHTML = table(data.events, [['Kind','kind'],['Entity','entity_type',(v,r)=>`${v}<br><code>${r.entity_id}</code>`],['Relay','relay_status',status],['Event','event_id',v=>`<a href="/nostr/events/${v}">${short(v)}</a>`],['Relays','relays',(v)=>v.map(r=>`${status(r.status)} ${r.relay_url.replace('wss://','')}`).join('<br>')]]);
+}
+async function createCampaign(){
+  const data = await api('/campaigns',{method:'POST',body:JSON.stringify({merchant_pubkey:$('merchant').value,name:$('campaignName').value,commission_bps:+$('commission').value,attribution_window_days:+$('windowDays').value,destination_url:$('destination').value})});
+  $('campaignId').value=data.campaign_id; show(data); toast('Campaign created'); await refresh();
+}
+async function createEnrollment(){
+  const data = await api('/enrollments',{method:'POST',body:JSON.stringify({campaign_id:$('campaignId').value,affiliate_pubkey:$('affiliate').value,lightning_address:$('lightning').value})});
+  $('refCode').value=data.ref_code; $('refBox').innerHTML=`Ref URL: <a href="${data.ref_url}" target="_blank">${data.ref_url}</a>`; show(data); toast('Affiliate enrolled'); await refresh();
+}
+async function simulateClick(){
+  const data = await api('/clicks/simulate',{method:'POST',body:JSON.stringify({ref_code:$('refCode').value})});
+  $('clickId').value=data.click_id; show(data); toast('Click simulated'); await refresh();
+}
+async function createConversion(){
+  const data = await api('/conversions',{method:'POST',body:JSON.stringify({order_id:'ord_'+crypto.randomUUID(),click_id:$('clickId').value,order_total:+$('orderTotal').value,currency:'USD',sats_per_usd:+$('satsUsd').value})});
+  show(data); toast('Conversion proof published'); await refresh();
+}
+async function runDemo(){ const data = await api('/demo',{method:'POST'}); $('campaignId').value=data.campaign.campaign_id; $('refCode').value=data.enrollment.ref_code; $('clickId').value=data.click_id; show(data); toast('Full demo complete'); await refresh(); }
+refresh().catch(e=>toast(e.message));
+</script>
+</body>
+</html>
+"""
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard() -> str:
+    return DASHBOARD_HTML
+
+
 @app.get("/", response_class=HTMLResponse)
 def home() -> str:
     return """
     <html><head><title>Nostr Affiliate POC</title><style>body{font-family:system-ui;margin:40px;max-width:900px}code,pre{background:#f4f4f4;padding:2px 5px;border-radius:4px}li{margin:8px 0}</style></head>
     <body><h1>Nostr Affiliate POC</h1><p>Minimal demo: campaign → enrollment → redirect click → conversion → real Nostr proof → pending Lightning payout.</p>
-    <ul><li><a href='/docs'>API docs</a></li><li><form method='post' action='/demo'><button>Run demo flow</button></form></li><li><a href='/proofs'>View Nostr proof events</a></li><li><a href='/health'>Health</a></li></ul>
+    <ul><li><a href='/dashboard'>Dashboard</a></li><li><a href='/docs'>API docs</a></li><li><form method='post' action='/demo'><button>Run demo flow</button></form></li><li><a href='/proofs'>View Nostr proof events</a></li><li><a href='/health'>Health</a></li></ul>
     <p>Events are real Nostr events signed with Schnorr keys. If NOSTR_PUBLISH=true, the app publishes them to configured public relays.</p></body></html>
     """
