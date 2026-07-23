@@ -30,6 +30,17 @@ def test_demo_flow_creates_conversion_and_proof(tmp_path, monkeypatch):
     dashboard_data = client.get('/dashboard/data')
     assert dashboard_data.status_code == 200
     assert dashboard_data.json()['counts']['conversions'] >= 1
+    receipt = client.get(f"/flows/{data['conversion']['conversion_id']}")
+    assert receipt.status_code == 200
+    receipt_json = receipt.json()
+    assert receipt_json['campaign']['id'] == data['campaign']['campaign_id']
+    assert receipt_json['enrollment']['ref_code'] == data['enrollment']['ref_code']
+    assert receipt_json['conversion']['id'] == data['conversion']['conversion_id']
+    assert len(receipt_json['events']) >= 3
+    receipt_page = client.get(f"/flows/{data['conversion']['conversion_id']}/receipt")
+    assert receipt_page.status_code == 200
+    assert 'Flow receipt' in receipt_page.text
+    assert data['conversion']['conversion_id'] in receipt_page.text
     click = client.post('/clicks/simulate', json={'ref_code': data['enrollment']['ref_code']})
     assert click.status_code == 200
     assert click.json()['click_id'].startswith('clk_')

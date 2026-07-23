@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import html as html_lib
 import json
 import os
 import secrets
@@ -648,6 +649,179 @@ def get_nostr_event(event_id: str) -> dict[str, Any]:
     return event
 
 
+
+def flow_receipt_data(conversion_id: str) -> dict[str, Any]:
+    init_db()
+    with engine().connect() as c:
+        conversion = asdict(c.execute(text("SELECT * FROM conversions WHERE id=:id"), {"id": conversion_id}).fetchone())
+        if not conversion:
+            raise HTTPException(404, "conversion not found")
+        click = asdict(c.execute(text("SELECT * FROM clicks WHERE id=:id"), {"id": conversion["click_id"]}).fetchone())
+        campaign = asdict(c.execute(text("SELECT * FROM campaigns WHERE id=:id"), {"id": conversion["campaign_id"]}).fetchone())
+        enrollment = asdict(c.execute(text("SELECT * FROM enrollments WHERE ref_code=:ref"), {"ref": click["ref_code"] if click else None}).fetchone()) if click else None
+        payout = asdict(c.execute(text("SELECT * FROM payouts WHERE conversion_id=:id ORDER BY created_at DESC LIMIT 1"), {"id": conversion_id}).fetchone())
+        event_ids = [eid for eid in [campaign.get("nostr_event_id") if campaign else None, enrollment.get("nostr_event_id") if enrollment else None, conversion.get("nostr_event_id")] if eid]
+        events: list[dict[str, Any]] = []
+        relays_by_event: dict[str, list[dict[str, Any]]] = {}
+        if event_ids:
+            for eid in event_ids:
+                ev = asdict(c.execute(text("SELECT event_id, kind, pubkey, entity_type, entity_id, relay_status, event_json, created_at, published_at FROM nostr_events WHERE event_id=:id"), {"id": eid}).fetchone())
+                if ev:
+                    ev["event_json"] = json.loads(ev["event_json"])
+                    events.append(ev)
+                relays_by_event[eid] = [dict(r._mapping) for r in c.execute(text("SELECT relay_url, status, error, created_at FROM nostr_event_relays WHERE event_id=:id"), {"id": eid}).fetchall()]
+    for ev in events:
+        ev["relays"] = relays_by_event.get(ev["event_id"], [])
+    return {
+        "conversion_id": conversion_id,
+        "merchant_pubkey": campaign["merchant_pubkey"] if campaign else None,
+        "affiliate_pubkey": conversion["affiliate_pubkey"],
+        "campaign": campaign,
+        "enrollment": enrollment,
+        "click": click,
+        "conversion": conversion,
+        "payout": payout,
+        "events": events,
+        "links": {
+            "campaign_event": f"/nostr/events/{campaign['nostr_event_id']}" if campaign else None,
+            "enrollment_event": f"/nostr/events/{enrollment['nostr_event_id']}" if enrollment else None,
+            "conversion_event": f"/nostr/events/{conversion['nostr_event_id']}",
+        },
+    }
+
+
+@app.get("/flows/{conversion_id}")
+def get_flow_receipt(conversion_id: str) -> dict[str, Any]:
+    return flow_receipt_data(conversion_id)
+
+
+def _esc(value: Any) -> str:
+    return html_lib.escape("" if value is None else str(value))
+
+
+def _short(value: Any, front: int = 12, back: int = 8) -> str:
+    value = "" if value is None else str(value)
+    return value if len(value) <= front + back + 1 else f"{value[:front]}…{value[-back:]}"
+
+
+def _status_badge(status_value: str) -> str:
+    cls = "published" if status_value == "published" else "failed" if status_value == "failed" else "skipped"
+    return f'<span class="status {cls}">{_esc(status_value)}</span>'
+
+
+@app.get("/flows/{conversion_id}/receipt", response_class=HTMLResponse)
+def flow_receipt_page(conversion_id: str) -> str:
+    data = flow_receipt_data(conversion_id)
+    campaign = data["campaign"] or {}
+    enrollment = data["enrollment"] or {}
+    click = data["click"] or {}
+    conversion = data["conversion"] or {}
+    payout = data["payout"] or {}
+    event_cards = []
+    for ev in data["events"]:
+        relays = "".join(f"<li>{_status_badge(r['status'])} <code>{_esc(r['relay_url'])}</code></li>" for r in ev.get("relays", []))
+        event_cards.append(f"""
+        <article class="event-card">
+          <div class="kind">kind {_esc(ev['kind'])} · {_esc(ev['entity_type'])}</div>
+          <h3><a href="/nostr/events/{_esc(ev['event_id'])}">{_esc(_short(ev['event_id']))}</a></h3>
+          <p>Entity <code>{_esc(ev['entity_id'])}</code> · {_status_badge(ev['relay_status'])}</p>
+          <ul>{relays}</ul>
+        </article>
+        """)
+    event_cards_html = "\n".join(event_cards)
+    return f"""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Flow receipt · {_esc(conversion_id)}</title>
+  <style>
+    :root {{ --black:#151615; --orange:#FC6A42; --gray:#E3E3D7; --blue:#6082DB; --yellow:#F9C441; --muted:#a8aa9e; --ok:#75d68a; --bad:#ff8585; }}
+    * {{ box-sizing:border-box; }}
+    body {{ margin:0; font-family:Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; background:radial-gradient(circle at top left, rgba(252,106,66,.22), transparent 30rem), var(--black); color:#fff; }}
+    main, header {{ width:min(1180px,100%); margin:0 auto; padding:28px clamp(16px,4vw,46px); }}
+    header {{ display:flex; justify-content:space-between; gap:24px; align-items:flex-start; border-bottom:1px solid rgba(227,227,215,.12); }}
+    h1,h2,h3 {{ font-family:Unbounded, Inter, system-ui, sans-serif; letter-spacing:-.04em; margin:0; }}
+    h1 {{ font-size:clamp(34px,5vw,62px); line-height:.95; max-width:760px; }}
+    p {{ color:var(--muted); line-height:1.55; }}
+    a {{ color:var(--yellow); }}
+    code {{ background:rgba(227,227,215,.09); border-radius:7px; padding:2px 6px; color:#fff; word-break:break-all; }}
+    .pill,.status {{ display:inline-flex; align-items:center; gap:7px; padding:7px 10px; border-radius:999px; font-size:13px; border:1px solid rgba(227,227,215,.15); background:rgba(227,227,215,.06); color:var(--gray); }}
+    .published {{ background:rgba(117,214,138,.18); color:var(--ok); }} .failed {{ background:rgba(255,133,133,.18); color:var(--bad); }} .skipped {{ background:rgba(249,196,65,.18); color:var(--yellow); }}
+    .grid {{ display:grid; grid-template-columns:repeat(12,minmax(0,1fr)); gap:18px; margin:22px 0; }}
+    .card {{ min-width:0; background:linear-gradient(180deg, rgba(255,255,255,.07), rgba(255,255,255,.035)); border:1px solid rgba(227,227,215,.12); border-radius:24px; padding:22px; box-shadow:0 20px 60px rgba(0,0,0,.22); overflow:hidden; }}
+    .span-4 {{ grid-column:span 4 / span 4; }} .span-6 {{ grid-column:span 6 / span 6; }} .span-8 {{ grid-column:span 8 / span 8; }} .span-12 {{ grid-column:1 / -1; }}
+    .metric {{ font-size:34px; font-weight:900; line-height:1; margin-top:8px; overflow-wrap:anywhere; }}
+    .label {{ color:var(--muted); font-size:13px; }}
+    .timeline {{ display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:12px; }}
+    .step {{ padding:14px; border:1px solid rgba(96,130,219,.28); background:rgba(96,130,219,.13); border-radius:16px; min-width:0; }}
+    .step b {{ display:block; margin-bottom:8px; }}
+    dl {{ display:grid; grid-template-columns:160px minmax(0,1fr); gap:10px 14px; }} dt {{ color:var(--muted); }} dd {{ margin:0; overflow-wrap:anywhere; }}
+    .events {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:16px; }}
+    .event-card {{ min-width:0; border:1px solid rgba(227,227,215,.12); background:rgba(0,0,0,.18); border-radius:18px; padding:16px; }}
+    .event-card ul {{ padding-left:18px; color:var(--muted); }} .kind {{ color:var(--blue); font-size:13px; font-weight:800; }}
+    .actions {{ display:flex; gap:10px; flex-wrap:wrap; }} .button {{ display:inline-flex; padding:11px 14px; border-radius:14px; background:var(--orange); color:var(--black); text-decoration:none; font-weight:900; }} .button.secondary {{ background:rgba(227,227,215,.08); color:var(--gray); }}
+    @media (max-width:900px){{ header{{display:block}} .span-4,.span-6,.span-8{{grid-column:1 / -1}} .timeline{{grid-template-columns:1fr}} dl{{grid-template-columns:1fr}} }}
+  </style>
+</head>
+<body>
+<header>
+  <div>
+    <div class="pill">✅ Flow receipt</div>
+    <h1>Bumbei affiliate conversion proof.</h1>
+    <p>Resumen end-to-end: merchant → campaign → affiliate enrollment → click → conversion → Nostr proof → pending sats.</p>
+  </div>
+  <div class="pill">{_esc(conversion.get('status'))} · {_esc(conversion.get('commission_sats'))} sats</div>
+</header>
+<main>
+  <section class="grid">
+    <div class="card span-4"><div class="label">Merchant</div><div class="metric">{_esc(_short(data['merchant_pubkey'], 10, 8))}</div><p><code>{_esc(data['merchant_pubkey'])}</code></p></div>
+    <div class="card span-4"><div class="label">Affiliate</div><div class="metric">{_esc(_short(data['affiliate_pubkey'], 10, 8))}</div><p><code>{_esc(data['affiliate_pubkey'])}</code></p></div>
+    <div class="card span-4"><div class="label">Reward</div><div class="metric">{_esc(conversion.get('commission_sats'))} sats</div><p>Status: {_status_badge(payout.get('status','pending'))}</p></div>
+  </section>
+  <section class="card span-12">
+    <h2>Proof timeline</h2>
+    <div class="timeline">
+      <div class="step"><b>Campaign</b><code>{_esc(campaign.get('id'))}</code></div>
+      <div class="step"><b>Enrollment</b><code>{_esc(enrollment.get('id'))}</code></div>
+      <div class="step"><b>Click</b><code>{_esc(click.get('id'))}</code></div>
+      <div class="step"><b>Conversion</b><code>{_esc(conversion.get('id'))}</code></div>
+      <div class="step"><b>Nostr proof</b><code>{_esc(_short(conversion.get('nostr_event_id')))}</code></div>
+    </div>
+  </section>
+  <section class="grid">
+    <div class="card span-6"><h2>Attribution details</h2><dl>
+      <dt>Campaign name</dt><dd>{_esc(campaign.get('name'))}</dd>
+      <dt>Ref code</dt><dd><code>{_esc(click.get('ref_code'))}</code></dd>
+      <dt>Click ID</dt><dd><code>{_esc(conversion.get('click_id'))}</code></dd>
+      <dt>Order hash</dt><dd><code>{_esc(conversion.get('order_id_hash'))}</code></dd>
+      <dt>Order total</dt><dd>{_esc(conversion.get('order_total'))} {_esc(conversion.get('currency'))}</dd>
+      <dt>Commission</dt><dd>{_esc(conversion.get('commission_sats'))} sats</dd>
+    </dl></div>
+    <div class="card span-6"><h2>Payout details</h2><dl>
+      <dt>Payout ID</dt><dd><code>{_esc(payout.get('id'))}</code></dd>
+      <dt>Status</dt><dd>{_status_badge(payout.get('status','pending'))}</dd>
+      <dt>Lightning address</dt><dd><code>{_esc(payout.get('lightning_address'))}</code></dd>
+      <dt>Amount</dt><dd>{_esc(payout.get('amount_sats'))} sats</dd>
+      <dt>Payment hash</dt><dd><code>{_esc(payout.get('payment_hash'))}</code></dd>
+    </dl></div>
+  </section>
+  <section class="card span-12">
+    <h2>Nostr events & relay receipts</h2>
+    <div class="events">{event_cards_html}</div>
+  </section>
+  <section class="card span-12 actions">
+    <a class="button" href="/nostr/events/{_esc(conversion.get('nostr_event_id'))}">Open conversion event</a>
+    <a class="button secondary" href="/flows/{_esc(conversion_id)}">View JSON receipt</a>
+    <a class="button secondary" href="/dashboard">Back to dashboard</a>
+  </section>
+</main>
+</body>
+</html>
+"""
+
+
 @app.post("/demo")
 def demo() -> dict[str, Any]:
     campaign = create_campaign(CampaignIn(merchant_pubkey="merchant_pubkey_demo", destination_url=f"{BASE_URL}/demo-checkout"))
@@ -795,7 +969,7 @@ async function refresh(){
   const metrics = [['Campaigns',data.counts.campaigns],['Enrollments',data.counts.enrollments],['Clicks',data.counts.clicks],['Conversions',data.counts.conversions],['Pending sats',data.counts.pending_sats],['Published events',data.counts.published_events]];
   $('metrics').innerHTML = metrics.map(m=>`<div class="card metric-card"><div class="label">${m[0]}</div><div class="metric">${m[1]}</div></div>`).join('');
   $('campaigns').innerHTML = table(data.campaigns, [['ID','id',v=>`<code>${v}</code>`],['Name','name'],['bps','commission_bps'],['Event','nostr_event_id',v=>`<a href="/nostr/events/${v}">${short(v)}</a>`]]);
-  $('conversions').innerHTML = table(data.conversions, [['ID','id',v=>`<code>${v}</code>`],['Affiliate','affiliate_pubkey',short],['sats','commission_sats'],['Event','nostr_event_id',v=>`<a href="/nostr/events/${v}">${short(v)}</a>`]]);
+  $('conversions').innerHTML = table(data.conversions, [['ID','id',v=>`<code>${v}</code>`],['Affiliate','affiliate_pubkey',short],['sats','commission_sats'],['Event','nostr_event_id',v=>`<a href="/nostr/events/${v}">${short(v)}</a>`],['Receipt','id',v=>`<a href="/flows/${v}/receipt">open</a>`]]);
   $('events').innerHTML = table(data.events, [['Kind','kind'],['Entity','entity_type',(v,r)=>`${v}<br><code>${r.entity_id}</code>`],['Relay','relay_status',status],['Event','event_id',v=>`<a href="/nostr/events/${v}">${short(v)}</a>`],['Relays','relays',(v)=>v.map(r=>`${status(r.status)} ${r.relay_url.replace('wss://','')}`).join('<br>')]]);
 }
 async function createCampaign(){
