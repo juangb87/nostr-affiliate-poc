@@ -33,6 +33,7 @@ python scripts/e2e.py
 - `GET /dashboard`
 - `GET /dashboard/data`
 - `POST /clicks/simulate`
+- `POST /merchant/conversions` — merchant webhook with `Authorization: Bearer <merchant_api_key>`
 - `POST /campaigns`
 - `POST /enrollments`
 - `GET /r/{ref_code}`
@@ -58,6 +59,25 @@ Recommended environment variables:
 - `NOSTR_PRIVATE_KEY`: hex or `nsec...` private key used to sign events
 - `NOSTR_PUBLISH`: set to `true` to publish to relays
 - `NOSTR_RELAYS`: comma-separated relay URLs. Default: `wss://nos.lol,wss://relay.damus.io,wss://relay.primal.net`
+- `MERCHANT_API_KEYS`: comma-separated bearer tokens accepted by `/merchant/conversions`.
+
+## Merchant webhook
+
+```bash
+curl -X POST "$BASE_URL/merchant/conversions" \
+  -H "Authorization: Bearer bumbei-demo-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "order_id": "order_123",
+    "bb_click_id": "clk_from_redirect",
+    "order_total": 100,
+    "currency": "USD",
+    "customer_hash": "sha256:optional_customer_hash",
+    "metadata": {"platform": "shopify"}
+  }'
+```
+
+The response includes `receipt_url`, `json_receipt_url`, `nostr_event_id`, payout status, and relay results. Duplicate `order_id` submissions are idempotent and return the original conversion.
 
 ## Privacy note
 

@@ -10,7 +10,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from fastapi import Cookie, FastAPI, HTTPException, Request
+from fastapi import Cookie, FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from nostr_sdk import Client, EventBuilder, Keys, Kind, RelayUrl, Tag
 from pydantic import BaseModel, Field
@@ -82,6 +82,21 @@ def nostr_publish_enabled() -> bool:
     if explicit is not None:
         return explicit.lower() in {"1", "true", "yes", "on"}
     return bool(os.getenv("NOSTR_PRIVATE_KEY"))
+
+
+def merchant_api_keys() -> set[str]:
+    raw = os.getenv("MERCHANT_API_KEYS", "bumbei-demo-key")
+    return {k.strip() for k in raw.split(",") if k.strip()}
+
+
+def require_merchant_api_key(authorization: str | None) -> str:
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(401, "missing Bearer merchant API key")
+    token = authorization.split(" ", 1)[1].strip()
+    for valid in merchant_api_keys():
+        if secrets.compare_digest(token, valid):
+            return token
+    raise HTTPException(403, "invalid merchant API key")
 
 
 def nostr_keys() -> Keys:
@@ -308,6 +323,16 @@ class ConversionIn(BaseModel):
 
 class SimulateClickIn(BaseModel):
     ref_code: str
+
+
+class MerchantConversionIn(BaseModel):
+    order_id: str = Field(..., min_length=3)
+    bb_click_id: str = Field(..., min_length=4)
+    order_total: float = Field(..., gt=0)
+    currency: str = "USD"
+    sats_per_usd: int = 2500
+    customer_hash: Optional[str] = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 @app.get("/health")
@@ -602,6 +627,52 @@ def dashboard_data() -> dict[str, Any]:
     for event in events:
         event["relays"] = relays_by_event.get(event["event_id"], [])
     return {"health": health(), "counts": counts, "campaigns": campaigns, "enrollments": enrollments, "clicks": clicks, "conversions": conversions, "events": events}
+
+
+@app.post("/merchant/conversions")
+def merchant_conversion_webhook(body: MerchantConversionIn, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """Merchant-facing server-to-server conversion webhook.
+
+    The merchant sends back the bb_click_id captured from the referral redirect. Raw
+    order/customer data is not published to Nostr; the conversion proof stores hashes.
+    """
+    require_merchant_api_key(authorization)
+    init_db()
+    order_id_hash = sha(body.order_id)
+    payload_hash = sha(json.dumps(body.model_dump(), sort_keys=True, default=str))
+    with engine().connect() as c:
+        existing = asdict(c.execute(text("SELECT id, nostr_event_id FROM conversions WHERE order_id_hash=:h"), {"h": order_id_hash}).fetchone())
+    if existing:
+        return {
+            "ok": True,
+            "duplicate": True,
+            "conversion_id": existing["id"],
+            "nostr_event_id": existing["nostr_event_id"],
+            "receipt_url": f"{BASE_URL}/flows/{existing['id']}/receipt",
+            "json_receipt_url": f"{BASE_URL}/flows/{existing['id']}",
+            "payload_hash": payload_hash,
+        }
+    conversion = create_conversion(
+        ConversionIn(
+            order_id=body.order_id,
+            click_id=body.bb_click_id,
+            order_total=body.order_total,
+            currency=body.currency,
+            sats_per_usd=body.sats_per_usd,
+        )
+    )
+    return {
+        "ok": True,
+        "duplicate": False,
+        "conversion_id": conversion["conversion_id"],
+        "nostr_event_id": conversion["nostr_event_id"],
+        "commission_sats": conversion["commission_sats"],
+        "payout_status": conversion["payout_status"],
+        "receipt_url": f"{BASE_URL}/flows/{conversion['conversion_id']}/receipt",
+        "json_receipt_url": f"{BASE_URL}/flows/{conversion['conversion_id']}",
+        "payload_hash": payload_hash,
+        "relay_results": conversion["relay_results"],
+    }
 
 
 @app.get("/affiliates/{affiliate_pubkey}")
@@ -915,6 +986,18 @@ DASHBOARD_HTML = """
   <section class="card span-12">
     <h2>End-to-end flow</h2>
     <div class="flow"><span>Campaign</span>→<span>Enrollment</span>→<span>Click</span>→<span>Conversion</span>→<span>Nostr proof</span>→<span>Pending sats</span></div>
+  </section>
+  <section class="card span-12">
+    <h2>Merchant webhook</h2>
+    <p>Para integraciones server-to-server tipo Shopify/WooCommerce/custom checkout: <code>POST /merchant/conversions</code> con <code>Authorization: Bearer bumbei-demo-key</code>. El merchant devuelve <code>bb_click_id</code> y recibe una receipt URL.</p>
+    <pre>{
+  "order_id": "order_123",
+  "bb_click_id": "clk_y8DrWEwJ8R",
+  "order_total": 100,
+  "currency": "USD",
+  "customer_hash": "sha256:...",
+  "metadata": {"platform": "shopify"}
+}</pre>
   </section>
   <section class="grid">
     <div class="card span-4">

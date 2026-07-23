@@ -44,3 +44,23 @@ def test_demo_flow_creates_conversion_and_proof(tmp_path, monkeypatch):
     click = client.post('/clicks/simulate', json={'ref_code': data['enrollment']['ref_code']})
     assert click.status_code == 200
     assert click.json()['click_id'].startswith('clk_')
+    no_auth = client.post('/merchant/conversions', json={'order_id': 'merchant_order_1', 'bb_click_id': click.json()['click_id'], 'order_total': 125, 'currency': 'USD'})
+    assert no_auth.status_code == 401
+    webhook = client.post(
+        '/merchant/conversions',
+        headers={'Authorization': 'Bearer bumbei-demo-key'},
+        json={'order_id': 'merchant_order_1', 'bb_click_id': click.json()['click_id'], 'order_total': 125, 'currency': 'USD', 'metadata': {'platform': 'shopify'}},
+    )
+    assert webhook.status_code == 200, webhook.text
+    webhook_json = webhook.json()
+    assert webhook_json['ok'] is True
+    assert webhook_json['duplicate'] is False
+    assert webhook_json['receipt_url'].endswith(f"/flows/{webhook_json['conversion_id']}/receipt")
+    duplicate = client.post(
+        '/merchant/conversions',
+        headers={'Authorization': 'Bearer bumbei-demo-key'},
+        json={'order_id': 'merchant_order_1', 'bb_click_id': click.json()['click_id'], 'order_total': 125, 'currency': 'USD'},
+    )
+    assert duplicate.status_code == 200
+    assert duplicate.json()['duplicate'] is True
+    assert duplicate.json()['conversion_id'] == webhook_json['conversion_id']
