@@ -22,7 +22,7 @@ pip install -r requirements.txt
 uvicorn app.main:app --reload
 ```
 
-Open http://localhost:8000 and click **Run demo flow**, or use:
+Open http://localhost:8000/dashboard for the interactive dashboard, or use:
 
 ```bash
 python scripts/e2e.py
@@ -30,6 +30,9 @@ python scripts/e2e.py
 
 ## API
 
+- `GET /dashboard`
+- `GET /dashboard/data`
+- `POST /clicks/simulate`
 - `POST /campaigns`
 - `POST /enrollments`
 - `GET /r/{ref_code}`
