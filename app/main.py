@@ -696,23 +696,25 @@ DASHBOARD_HTML = """
     h2 { font-size:22px; margin-bottom:14px; }
     p { color:var(--muted); line-height:1.55; }
     a { color:var(--yellow); }
-    main { padding:28px clamp(18px,4vw,56px) 60px; display:grid; gap:22px; }
-    .pill { display:inline-flex; align-items:center; gap:8px; border:1px solid rgba(227,227,215,.15); background:rgba(227,227,215,.06); border-radius:999px; padding:8px 12px; color:var(--gray); font-size:13px; }
-    .grid { display:grid; grid-template-columns:repeat(12,1fr); gap:18px; }
-    .card { background:linear-gradient(180deg, rgba(255,255,255,.07), rgba(255,255,255,.035)); border:1px solid rgba(227,227,215,.12); border-radius:22px; padding:20px; box-shadow:0 20px 60px rgba(0,0,0,.24); }
-    .span-3{grid-column:span 3}.span-4{grid-column:span 4}.span-5{grid-column:span 5}.span-7{grid-column:span 7}.span-8{grid-column:span 8}.span-12{grid-column:span 12}
-    .metric { font-size:34px; font-weight:800; margin-top:8px; }
-    .label { color:var(--muted); font-size:13px; }
-    input, button, select { width:100%; border:1px solid rgba(227,227,215,.18); border-radius:14px; padding:12px 13px; background:#111210; color:#fff; font:inherit; }
-    button { cursor:pointer; background:var(--orange); border-color:var(--orange); color:#151615; font-weight:800; transition:.15s transform ease; }
+    main { width:min(1440px,100%); margin:0 auto; padding:28px clamp(18px,4vw,56px) 60px; display:grid; gap:22px; }
+    .pill { display:inline-flex; align-items:center; gap:8px; border:1px solid rgba(227,227,215,.15); background:rgba(227,227,215,.06); border-radius:999px; padding:8px 12px; color:var(--gray); font-size:13px; white-space:nowrap; }
+    .grid { display:grid; grid-template-columns:repeat(12,minmax(0,1fr)); gap:18px; width:100%; }
+    .metrics-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:16px; width:100%; }
+    .card { min-width:0; background:linear-gradient(180deg, rgba(255,255,255,.07), rgba(255,255,255,.035)); border:1px solid rgba(227,227,215,.12); border-radius:22px; padding:20px; box-shadow:0 20px 60px rgba(0,0,0,.24); overflow:hidden; }
+    .span-3{grid-column:span 3 / span 3}.span-4{grid-column:span 4 / span 4}.span-5{grid-column:span 5 / span 5}.span-6{grid-column:span 6 / span 6}.span-7{grid-column:span 7 / span 7}.span-8{grid-column:span 8 / span 8}.span-12{grid-column:1 / -1}
+    .metric { font-size:34px; font-weight:800; margin-top:8px; line-height:1; overflow-wrap:anywhere; }
+    .label { color:var(--muted); font-size:13px; overflow-wrap:anywhere; }
+    input, button, select { width:100%; min-width:0; border:1px solid rgba(227,227,215,.18); border-radius:14px; padding:12px 13px; background:#111210; color:#fff; font:inherit; }
+    button { cursor:pointer; background:var(--orange); border-color:var(--orange); color:#151615; font-weight:800; transition:.15s transform ease; line-height:1.2; }
     button:hover { transform:translateY(-1px); }
     button.secondary { background:rgba(227,227,215,.08); color:var(--gray); border-color:rgba(227,227,215,.18); }
-    .row { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin:10px 0; }
+    .row { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; margin:10px 0; }
     pre { max-height:360px; overflow:auto; background:#0b0c0b; border:1px solid rgba(227,227,215,.12); border-radius:16px; padding:14px; color:#dfe2d1; font-size:12px; white-space:pre-wrap; word-break:break-word; }
-    table { width:100%; border-collapse:collapse; font-size:13px; }
-    th,td { text-align:left; padding:10px 8px; border-bottom:1px solid rgba(227,227,215,.09); vertical-align:top; }
+    .table-wrap { width:100%; overflow-x:auto; }
+    table { width:100%; min-width:560px; border-collapse:collapse; font-size:13px; table-layout:fixed; }
+    th,td { text-align:left; padding:10px 8px; border-bottom:1px solid rgba(227,227,215,.09); vertical-align:top; overflow-wrap:anywhere; word-break:break-word; }
     th { color:var(--muted); font-weight:600; }
-    code { color:#fff; background:rgba(227,227,215,.09); padding:2px 5px; border-radius:6px; }
+    code { color:#fff; background:rgba(227,227,215,.09); padding:2px 5px; border-radius:6px; overflow-wrap:anywhere; word-break:break-all; }
     .status { display:inline-block; padding:4px 8px; border-radius:999px; font-size:12px; background:rgba(227,227,215,.1); }
     .published { background:rgba(117,214,138,.18); color:var(--ok); }
     .failed { background:rgba(255,133,133,.18); color:var(--bad); }
@@ -720,7 +722,9 @@ DASHBOARD_HTML = """
     .flow { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
     .flow span { padding:10px 12px; background:rgba(96,130,219,.16); border:1px solid rgba(96,130,219,.28); border-radius:14px; }
     .toast { position:fixed; right:20px; bottom:20px; max-width:420px; padding:14px 16px; border-radius:16px; background:#fff; color:#151615; box-shadow:0 20px 60px rgba(0,0,0,.35); display:none; }
-    @media (max-width: 900px){ .span-3,.span-4,.span-5,.span-7,.span-8{grid-column:span 12}.row{grid-template-columns:1fr} header{display:block} }
+    @media (max-width: 1100px){ .span-4,.span-5,.span-6,.span-7,.span-8{grid-column:1 / -1} }
+    @media (max-width: 900px){ header{display:block} h1{font-size:42px}.row{grid-template-columns:1fr}.metrics-grid{grid-template-columns:repeat(2,minmax(0,1fr))} }
+    @media (max-width: 560px){ main,header{padding-left:16px;padding-right:16px}.metrics-grid{grid-template-columns:1fr}.flow{align-items:flex-start}.flow span{width:100%} }
   </style>
 </head>
 <body>
@@ -733,7 +737,7 @@ DASHBOARD_HTML = """
   <div class="pill" id="health-pill">Loading…</div>
 </header>
 <main>
-  <section class="grid" id="metrics"></section>
+  <section class="metrics-grid" id="metrics"></section>
   <section class="card span-12">
     <h2>End-to-end flow</h2>
     <div class="flow"><span>Campaign</span>→<span>Enrollment</span>→<span>Click</span>→<span>Conversion</span>→<span>Nostr proof</span>→<span>Pending sats</span></div>
@@ -784,12 +788,12 @@ async function api(path, opts={}){
 }
 function short(x){ return x ? String(x).slice(0,10)+'…'+String(x).slice(-6) : ''; }
 function status(s){ return `<span class="status ${s}">${s}</span>`; }
-function table(rows, cols){ if(!rows?.length) return '<p class="label">No rows yet.</p>'; return `<table><thead><tr>${cols.map(c=>`<th>${c[0]}</th>`).join('')}</tr></thead><tbody>${rows.map(r=>`<tr>${cols.map(c=>`<td>${c[2]?c[2](r[c[1]],r):r[c[1]]??''}</td>`).join('')}</tr>`).join('')}</tbody></table>`; }
+function table(rows, cols){ if(!rows?.length) return '<p class="label">No rows yet.</p>'; return `<div class="table-wrap"><table><thead><tr>${cols.map(c=>`<th>${c[0]}</th>`).join('')}</tr></thead><tbody>${rows.map(r=>`<tr>${cols.map(c=>`<td>${c[2]?c[2](r[c[1]],r):r[c[1]]??''}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`; }
 async function refresh(){
   const data = await api('/dashboard/data');
   $('health-pill').textContent = `${data.health.db} · Nostr publish ${data.health.nostr_publish ? 'on' : 'off'}`;
   const metrics = [['Campaigns',data.counts.campaigns],['Enrollments',data.counts.enrollments],['Clicks',data.counts.clicks],['Conversions',data.counts.conversions],['Pending sats',data.counts.pending_sats],['Published events',data.counts.published_events]];
-  $('metrics').innerHTML = metrics.map(m=>`<div class="card span-3"><div class="label">${m[0]}</div><div class="metric">${m[1]}</div></div>`).join('');
+  $('metrics').innerHTML = metrics.map(m=>`<div class="card metric-card"><div class="label">${m[0]}</div><div class="metric">${m[1]}</div></div>`).join('');
   $('campaigns').innerHTML = table(data.campaigns, [['ID','id',v=>`<code>${v}</code>`],['Name','name'],['bps','commission_bps'],['Event','nostr_event_id',v=>`<a href="/nostr/events/${v}">${short(v)}</a>`]]);
   $('conversions').innerHTML = table(data.conversions, [['ID','id',v=>`<code>${v}</code>`],['Affiliate','affiliate_pubkey',short],['sats','commission_sats'],['Event','nostr_event_id',v=>`<a href="/nostr/events/${v}">${short(v)}</a>`]]);
   $('events').innerHTML = table(data.events, [['Kind','kind'],['Entity','entity_type',(v,r)=>`${v}<br><code>${r.entity_id}</code>`],['Relay','relay_status',status],['Event','event_id',v=>`<a href="/nostr/events/${v}">${short(v)}</a>`],['Relays','relays',(v)=>v.map(r=>`${status(r.status)} ${r.relay_url.replace('wss://','')}`).join('<br>')]]);
