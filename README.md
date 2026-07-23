@@ -50,4 +50,4 @@ Recommended environment variables:
 - `APP_SECRET`: random signing secret for mock event signatures
 - `BASE_URL`: public Railway URL
 - `DEFAULT_DESTINATION_URL`: merchant checkout URL used for redirect links
-- `DATABASE_URL`: defaults to `sqlite:///./data/poc.db`; use a mounted volume or Postgres in a later version
+- `DATABASE_URL`: defaults to `sqlite:///./data/poc.db`; supports Railway Postgres URLs (`postgres://...`) for persistence
