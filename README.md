@@ -60,6 +60,7 @@ Recommended environment variables:
 - `NOSTR_PUBLISH`: set to `true` to publish to relays
 - `NOSTR_RELAYS`: comma-separated relay URLs. Default: `wss://nos.lol,wss://relay.damus.io,wss://relay.primal.net`
 - `MERCHANT_API_KEYS`: comma-separated bearer tokens accepted by `/merchant/conversions`.
+- `SATS_PER_USD`: server-side USD→sats conversion rate used only when merchant reports `currency: "USD"`. Default: `2500`.
 
 ## Merchant webhook
 
@@ -70,14 +71,22 @@ curl -X POST "$BASE_URL/merchant/conversions" \
   -d '{
     "order_id": "order_123",
     "bb_click_id": "clk_from_redirect",
-    "order_total": 100,
-    "currency": "USD",
+    "order_total": 250000,
+    "currency": "SATS",
     "customer_hash": "sha256:optional_customer_hash",
-    "metadata": {"platform": "shopify"}
+    "metadata": {"platform": "oshigoods"}
   }'
 ```
 
-The response includes `receipt_url`, `json_receipt_url`, `nostr_event_id`, payout status, and relay results. Duplicate `order_id` submissions are idempotent and return the original conversion.
+Supported currencies:
+
+- `SATS`: `order_total` is already sats, ideal for Nostr-native merchants.
+- `BTC`: `order_total` is BTC and the app converts to sats.
+- `USD`: the merchant sends fiat amount; Bumbei/this service converts to sats with server-side `SATS_PER_USD`.
+
+Merchants do **not** send `sats_per_usd`; exchange-rate policy stays server-side.
+
+The response includes `order_total_sats`, `receipt_url`, `json_receipt_url`, `nostr_event_id`, payout status, and relay results. Duplicate `order_id` submissions are idempotent and return the original conversion.
 
 ## Privacy note
 

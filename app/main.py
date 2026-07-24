@@ -21,6 +21,7 @@ APP_SECRET = os.getenv("APP_SECRET", "dev-secret-change-me")
 BASE_URL = os.getenv("BASE_URL", "http://localhost:8000").rstrip("/")
 DEFAULT_DESTINATION = os.getenv("DEFAULT_DESTINATION_URL", "https://example.com/checkout")
 DEFAULT_RELAYS = "wss://nos.lol,wss://relay.damus.io,wss://relay.primal.net"
+DEFAULT_SATS_PER_USD = int(os.getenv("SATS_PER_USD", "2500"))
 
 app = FastAPI(
     title="Nostr Affiliate POC",
@@ -70,6 +71,19 @@ def hid(prefix: str) -> str:
 
 def sha(value: str) -> str:
     return "sha256:" + hashlib.sha256(value.encode()).hexdigest()
+
+
+def order_total_sats(order_total: float, currency: str, sats_per_usd: int | None = None) -> int:
+    normalized = currency.upper().strip()
+    if normalized in {"SAT", "SATS", "MSAT"}:
+        if normalized == "MSAT":
+            return round(order_total / 1000)
+        return round(order_total)
+    if normalized in {"BTC", "XBT"}:
+        return round(order_total * 100_000_000)
+    if normalized in {"USD", "USDC"}:
+        return round(order_total * (sats_per_usd or DEFAULT_SATS_PER_USD))
+    raise HTTPException(400, "unsupported currency; use USD, SATS, or BTC")
 
 
 def nostr_relays() -> list[str]:
@@ -329,8 +343,7 @@ class MerchantConversionIn(BaseModel):
     order_id: str = Field(..., min_length=3)
     bb_click_id: str = Field(..., min_length=4)
     order_total: float = Field(..., gt=0)
-    currency: str = "USD"
-    sats_per_usd: int = 2500
+    currency: str = Field("USD", description="USD, SATS, or BTC. USD is converted to sats server-side.")
     customer_hash: Optional[str] = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -345,6 +358,7 @@ def health() -> dict[str, Any]:
         "nostr_pubkey": nostr_keys().public_key().to_hex(),
         "nostr_publish": nostr_publish_enabled(),
         "relays": nostr_relays(),
+        "sats_per_usd": DEFAULT_SATS_PER_USD,
     }
 
 
@@ -499,7 +513,8 @@ def create_conversion(body: ConversionIn, bb_click_id: Optional[str] = Cookie(No
             raise HTTPException(404, "click not found")
         camp = asdict(c.execute(text("SELECT * FROM campaigns WHERE id=:id"), {"id": click["campaign_id"]}).fetchone())
         enr = asdict(c.execute(text("SELECT * FROM enrollments WHERE ref_code=:ref"), {"ref": click["ref_code"]}).fetchone())
-        commission_sats = round(body.order_total * body.sats_per_usd * int(camp["commission_bps"]) / 10000)
+        total_sats = order_total_sats(body.order_total, body.currency, body.sats_per_usd)
+        commission_sats = round(total_sats * int(camp["commission_bps"]) / 10000)
         conversion_id = hid("conv")
         event = build_nostr_event(
             39005,
@@ -510,6 +525,8 @@ def create_conversion(body: ConversionIn, bb_click_id: Optional[str] = Cookie(No
                 ["affiliate", click["affiliate_pubkey"]],
                 ["click_hash", sha(click_id)],
                 ["conversion_hash", sha(body.order_id)],
+                ["order_total_sats", str(total_sats)],
+                ["order_currency", body.currency.upper()],
                 ["commission_sats", str(commission_sats)],
                 ["status", "approved"],
             ],
@@ -658,14 +675,18 @@ def merchant_conversion_webhook(body: MerchantConversionIn, authorization: str |
             click_id=body.bb_click_id,
             order_total=body.order_total,
             currency=body.currency,
-            sats_per_usd=body.sats_per_usd,
+            sats_per_usd=DEFAULT_SATS_PER_USD,
         )
     )
+    total_sats = order_total_sats(body.order_total, body.currency, DEFAULT_SATS_PER_USD)
     return {
         "ok": True,
         "duplicate": False,
         "conversion_id": conversion["conversion_id"],
         "nostr_event_id": conversion["nostr_event_id"],
+        "order_total_sats": total_sats,
+        "sats_per_usd_source": "server" if body.currency.upper() in {"USD", "USDC"} else "not_required",
+        "sats_per_usd": DEFAULT_SATS_PER_USD if body.currency.upper() in {"USD", "USDC"} else None,
         "commission_sats": conversion["commission_sats"],
         "payout_status": conversion["payout_status"],
         "receipt_url": f"{BASE_URL}/flows/{conversion['conversion_id']}/receipt",
@@ -989,14 +1010,14 @@ DASHBOARD_HTML = """
   </section>
   <section class="card span-12">
     <h2>Merchant webhook</h2>
-    <p>Para integraciones server-to-server tipo Shopify/WooCommerce/custom checkout: <code>POST /merchant/conversions</code> con <code>Authorization: Bearer bumbei-demo-key</code>. El merchant devuelve <code>bb_click_id</code> y recibe una receipt URL.</p>
+    <p>Para integraciones server-to-server tipo Shopify/WooCommerce/custom checkout: <code>POST /merchant/conversions</code>. El merchant devuelve <code>bb_click_id</code>; si reporta <code>USD</code>, Bumbei calcula sats con su rate server-side. También acepta <code>SATS</code> o <code>BTC</code> para merchants Nostr-native como Oshigoods.</p>
     <pre>{
   "order_id": "order_123",
   "bb_click_id": "clk_y8DrWEwJ8R",
-  "order_total": 100,
-  "currency": "USD",
+  "order_total": 250000,
+  "currency": "SATS",
   "customer_hash": "sha256:...",
-  "metadata": {"platform": "shopify"}
+  "metadata": {"platform": "oshigoods"}
 }</pre>
   </section>
   <section class="grid">

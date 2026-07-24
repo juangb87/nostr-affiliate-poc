@@ -55,6 +55,8 @@ def test_demo_flow_creates_conversion_and_proof(tmp_path, monkeypatch):
     webhook_json = webhook.json()
     assert webhook_json['ok'] is True
     assert webhook_json['duplicate'] is False
+    assert webhook_json['order_total_sats'] == 312500
+    assert webhook_json['sats_per_usd_source'] == 'server'
     assert webhook_json['receipt_url'].endswith(f"/flows/{webhook_json['conversion_id']}/receipt")
     duplicate = client.post(
         '/merchant/conversions',
@@ -64,3 +66,22 @@ def test_demo_flow_creates_conversion_and_proof(tmp_path, monkeypatch):
     assert duplicate.status_code == 200
     assert duplicate.json()['duplicate'] is True
     assert duplicate.json()['conversion_id'] == webhook_json['conversion_id']
+    sat_click = client.post('/clicks/simulate', json={'ref_code': data['enrollment']['ref_code']}).json()['click_id']
+    sats_webhook = client.post(
+        '/merchant/conversions',
+        headers={'Authorization': 'Bearer bumbei-demo-key'},
+        json={'order_id': 'merchant_order_sats', 'bb_click_id': sat_click, 'order_total': 250000, 'currency': 'SATS', 'metadata': {'platform': 'oshigoods'}},
+    )
+    assert sats_webhook.status_code == 200, sats_webhook.text
+    assert sats_webhook.json()['order_total_sats'] == 250000
+    assert sats_webhook.json()['commission_sats'] == 20000
+    assert sats_webhook.json()['sats_per_usd_source'] == 'not_required'
+    btc_click = client.post('/clicks/simulate', json={'ref_code': data['enrollment']['ref_code']}).json()['click_id']
+    btc_webhook = client.post(
+        '/merchant/conversions',
+        headers={'Authorization': 'Bearer bumbei-demo-key'},
+        json={'order_id': 'merchant_order_btc', 'bb_click_id': btc_click, 'order_total': 0.0025, 'currency': 'BTC'},
+    )
+    assert btc_webhook.status_code == 200, btc_webhook.text
+    assert btc_webhook.json()['order_total_sats'] == 250000
+    assert btc_webhook.json()['commission_sats'] == 20000
