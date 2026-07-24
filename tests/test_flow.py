@@ -11,7 +11,15 @@ def test_demo_flow_creates_conversion_and_proof(tmp_path, monkeypatch):
     assert res.status_code == 200, res.text
     data = res.json()
     assert data['campaign']['campaign_id'].startswith('camp_')
+    assert data['campaign']['merchant_pubkey'].startswith('npub')
+    assert len(data['campaign']['merchant_pubkey_hex']) == 64
+    assert any(t[0] == 'p' and t[3] == 'merchant' for t in data['campaign']['nostr_event']['tags'])
+    bad_campaign = client.post('/campaigns', json={'merchant_pubkey': 'merchant_pubkey_demo', 'destination_url': 'https://example.com'})
+    assert bad_campaign.status_code == 400
     assert data['enrollment']['ref_url'].endswith(data['enrollment']['ref_code'])
+    assert data['enrollment']['affiliate_pubkey'].startswith('npub')
+    assert len(data['enrollment']['affiliate_pubkey_hex']) == 64
+    assert any(t[0] == 'p' and t[3] == 'affiliate' for t in data['enrollment']['nostr_event']['tags'])
     assert data['conversion']['commission_sats'] == 20000
     assert data['conversion']['nostr_event']['kind'] == 39005
     assert data['conversion']['nostr_event']['pubkey']

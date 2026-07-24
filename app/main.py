@@ -12,7 +12,7 @@ from typing import Any, Optional
 
 from fastapi import Cookie, FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
-from nostr_sdk import Client, EventBuilder, Keys, Kind, RelayUrl, Tag
+from nostr_sdk import Client, EventBuilder, Keys, Kind, PublicKey, RelayUrl, Tag
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
@@ -22,6 +22,8 @@ BASE_URL = os.getenv("BASE_URL", "http://localhost:8000").rstrip("/")
 DEFAULT_DESTINATION = os.getenv("DEFAULT_DESTINATION_URL", "https://example.com/checkout")
 DEFAULT_RELAYS = "wss://nos.lol,wss://relay.damus.io,wss://relay.primal.net"
 DEFAULT_SATS_PER_USD = int(os.getenv("SATS_PER_USD", "2500"))
+DEFAULT_MERCHANT_NPUB = "npub1540rxhz9x7fpc73nu5q3qydykej7lceh5j4jej6mmpc6n3saw3cqv7s8js"
+DEFAULT_AFFILIATE_NPUB = "npub16ghkhw9d4g9x6pxp6l6dtyjqaeuavwucrq8gpkt60x0kx9fzqwpszhtw0n"
 
 app = FastAPI(
     title="Nostr Affiliate POC",
@@ -84,6 +86,15 @@ def order_total_sats(order_total: float, currency: str, sats_per_usd: int | None
     if normalized in {"USD", "USDC"}:
         return round(order_total * (sats_per_usd or DEFAULT_SATS_PER_USD))
     raise HTTPException(400, "unsupported currency; use USD, SATS, or BTC")
+
+
+def normalize_pubkey(value: str, label: str = "pubkey") -> dict[str, str]:
+    raw = value.strip()
+    try:
+        pk = PublicKey.parse(raw)
+    except Exception as exc:
+        raise HTTPException(400, f"invalid {label}; expected npub or 64-char hex pubkey") from exc
+    return {"npub": pk.to_bech32(), "hex": pk.to_hex(), "input": raw}
 
 
 def nostr_relays() -> list[str]:
@@ -223,6 +234,7 @@ def init_db() -> None:
     CREATE TABLE IF NOT EXISTS campaigns (
         id TEXT PRIMARY KEY,
         merchant_pubkey TEXT NOT NULL,
+        merchant_pubkey_hex TEXT,
         name TEXT NOT NULL,
         commission_bps INTEGER NOT NULL,
         window_days INTEGER NOT NULL,
@@ -236,6 +248,7 @@ def init_db() -> None:
         id TEXT PRIMARY KEY,
         campaign_id TEXT NOT NULL,
         affiliate_pubkey TEXT NOT NULL,
+        affiliate_pubkey_hex TEXT,
         lightning_address TEXT,
         ref_code TEXT UNIQUE NOT NULL,
         nostr_event_id TEXT NOT NULL,
@@ -305,6 +318,16 @@ def init_db() -> None:
     with engine().begin() as c:
         for stmt in [s.strip() for s in ddl.split(";") if s.strip()]:
             c.execute(text(stmt))
+        if database_url().startswith("postgresql"):
+            c.execute(text("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS merchant_pubkey_hex TEXT"))
+            c.execute(text("ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS affiliate_pubkey_hex TEXT"))
+        else:
+            campaign_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(campaigns)")).fetchall()}
+            enrollment_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(enrollments)")).fetchall()}
+            if "merchant_pubkey_hex" not in campaign_cols:
+                c.execute(text("ALTER TABLE campaigns ADD COLUMN merchant_pubkey_hex TEXT"))
+            if "affiliate_pubkey_hex" not in enrollment_cols:
+                c.execute(text("ALTER TABLE enrollments ADD COLUMN affiliate_pubkey_hex TEXT"))
 
 
 @app.on_event("startup")
@@ -313,7 +336,7 @@ def startup() -> None:
 
 
 class CampaignIn(BaseModel):
-    merchant_pubkey: str = Field(..., examples=["merchant_pubkey_demo"])
+    merchant_pubkey: str = Field(..., examples=[DEFAULT_MERCHANT_NPUB])
     name: str = "Bumbei BTC Rewards"
     commission_bps: int = 800
     attribution_window_days: int = 30
@@ -323,7 +346,7 @@ class CampaignIn(BaseModel):
 
 class EnrollmentIn(BaseModel):
     campaign_id: str
-    affiliate_pubkey: str = Field(..., examples=["affiliate_pubkey_demo"])
+    affiliate_pubkey: str = Field(..., examples=[DEFAULT_AFFILIATE_NPUB])
     lightning_address: Optional[str] = Field(None, examples=["seba@getalby.com"])
 
 
@@ -373,13 +396,16 @@ def health() -> dict[str, Any]:
 def create_campaign(body: CampaignIn) -> dict[str, Any]:
     init_db()
     campaign_id = hid("camp")
+    merchant = normalize_pubkey(body.merchant_pubkey, "merchant_pubkey")
     terms_hash = sha(body.terms_url)
     event = build_nostr_event(
         39001,
         [
             ["d", campaign_id],
             ["type", "affiliate_campaign"],
-            ["merchant", body.merchant_pubkey],
+            ["p", merchant["hex"], "", "merchant"],
+            ["merchant", merchant["hex"]],
+            ["merchant_npub", merchant["npub"]],
             ["commission_bps", str(body.commission_bps)],
             ["window_days", str(body.attribution_window_days)],
             ["payout", "sats"],
@@ -394,15 +420,16 @@ def create_campaign(body: CampaignIn) -> dict[str, Any]:
         c.execute(
             text(
                 """
-                INSERT INTO campaigns (id, merchant_pubkey, name, commission_bps, window_days,
+                INSERT INTO campaigns (id, merchant_pubkey, merchant_pubkey_hex, name, commission_bps, window_days,
                 destination_url, terms_hash, nostr_event_id, nostr_event_json, created_at)
-                VALUES (:id, :merchant_pubkey, :name, :commission_bps, :window_days,
+                VALUES (:id, :merchant_pubkey, :merchant_pubkey_hex, :name, :commission_bps, :window_days,
                 :destination_url, :terms_hash, :nostr_event_id, :nostr_event_json, :created_at)
                 """
             ),
             {
                 "id": campaign_id,
-                "merchant_pubkey": body.merchant_pubkey,
+                "merchant_pubkey": merchant["npub"],
+                "merchant_pubkey_hex": merchant["hex"],
                 "name": body.name,
                 "commission_bps": body.commission_bps,
                 "window_days": body.attribution_window_days,
@@ -413,7 +440,7 @@ def create_campaign(body: CampaignIn) -> dict[str, Any]:
                 "created_at": now(),
             },
         )
-    return {"campaign_id": campaign_id, "nostr_event_id": event["id"], "nostr_event": event, "relay_results": relay_results}
+    return {"campaign_id": campaign_id, "merchant_pubkey": merchant["npub"], "merchant_pubkey_hex": merchant["hex"], "nostr_event_id": event["id"], "nostr_event": event, "relay_results": relay_results}
 
 
 @app.get("/campaigns/{campaign_id}")
@@ -435,13 +462,20 @@ def create_enrollment(body: EnrollmentIn) -> dict[str, Any]:
         raise HTTPException(404, "campaign not found")
     enrollment_id = hid("enr")
     ref_code = hid("ref")
+    affiliate = normalize_pubkey(body.affiliate_pubkey, "affiliate_pubkey")
+    merchant_hex = camp.get("merchant_pubkey_hex") or normalize_pubkey(camp["merchant_pubkey"], "merchant_pubkey")["hex"]
     event = build_nostr_event(
         39002,
         [
+            ["d", enrollment_id],
             ["type", "affiliate_enrollment"],
             ["campaign", body.campaign_id],
-            ["merchant", camp["merchant_pubkey"]],
-            ["affiliate", body.affiliate_pubkey],
+            ["p", merchant_hex, "", "merchant"],
+            ["p", affiliate["hex"], "", "affiliate"],
+            ["merchant", merchant_hex],
+            ["merchant_npub", camp["merchant_pubkey"]],
+            ["affiliate", affiliate["hex"]],
+            ["affiliate_npub", affiliate["npub"]],
             ["terms", camp["terms_hash"]],
         ],
         "",
@@ -452,16 +486,17 @@ def create_enrollment(body: EnrollmentIn) -> dict[str, Any]:
         c.execute(
             text(
                 """
-                INSERT INTO enrollments (id, campaign_id, affiliate_pubkey, lightning_address,
+                INSERT INTO enrollments (id, campaign_id, affiliate_pubkey, affiliate_pubkey_hex, lightning_address,
                 ref_code, nostr_event_id, nostr_event_json, created_at)
-                VALUES (:id, :campaign_id, :affiliate_pubkey, :lightning_address,
+                VALUES (:id, :campaign_id, :affiliate_pubkey, :affiliate_pubkey_hex, :lightning_address,
                 :ref_code, :nostr_event_id, :nostr_event_json, :created_at)
                 """
             ),
             {
                 "id": enrollment_id,
                 "campaign_id": body.campaign_id,
-                "affiliate_pubkey": body.affiliate_pubkey,
+                "affiliate_pubkey": affiliate["npub"],
+                "affiliate_pubkey_hex": affiliate["hex"],
                 "lightning_address": body.lightning_address,
                 "ref_code": ref_code,
                 "nostr_event_id": event["id"],
@@ -469,7 +504,7 @@ def create_enrollment(body: EnrollmentIn) -> dict[str, Any]:
                 "created_at": now(),
             },
         )
-    return {"enrollment_id": enrollment_id, "ref_code": ref_code, "ref_url": f"{BASE_URL}/r/{ref_code}", "nostr_event_id": event["id"], "nostr_event": event, "relay_results": relay_results}
+    return {"enrollment_id": enrollment_id, "affiliate_pubkey": affiliate["npub"], "affiliate_pubkey_hex": affiliate["hex"], "ref_code": ref_code, "ref_url": f"{BASE_URL}/r/{ref_code}", "nostr_event_id": event["id"], "nostr_event": event, "relay_results": relay_results}
 
 
 @app.get("/r/{ref_code}")
@@ -528,8 +563,12 @@ def create_conversion(body: ConversionIn, bb_click_id: Optional[str] = Cookie(No
             [
                 ["type", "affiliate_conversion"],
                 ["campaign", click["campaign_id"]],
-                ["merchant", camp["merchant_pubkey"]],
-                ["affiliate", click["affiliate_pubkey"]],
+                ["p", (camp.get("merchant_pubkey_hex") or normalize_pubkey(camp["merchant_pubkey"], "merchant_pubkey")["hex"]), "", "merchant"],
+                ["p", (enr.get("affiliate_pubkey_hex") if enr else None) or normalize_pubkey(click["affiliate_pubkey"], "affiliate_pubkey")["hex"], "", "affiliate"],
+                ["merchant", (camp.get("merchant_pubkey_hex") or normalize_pubkey(camp["merchant_pubkey"], "merchant_pubkey")["hex"])],
+                ["merchant_npub", camp["merchant_pubkey"]],
+                ["affiliate", ((enr.get("affiliate_pubkey_hex") if enr else None) or normalize_pubkey(click["affiliate_pubkey"], "affiliate_pubkey")["hex"])],
+                ["affiliate_npub", click["affiliate_pubkey"]],
                 ["click_hash", sha(click_id)],
                 ["conversion_hash", sha(body.order_id)],
                 ["order_total_sats", str(total_sats)],
@@ -923,8 +962,8 @@ def flow_receipt_page(conversion_id: str) -> str:
 
 @app.post("/demo")
 def demo() -> dict[str, Any]:
-    campaign = create_campaign(CampaignIn(merchant_pubkey="merchant_pubkey_demo", destination_url=f"{BASE_URL}/demo-checkout"))
-    enrollment = create_enrollment(EnrollmentIn(campaign_id=campaign["campaign_id"], affiliate_pubkey="affiliate_pubkey_demo", lightning_address="affiliate@getalby.com"))
+    campaign = create_campaign(CampaignIn(merchant_pubkey=DEFAULT_MERCHANT_NPUB, destination_url=f"{BASE_URL}/demo-checkout"))
+    enrollment = create_enrollment(EnrollmentIn(campaign_id=campaign["campaign_id"], affiliate_pubkey=DEFAULT_AFFILIATE_NPUB, lightning_address="affiliate@getalby.com"))
     click_id = hid("clk")
     with engine().begin() as c:
         c.execute(
@@ -940,7 +979,7 @@ def demo() -> dict[str, Any]:
                 "id": click_id,
                 "ref_code": enrollment["ref_code"],
                 "campaign_id": campaign["campaign_id"],
-                "affiliate_pubkey": "affiliate_pubkey_demo",
+                "affiliate_pubkey": DEFAULT_AFFILIATE_NPUB,
                 "ip_hash": sha("demo-ip"),
                 "user_agent_hash": sha("demo-ua"),
                 "landing_url": f"{BASE_URL}/demo-checkout",
@@ -948,7 +987,7 @@ def demo() -> dict[str, Any]:
             },
         )
     conversion = create_conversion(ConversionIn(order_id=hid("ord"), click_id=click_id, order_total=100.0, currency="USD"))
-    return {"campaign": campaign, "enrollment": enrollment, "click_id": click_id, "conversion": conversion, "affiliate": affiliate_summary("affiliate_pubkey_demo")}
+    return {"campaign": campaign, "enrollment": enrollment, "click_id": click_id, "conversion": conversion, "affiliate": affiliate_summary(DEFAULT_AFFILIATE_NPUB)}
 
 
 
@@ -1190,7 +1229,7 @@ DASHBOARD_HTML = """
   <section class="grid">
     <div class="card span-4">
       <h2>1. Create campaign</h2>
-      <div class="row"><input id="merchant" value="merchant_pubkey_demo" placeholder="merchant pubkey"><input id="campaignName" value="Bumbei BTC Rewards" placeholder="campaign name"></div>
+      <div class="row"><input id="merchant" value="npub1540rxhz9x7fpc73nu5q3qydykej7lceh5j4jej6mmpc6n3saw3cqv7s8js" placeholder="merchant pubkey"><input id="campaignName" value="Bumbei BTC Rewards" placeholder="campaign name"></div>
       <div class="row"><input id="commission" type="number" value="800" placeholder="bps"><input id="windowDays" type="number" value="30" placeholder="window days"></div>
       <input id="destination" value="https://example.com/checkout" placeholder="destination URL">
       <p><button onclick="createCampaign()">Create campaign + publish Nostr event</button></p>
@@ -1198,7 +1237,7 @@ DASHBOARD_HTML = """
     <div class="card span-4">
       <h2>2. Enroll affiliate</h2>
       <input id="campaignId" placeholder="campaign_id from step 1">
-      <div class="row"><input id="affiliate" value="affiliate_pubkey_demo" placeholder="affiliate pubkey"><input id="lightning" value="affiliate@getalby.com" placeholder="Lightning address"></div>
+      <div class="row"><input id="affiliate" value="npub16ghkhw9d4g9x6pxp6l6dtyjqaeuavwucrq8gpkt60x0kx9fzqwpszhtw0n" placeholder="affiliate pubkey"><input id="lightning" value="affiliate@getalby.com" placeholder="Lightning address"></div>
       <p><button onclick="createEnrollment()">Enroll + generate ref link</button></p>
       <p id="refBox" class="label"></p>
     </div>

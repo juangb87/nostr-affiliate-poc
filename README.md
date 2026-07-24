@@ -6,7 +6,7 @@ Minimal proof-of-concept for a Nostr-powered affiliate network:
 
 ## What this MVP proves
 
-- Portable merchant/affiliate identity via pubkeys/npubs
+- Portable merchant/affiliate identity via validated Nostr pubkeys (`npub` or 64-char hex)
 - Campaign terms as signed, timestamped Nostr events
 - Last-click attribution using `click_id`
 - Conversion proof events with hashed click/order IDs
