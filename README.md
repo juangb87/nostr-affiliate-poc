@@ -48,6 +48,9 @@ python scripts/e2e.py
 - `GET /affiliates/{npub_or_hex}`
 - `GET /affiliates/{npub_or_hex}/summary`
 - `GET /affiliates/{npub_or_hex}/profile`
+- `GET /payouts/{payout_id}`
+- `POST /payouts/{payout_id}/mark-paid` — sandbox Lightning payout settlement + kind `39006` proof
+- `GET /payouts/{payout_id}/receipt`
 - `GET /nostr/events/{event_id}`
 - `POST /demo`
 

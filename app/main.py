@@ -378,6 +378,11 @@ class DemoMerchantCheckoutIn(BaseModel):
     currency: str = "SATS"
 
 
+class PayoutMarkPaidIn(BaseModel):
+    payment_hash: Optional[str] = Field(None, description="Sandbox Lightning payment hash. Generated if omitted.")
+    note: Optional[str] = "sandbox payout paid"
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     init_db()
@@ -780,7 +785,7 @@ def affiliate_public_data(affiliate_pubkey: str) -> dict[str, Any]:
             {"npub": identity["npub"], "hex": identity["hex"]},
         ).fetchall()]
         payouts = [dict(r._mapping) for r in c.execute(text("SELECT * FROM payouts WHERE affiliate_pubkey=:npub OR affiliate_pubkey=:hex ORDER BY created_at DESC"), {"npub": identity["npub"], "hex": identity["hex"]}).fetchall()]
-        entity_ids = [e["id"] for e in enrollments] + [v["id"] for v in conversions]
+        entity_ids = [e["id"] for e in enrollments] + [v["id"] for v in conversions] + [p["id"] for p in payouts]
         events: list[dict[str, Any]] = []
         relays_by_event: dict[str, list[dict[str, Any]]] = {}
         for entity_id in entity_ids:
@@ -894,6 +899,128 @@ def affiliate_public_profile(affiliate_pubkey: str) -> str:
 """
 
 
+def payout_data(payout_id: str) -> dict[str, Any]:
+    init_db()
+    with engine().connect() as c:
+        payout = asdict(c.execute(text("SELECT * FROM payouts WHERE id=:id"), {"id": payout_id}).fetchone())
+        if not payout:
+            raise HTTPException(404, "payout not found")
+        conversion = asdict(c.execute(text("SELECT * FROM conversions WHERE id=:id"), {"id": payout["conversion_id"]}).fetchone())
+        campaign = asdict(c.execute(text("SELECT * FROM campaigns WHERE id=:id"), {"id": conversion["campaign_id"] if conversion else None}).fetchone()) if conversion else None
+        click = asdict(c.execute(text("SELECT * FROM clicks WHERE id=:id"), {"id": conversion["click_id"] if conversion else None}).fetchone()) if conversion else None
+        enrollment = asdict(c.execute(text("SELECT * FROM enrollments WHERE ref_code=:ref"), {"ref": click["ref_code"] if click else None}).fetchone()) if click else None
+        event = asdict(c.execute(text("SELECT event_id, kind, pubkey, entity_type, entity_id, relay_status, event_json, created_at, published_at FROM nostr_events WHERE event_id=:id"), {"id": payout.get("nostr_event_id")}).fetchone()) if payout.get("nostr_event_id") else None
+        relays = [dict(r._mapping) for r in c.execute(text("SELECT relay_url, status, error, created_at FROM nostr_event_relays WHERE event_id=:id"), {"id": payout.get("nostr_event_id")}).fetchall()] if payout.get("nostr_event_id") else []
+    if event:
+        event["event_json"] = json.loads(event["event_json"])
+        event["relays"] = relays
+    return {"payout": payout, "conversion": conversion, "campaign": campaign, "click": click, "enrollment": enrollment, "event": event}
+
+
+@app.get("/payouts/{payout_id}")
+def payout_detail(payout_id: str) -> dict[str, Any]:
+    return payout_data(payout_id)
+
+
+@app.post("/payouts/{payout_id}/mark-paid")
+def mark_payout_paid(payout_id: str, body: PayoutMarkPaidIn) -> dict[str, Any]:
+    init_db()
+    with engine().begin() as c:
+        payout = asdict(c.execute(text("SELECT * FROM payouts WHERE id=:id"), {"id": payout_id}).fetchone())
+        if not payout:
+            raise HTTPException(404, "payout not found")
+        conversion = asdict(c.execute(text("SELECT * FROM conversions WHERE id=:id"), {"id": payout["conversion_id"]}).fetchone())
+        campaign = asdict(c.execute(text("SELECT * FROM campaigns WHERE id=:id"), {"id": conversion["campaign_id"] if conversion else None}).fetchone()) if conversion else None
+        click = asdict(c.execute(text("SELECT * FROM clicks WHERE id=:id"), {"id": conversion["click_id"] if conversion else None}).fetchone()) if conversion else None
+        enrollment = asdict(c.execute(text("SELECT * FROM enrollments WHERE ref_code=:ref"), {"ref": click["ref_code"] if click else None}).fetchone()) if click else None
+        if payout["status"] == "paid" and payout.get("nostr_event_id"):
+            existing_event = json.loads(payout["nostr_event_json"]) if payout.get("nostr_event_json") else None
+            return {
+                "ok": True,
+                "duplicate": True,
+                "payout_id": payout_id,
+                "payout_status": "paid",
+                "payment_hash": payout.get("payment_hash"),
+                "nostr_event_id": payout.get("nostr_event_id"),
+                "nostr_event": existing_event,
+                "receipt_url": f"{BASE_URL}/payouts/{payout_id}/receipt",
+                "flow_receipt_url": f"{BASE_URL}/flows/{payout['conversion_id']}/receipt",
+            }
+        if not conversion or not campaign:
+            raise HTTPException(400, "payout is missing conversion/campaign context")
+        payment_hash = (body.payment_hash or sha(f"{payout_id}:{time.time()}"))
+        affiliate_identity = normalize_pubkey(payout["affiliate_pubkey"], "affiliate_pubkey")
+        merchant_hex = campaign.get("merchant_pubkey_hex") or normalize_pubkey(campaign["merchant_pubkey"], "merchant_pubkey")["hex"]
+        event = build_nostr_event(
+            39006,
+            [
+                ["d", payout_id],
+                ["type", "affiliate_payout"],
+                ["status", "paid"],
+                ["payout", payout_id],
+                ["conversion", payout["conversion_id"]],
+                ["campaign", conversion["campaign_id"]],
+                ["p", merchant_hex, "", "merchant"],
+                ["p", affiliate_identity["hex"], "", "affiliate"],
+                ["merchant", merchant_hex],
+                ["merchant_npub", campaign["merchant_pubkey"]],
+                ["affiliate", affiliate_identity["hex"]],
+                ["affiliate_npub", affiliate_identity["npub"]],
+                ["amount_sats", str(payout["amount_sats"])],
+                ["payment_hash", payment_hash],
+                ["sandbox", "true"],
+            ],
+            json.dumps({"note": body.note, "lightning_address": payout.get("lightning_address"), "sandbox": True}),
+        )
+        relay_results = publish_event(event)
+        persist_nostr_event(c, event, "payout", payout_id, relay_results)
+        c.execute(
+            text("""
+                UPDATE payouts
+                SET status='paid', payment_hash=:payment_hash, nostr_event_id=:nostr_event_id, nostr_event_json=:nostr_event_json
+                WHERE id=:id
+            """),
+            {"id": payout_id, "payment_hash": payment_hash, "nostr_event_id": event["id"], "nostr_event_json": json.dumps(event)},
+        )
+    return {
+        "ok": True,
+        "duplicate": False,
+        "payout_id": payout_id,
+        "conversion_id": payout["conversion_id"],
+        "payout_status": "paid",
+        "amount_sats": payout["amount_sats"],
+        "payment_hash": payment_hash,
+        "nostr_event_id": event["id"],
+        "nostr_event": event,
+        "relay_results": relay_results,
+        "receipt_url": f"{BASE_URL}/payouts/{payout_id}/receipt",
+        "flow_receipt_url": f"{BASE_URL}/flows/{payout['conversion_id']}/receipt",
+    }
+
+
+@app.get("/payouts/{payout_id}/receipt", response_class=HTMLResponse)
+def payout_receipt_page(payout_id: str) -> str:
+    data = payout_data(payout_id)
+    p = data["payout"]
+    c = data["conversion"] or {}
+    campaign = data["campaign"] or {}
+    event = data["event"]
+    relay_rows = ""
+    if event:
+        relay_rows = "".join(f"<li>{_status_badge(r['status'])} <code>{_esc(r['relay_url'])}</code></li>" for r in event.get("relays", []))
+    else:
+        relay_rows = "<li>No payout proof event yet.</li>"
+    event_link = f"<a href='/nostr/events/{_esc(p.get('nostr_event_id'))}'>{_esc(_short(p.get('nostr_event_id')))}</a>" if p.get("nostr_event_id") else "pending"
+    return f"""
+<!doctype html><html lang='en'><head><meta charset='utf-8'/><meta name='viewport' content='width=device-width, initial-scale=1'/><title>Payout receipt · {_esc(payout_id)}</title>
+<style>:root{{--black:#151615;--orange:#FC6A42;--gray:#E3E3D7;--blue:#6082DB;--yellow:#F9C441;--muted:#a8aa9e;--ok:#75d68a;--bad:#ff8585}}*{{box-sizing:border-box}}body{{margin:0;font-family:Inter,system-ui,sans-serif;background:radial-gradient(circle at top left,rgba(249,196,65,.2),transparent 30rem),var(--black);color:#fff}}header,main{{width:min(1040px,100%);margin:0 auto;padding:30px clamp(16px,4vw,52px)}}header{{border-bottom:1px solid rgba(227,227,215,.12);display:flex;justify-content:space-between;align-items:flex-start;gap:22px}}h1,h2{{margin:0;letter-spacing:-.045em}}h1{{font-size:clamp(36px,6vw,70px);line-height:.9}}p{{color:var(--muted);line-height:1.6}}a{{color:var(--yellow)}}code{{background:rgba(227,227,215,.09);border-radius:7px;padding:2px 6px;word-break:break-all}}.pill,.status{{display:inline-flex;align-items:center;width:max-content;max-width:100%;height:auto;align-self:flex-start;padding:7px 10px;border-radius:999px;border:1px solid rgba(227,227,215,.15);background:rgba(227,227,215,.06);color:var(--gray);font-size:13px;line-height:1.2;white-space:nowrap}}.published{{background:rgba(117,214,138,.18);color:var(--ok)}}.failed{{background:rgba(255,133,133,.18);color:var(--bad)}}.skipped{{background:rgba(249,196,65,.18);color:var(--yellow)}}.grid{{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:18px;margin:22px 0}}.card{{grid-column:span 6 / span 6;min-width:0;border:1px solid rgba(227,227,215,.12);background:linear-gradient(180deg,rgba(255,255,255,.07),rgba(255,255,255,.035));border-radius:24px;padding:22px;overflow:hidden}}.span-12{{grid-column:1/-1}}dl{{display:grid;grid-template-columns:150px minmax(0,1fr);gap:10px 14px}}dt{{color:var(--muted)}}dd{{margin:0;overflow-wrap:anywhere}}@media(max-width:800px){{header{{display:block}}.card{{grid-column:1/-1}}dl{{grid-template-columns:1fr}}}}</style></head>
+<body><header><div><span class='pill'>Payout receipt</span><h1>{_esc(p['amount_sats'])} sats paid.</h1><p>Sandbox Lightning payout proof for an attributed Nostr affiliate conversion.</p></div><div class='pill'>{_esc(p['status'])}</div></header><main><section class='grid'>
+<div class='card'><h2>Payout</h2><dl><dt>Payout ID</dt><dd><code>{_esc(p['id'])}</code></dd><dt>Status</dt><dd>{_status_badge(p['status'])}</dd><dt>Amount</dt><dd>{_esc(p['amount_sats'])} sats</dd><dt>Payment hash</dt><dd><code>{_esc(p.get('payment_hash'))}</code></dd><dt>Lightning address</dt><dd><code>{_esc(p.get('lightning_address'))}</code></dd></dl></div>
+<div class='card'><h2>Attribution</h2><dl><dt>Campaign</dt><dd><a href='/campaigns/{_esc(c.get('campaign_id'))}/page'>{_esc(campaign.get('name'))}</a></dd><dt>Conversion</dt><dd><a href='/flows/{_esc(p['conversion_id'])}/receipt'>{_esc(p['conversion_id'])}</a></dd><dt>Affiliate</dt><dd><a href='/affiliates/{_esc(p['affiliate_pubkey'])}/profile'>{_esc(_short(p['affiliate_pubkey']))}</a></dd><dt>Nostr event</dt><dd>{event_link}</dd></dl></div>
+<section class='card span-12'><h2>Relay receipts</h2><ul>{relay_rows}</ul></section></section></main></body></html>
+"""
+
+
 @app.get("/proofs")
 def proofs() -> dict[str, Any]:
     with engine().connect() as c:
@@ -932,7 +1059,7 @@ def campaign_public_data(campaign_id: str) -> dict[str, Any]:
         clicks = [dict(r._mapping) for r in c.execute(text("SELECT * FROM clicks WHERE campaign_id=:id ORDER BY created_at DESC"), {"id": campaign_id}).fetchall()]
         conversions = [dict(r._mapping) for r in c.execute(text("SELECT * FROM conversions WHERE campaign_id=:id ORDER BY created_at DESC"), {"id": campaign_id}).fetchall()]
         payouts = [dict(r._mapping) for r in c.execute(text("SELECT p.* FROM payouts p JOIN conversions v ON p.conversion_id=v.id WHERE v.campaign_id=:id ORDER BY p.created_at DESC"), {"id": campaign_id}).fetchall()]
-        entity_ids = [campaign_id] + [e["id"] for e in enrollments] + [v["id"] for v in conversions]
+        entity_ids = [campaign_id] + [e["id"] for e in enrollments] + [v["id"] for v in conversions] + [p["id"] for p in payouts]
         events: list[dict[str, Any]] = []
         relays_by_event: dict[str, list[dict[str, Any]]] = {}
         for entity_id in entity_ids:
@@ -984,7 +1111,7 @@ def flow_receipt_data(conversion_id: str) -> dict[str, Any]:
         campaign = asdict(c.execute(text("SELECT * FROM campaigns WHERE id=:id"), {"id": conversion["campaign_id"]}).fetchone())
         enrollment = asdict(c.execute(text("SELECT * FROM enrollments WHERE ref_code=:ref"), {"ref": click["ref_code"] if click else None}).fetchone()) if click else None
         payout = asdict(c.execute(text("SELECT * FROM payouts WHERE conversion_id=:id ORDER BY created_at DESC LIMIT 1"), {"id": conversion_id}).fetchone())
-        event_ids = [eid for eid in [campaign.get("nostr_event_id") if campaign else None, enrollment.get("nostr_event_id") if enrollment else None, conversion.get("nostr_event_id")] if eid]
+        event_ids = [eid for eid in [campaign.get("nostr_event_id") if campaign else None, enrollment.get("nostr_event_id") if enrollment else None, conversion.get("nostr_event_id"), payout.get("nostr_event_id") if payout else None] if eid]
         events: list[dict[str, Any]] = []
         relays_by_event: dict[str, list[dict[str, Any]]] = {}
         if event_ids:
@@ -1213,6 +1340,7 @@ def flow_receipt_page(conversion_id: str) -> str:
       <dt>Lightning address</dt><dd><code>{_esc(payout.get('lightning_address'))}</code></dd>
       <dt>Amount</dt><dd>{_esc(payout.get('amount_sats'))} sats</dd>
       <dt>Payment hash</dt><dd><code>{_esc(payout.get('payment_hash'))}</code></dd>
+      <dt>Payout receipt</dt><dd><a href='/payouts/{_esc(payout.get('id'))}/receipt'>open</a></dd>
     </dl></div>
   </section>
   <section class="card span-12">
