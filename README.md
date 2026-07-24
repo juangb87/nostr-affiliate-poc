@@ -32,6 +32,9 @@ python scripts/e2e.py
 
 - `GET /dashboard`
 - `GET /dashboard/data`
+- `GET /bb.js` — lightweight tracking snippet that captures `bb_click_id`/`bb_ref`
+- `GET /demo-merchant` — demo landing/checkout page using the snippet
+- `POST /demo-merchant/checkout` — demo-only checkout trigger
 - `POST /clicks/simulate`
 - `POST /merchant/conversions` — merchant webhook with `Authorization: Bearer <merchant_api_key>`
 - `POST /campaigns`
@@ -61,6 +64,29 @@ Recommended environment variables:
 - `NOSTR_RELAYS`: comma-separated relay URLs. Default: `wss://nos.lol,wss://relay.damus.io,wss://relay.primal.net`
 - `MERCHANT_API_KEYS`: comma-separated bearer tokens accepted by `/merchant/conversions`.
 - `SATS_PER_USD`: server-side USD→sats conversion rate used only when merchant reports `currency: "USD"`. Default: `2500`.
+
+## Merchant tracking snippet
+
+Real merchants can add:
+
+```html
+<script src="https://nostr-affiliate-poc-production.up.railway.app/bb.js"></script>
+```
+
+The snippet reads `bb_click_id` and `bb_ref` from URL params, stores them in first-party cookie + localStorage, injects hidden checkout form inputs, and exposes:
+
+```js
+window.BumbeiAttribution.get()
+window.BumbeiAttribution.debug()
+```
+
+The demo merchant page is available at `/demo-merchant`. Visit it with params like:
+
+```text
+/demo-merchant?bb_click_id=clk_y8DrWEwJ8R&bb_ref=ref_I6al7223jL
+```
+
+Then submit the checkout form to simulate a paid order and trigger the conversion proof.
 
 ## Merchant webhook
 

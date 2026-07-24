@@ -85,3 +85,18 @@ def test_demo_flow_creates_conversion_and_proof(tmp_path, monkeypatch):
     assert btc_webhook.status_code == 200, btc_webhook.text
     assert btc_webhook.json()['order_total_sats'] == 250000
     assert btc_webhook.json()['commission_sats'] == 20000
+    snippet = client.get('/bb.js')
+    assert snippet.status_code == 200
+    assert 'window.BumbeiAttribution' in snippet.text
+    assert 'bb_click_id' in snippet.text
+    landing = client.get(f"/demo-merchant?bb_click_id={click.json()['click_id']}&bb_ref={data['enrollment']['ref_code']}")
+    assert landing.status_code == 200
+    assert '/bb.js' in landing.text
+    demo_checkout = client.post(
+        '/demo-merchant/checkout',
+        json={'bb_click_id': click.json()['click_id'], 'bb_ref': data['enrollment']['ref_code'], 'order_total': 250000, 'currency': 'SATS'},
+    )
+    assert demo_checkout.status_code == 200, demo_checkout.text
+    assert demo_checkout.json()['ok'] is True
+    assert demo_checkout.json()['order_total_sats'] == 250000
+    assert demo_checkout.json()['receipt_url'].endswith(f"/flows/{demo_checkout.json()['conversion_id']}/receipt")

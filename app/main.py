@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from fastapi import Cookie, FastAPI, Header, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from nostr_sdk import Client, EventBuilder, Keys, Kind, RelayUrl, Tag
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, text
@@ -346,6 +346,13 @@ class MerchantConversionIn(BaseModel):
     currency: str = Field("USD", description="USD, SATS, or BTC. USD is converted to sats server-side.")
     customer_hash: Optional[str] = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class DemoMerchantCheckoutIn(BaseModel):
+    bb_click_id: str = Field(..., min_length=4)
+    bb_ref: Optional[str] = None
+    order_total: float = Field(250000, gt=0)
+    currency: str = "SATS"
 
 
 @app.get("/health")
@@ -943,6 +950,166 @@ def demo() -> dict[str, Any]:
     conversion = create_conversion(ConversionIn(order_id=hid("ord"), click_id=click_id, order_total=100.0, currency="USD"))
     return {"campaign": campaign, "enrollment": enrollment, "click_id": click_id, "conversion": conversion, "affiliate": affiliate_summary("affiliate_pubkey_demo")}
 
+
+
+BB_JS = r"""
+(function(){
+  var COOKIE_DAYS = 30;
+  function readParams(){
+    var p = new URLSearchParams(window.location.search || '');
+    return { bb_click_id: p.get('bb_click_id'), bb_ref: p.get('bb_ref') };
+  }
+  function setCookie(name, value){
+    if(!value) return;
+    var maxAge = COOKIE_DAYS * 24 * 60 * 60;
+    document.cookie = name + '=' + encodeURIComponent(value) + '; path=/; max-age=' + maxAge + '; SameSite=Lax';
+  }
+  function getCookie(name){
+    var match = document.cookie.match(new RegExp('(?:^|; )' + name.replace(/[.$?*|{}()\[\]\\\/\+^]/g, '\\$&') + '=([^;]*)'));
+    return match ? decodeURIComponent(match[1]) : null;
+  }
+  function save(attribution){
+    if(attribution.bb_click_id) { localStorage.setItem('bb_click_id', attribution.bb_click_id); setCookie('bb_click_id', attribution.bb_click_id); }
+    if(attribution.bb_ref) { localStorage.setItem('bb_ref', attribution.bb_ref); setCookie('bb_ref', attribution.bb_ref); }
+  }
+  function get(){
+    return {
+      bb_click_id: localStorage.getItem('bb_click_id') || getCookie('bb_click_id'),
+      bb_ref: localStorage.getItem('bb_ref') || getCookie('bb_ref')
+    };
+  }
+  function injectHiddenInputs(root){
+    var attr = get();
+    root = root || document;
+    Array.prototype.forEach.call(root.querySelectorAll('form'), function(form){
+      ['bb_click_id','bb_ref'].forEach(function(name){
+        var val = attr[name];
+        if(!val) return;
+        var input = form.querySelector('input[name="'+name+'"]');
+        if(!input){
+          input = document.createElement('input');
+          input.type = 'hidden';
+          input.name = name;
+          form.appendChild(input);
+        }
+        input.value = val;
+      });
+    });
+  }
+  function init(){
+    var params = readParams();
+    if(params.bb_click_id || params.bb_ref) save(params);
+    injectHiddenInputs(document);
+    window.dispatchEvent(new CustomEvent('bumbei:attribution', { detail: get() }));
+  }
+  window.BumbeiAttribution = {
+    init: init,
+    get: get,
+    save: save,
+    injectHiddenInputs: injectHiddenInputs,
+    debug: function(){ console.table(get()); return get(); }
+  };
+  if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
+})();
+"""
+
+
+@app.get("/bb.js")
+def bb_js() -> Response:
+    return Response(BB_JS, media_type="application/javascript", headers={"Cache-Control": "public, max-age=300"})
+
+
+@app.get("/demo-merchant", response_class=HTMLResponse)
+def demo_merchant_page() -> str:
+    return f"""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Demo merchant checkout · Bumbei</title>
+  <style>
+    :root {{ --black:#151615; --orange:#FC6A42; --gray:#E3E3D7; --yellow:#F9C441; --muted:#a8aa9e; --ok:#75d68a; }}
+    * {{ box-sizing:border-box; }} body {{ margin:0; font-family:Inter,system-ui,sans-serif; background:radial-gradient(circle at top left, rgba(252,106,66,.24), transparent 30rem), var(--black); color:#fff; }}
+    main {{ width:min(980px,100%); margin:0 auto; padding:42px clamp(16px,4vw,52px); }}
+    .card {{ background:linear-gradient(180deg, rgba(255,255,255,.08), rgba(255,255,255,.035)); border:1px solid rgba(227,227,215,.14); border-radius:26px; padding:24px; box-shadow:0 24px 70px rgba(0,0,0,.28); }}
+    h1 {{ font-size:clamp(36px,6vw,70px); line-height:.92; letter-spacing:-.06em; margin:0 0 16px; }} p {{ color:var(--muted); line-height:1.6; }}
+    code,pre {{ background:#0b0c0b; color:#fff; border-radius:12px; padding:4px 7px; word-break:break-all; }} pre {{ padding:16px; overflow:auto; }}
+    label {{ display:block; margin:12px 0 6px; color:var(--gray); }} input,select,button {{ width:100%; padding:13px; border-radius:14px; border:1px solid rgba(227,227,215,.18); background:#111210; color:#fff; font:inherit; }}
+    button {{ margin-top:16px; background:var(--orange); color:var(--black); font-weight:900; cursor:pointer; }} .grid {{ display:grid; grid-template-columns:1fr 1fr; gap:18px; }}
+    .pill {{ display:inline-flex; border:1px solid rgba(227,227,215,.14); border-radius:999px; padding:8px 12px; color:var(--gray); background:rgba(227,227,215,.06); }}
+    .ok {{ color:var(--ok); }} @media(max-width:760px){{.grid{{grid-template-columns:1fr}}}}
+  </style>
+</head>
+<body>
+<main>
+  <span class="pill">Demo merchant landing / checkout</span>
+  <h1>Simulate an Oshigoods-style sats order.</h1>
+  <p>This page loads <code>/bb.js</code>, captures <code>bb_click_id</code>/<code>bb_ref</code> from the URL, injects hidden checkout fields, and posts to a demo merchant backend trigger.</p>
+  <div class="grid">
+    <section class="card">
+      <h2>Attribution captured by snippet</h2>
+      <pre id="debug">Loading attribution…</pre>
+      <p>Try visiting this page with <code>?bb_click_id=clk_y8DrWEwJ8R&amp;bb_ref=ref_I6al7223jL</code>.</p>
+    </section>
+    <section class="card">
+      <h2>Checkout action</h2>
+      <form id="checkout-form">
+        <label>Order total</label><input name="order_total" type="number" value="250000" />
+        <label>Currency</label><select name="currency"><option>SATS</option><option>BTC</option><option>USD</option></select>
+        <button type="submit">Simulate paid order → trigger conversion</button>
+      </form>
+      <pre id="result">Submit to create conversion proof.</pre>
+    </section>
+  </div>
+</main>
+<script src="/bb.js"></script>
+<script>
+function showAttr() {{ document.getElementById('debug').textContent = JSON.stringify(window.BumbeiAttribution.get(), null, 2); }}
+window.addEventListener('bumbei:attribution', showAttr); setTimeout(showAttr, 150);
+document.getElementById('checkout-form').addEventListener('submit', async function(e) {{
+  e.preventDefault();
+  window.BumbeiAttribution.injectHiddenInputs(document);
+  const fd = new FormData(e.currentTarget);
+  const payload = Object.fromEntries(fd.entries());
+  payload.order_total = Number(payload.order_total);
+  const res = await fetch('/demo-merchant/checkout', {{ method:'POST', headers:{{'content-type':'application/json'}}, body:JSON.stringify(payload) }});
+  const json = await res.json();
+  document.getElementById('result').textContent = JSON.stringify(json, null, 2);
+  if(json.receipt_url) window.open(json.receipt_url, '_blank');
+}});
+</script>
+</body>
+</html>
+"""
+
+
+@app.post("/demo-merchant/checkout")
+def demo_merchant_checkout(body: DemoMerchantCheckoutIn) -> dict[str, Any]:
+    """Demo-only merchant backend trigger. Real merchants should use /merchant/conversions server-side."""
+    conversion = create_conversion(
+        ConversionIn(
+            order_id=hid("demo_order"),
+            click_id=body.bb_click_id,
+            order_total=body.order_total,
+            currency=body.currency,
+            sats_per_usd=DEFAULT_SATS_PER_USD,
+        )
+    )
+    total_sats = order_total_sats(body.order_total, body.currency, DEFAULT_SATS_PER_USD)
+    return {
+        "ok": True,
+        "demo": True,
+        "bb_click_id": body.bb_click_id,
+        "bb_ref": body.bb_ref,
+        "order_total_sats": total_sats,
+        "conversion_id": conversion["conversion_id"],
+        "nostr_event_id": conversion["nostr_event_id"],
+        "commission_sats": conversion["commission_sats"],
+        "receipt_url": f"{BASE_URL}/flows/{conversion['conversion_id']}/receipt",
+        "json_receipt_url": f"{BASE_URL}/flows/{conversion['conversion_id']}",
+        "relay_results": conversion["relay_results"],
+    }
 
 
 DASHBOARD_HTML = """
