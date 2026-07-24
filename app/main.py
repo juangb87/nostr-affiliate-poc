@@ -788,6 +788,58 @@ def get_nostr_event(event_id: str) -> dict[str, Any]:
 
 
 
+def campaign_public_data(campaign_id: str) -> dict[str, Any]:
+    init_db()
+    with engine().connect() as c:
+        campaign = asdict(c.execute(text("SELECT * FROM campaigns WHERE id=:id"), {"id": campaign_id}).fetchone())
+        if not campaign:
+            raise HTTPException(404, "campaign not found")
+        enrollments = [dict(r._mapping) for r in c.execute(text("SELECT * FROM enrollments WHERE campaign_id=:id ORDER BY created_at DESC"), {"id": campaign_id}).fetchall()]
+        clicks = [dict(r._mapping) for r in c.execute(text("SELECT * FROM clicks WHERE campaign_id=:id ORDER BY created_at DESC"), {"id": campaign_id}).fetchall()]
+        conversions = [dict(r._mapping) for r in c.execute(text("SELECT * FROM conversions WHERE campaign_id=:id ORDER BY created_at DESC"), {"id": campaign_id}).fetchall()]
+        payouts = [dict(r._mapping) for r in c.execute(text("SELECT p.* FROM payouts p JOIN conversions v ON p.conversion_id=v.id WHERE v.campaign_id=:id ORDER BY p.created_at DESC"), {"id": campaign_id}).fetchall()]
+        entity_ids = [campaign_id] + [e["id"] for e in enrollments] + [v["id"] for v in conversions]
+        events: list[dict[str, Any]] = []
+        relays_by_event: dict[str, list[dict[str, Any]]] = {}
+        for entity_id in entity_ids:
+            for ev in c.execute(text("SELECT event_id, kind, pubkey, entity_type, entity_id, relay_status, event_json, created_at, published_at FROM nostr_events WHERE entity_id=:id ORDER BY created_at DESC"), {"id": entity_id}).fetchall():
+                evd = dict(ev._mapping)
+                evd["event_json"] = json.loads(evd["event_json"])
+                events.append(evd)
+                relays_by_event[evd["event_id"]] = [dict(r._mapping) for r in c.execute(text("SELECT relay_url, status, error, created_at FROM nostr_event_relays WHERE event_id=:event_id"), {"event_id": evd["event_id"]}).fetchall()]
+    for ev in events:
+        ev["relays"] = relays_by_event.get(ev["event_id"], [])
+    totals = {
+        "enrollments": len(enrollments),
+        "clicks": len(clicks),
+        "conversions": len(conversions),
+        "commission_sats": sum(int(v["commission_sats"]) for v in conversions),
+        "pending_sats": sum(int(p["amount_sats"]) for p in payouts if p["status"] == "pending"),
+        "published_events": sum(1 for ev in events if ev["relay_status"] == "published"),
+    }
+    campaign["nostr_event"] = json.loads(campaign.pop("nostr_event_json"))
+    return {
+        "campaign_id": campaign_id,
+        "campaign": campaign,
+        "totals": totals,
+        "enrollments": enrollments,
+        "clicks": clicks,
+        "conversions": conversions,
+        "payouts": payouts,
+        "events": events,
+        "links": {
+            "page": f"{BASE_URL}/campaigns/{campaign_id}/page",
+            "json": f"{BASE_URL}/campaigns/{campaign_id}/summary",
+            "campaign_event": f"{BASE_URL}/nostr/events/{campaign['nostr_event_id']}",
+        },
+    }
+
+
+@app.get("/campaigns/{campaign_id}/summary")
+def campaign_summary(campaign_id: str) -> dict[str, Any]:
+    return campaign_public_data(campaign_id)
+
+
 def flow_receipt_data(conversion_id: str) -> dict[str, Any]:
     init_db()
     with engine().connect() as c:
@@ -845,6 +897,90 @@ def _short(value: Any, front: int = 12, back: int = 8) -> str:
 def _status_badge(status_value: str) -> str:
     cls = "published" if status_value == "published" else "failed" if status_value == "failed" else "skipped"
     return f'<span class="status {cls}">{_esc(status_value)}</span>'
+
+
+@app.get("/campaigns/{campaign_id}/page", response_class=HTMLResponse)
+def campaign_public_page(campaign_id: str) -> str:
+    data = campaign_public_data(campaign_id)
+    c = data["campaign"]
+    totals = data["totals"]
+    enroll_rows = "".join(
+        f"<tr><td><code>{_esc(e['id'])}</code></td><td>{_esc(_short(e['affiliate_pubkey'], 12, 8))}</td><td><code>{_esc(e['ref_code'])}</code></td><td><a href='/nostr/events/{_esc(e['nostr_event_id'])}'>{_esc(_short(e['nostr_event_id']))}</a></td></tr>"
+        for e in data["enrollments"][:20]
+    ) or "<tr><td colspan='4'>No enrollments yet.</td></tr>"
+    conversion_rows = "".join(
+        f"<tr><td><code>{_esc(v['id'])}</code></td><td><code>{_esc(v['click_id'])}</code></td><td>{_esc(v['commission_sats'])} sats</td><td><a href='/flows/{_esc(v['id'])}/receipt'>receipt</a></td></tr>"
+        for v in data["conversions"][:20]
+    ) or "<tr><td colspan='4'>No conversions yet.</td></tr>"
+    event_cards = "".join(
+        f"""
+        <article class='event-card'>
+          <div class='kind'>kind {_esc(ev['kind'])} · {_esc(ev['entity_type'])}</div>
+          <h3><a href='/nostr/events/{_esc(ev['event_id'])}'>{_esc(_short(ev['event_id']))}</a></h3>
+          <p><code>{_esc(ev['entity_id'])}</code> {_status_badge(ev['relay_status'])}</p>
+        </article>
+        """
+        for ev in data["events"][:24]
+    ) or "<p class='label'>No proof events yet.</p>"
+    ref_url = f"{BASE_URL}/r/{data['enrollments'][0]['ref_code']}" if data["enrollments"] else ""
+    return f"""
+<!doctype html>
+<html lang='en'>
+<head>
+  <meta charset='utf-8' />
+  <meta name='viewport' content='width=device-width, initial-scale=1' />
+  <title>{_esc(c['name'])} · Campaign public page</title>
+  <style>
+    :root {{ --black:#151615; --orange:#FC6A42; --gray:#E3E3D7; --blue:#6082DB; --yellow:#F9C441; --muted:#a8aa9e; --ok:#75d68a; --bad:#ff8585; }}
+    * {{ box-sizing:border-box; }} body {{ margin:0; font-family:Inter, ui-sans-serif, system-ui, sans-serif; color:#fff; background:radial-gradient(circle at top left, rgba(252,106,66,.23), transparent 32rem), var(--black); }}
+    header, main {{ width:min(1240px,100%); margin:0 auto; padding:30px clamp(16px,4vw,52px); }} header {{ border-bottom:1px solid rgba(227,227,215,.12); display:flex; justify-content:space-between; gap:22px; }}
+    h1,h2,h3 {{ margin:0; letter-spacing:-.045em; }} h1 {{ font-size:clamp(38px,6vw,76px); line-height:.9; max-width:820px; }} p {{ color:var(--muted); line-height:1.6; }} a {{ color:var(--yellow); }}
+    code {{ background:rgba(227,227,215,.09); border-radius:7px; padding:2px 6px; word-break:break-all; }} .pill,.status {{ display:inline-flex; padding:7px 10px; border-radius:999px; border:1px solid rgba(227,227,215,.15); background:rgba(227,227,215,.06); color:var(--gray); font-size:13px; }}
+    .published {{ background:rgba(117,214,138,.18); color:var(--ok); }} .failed {{ background:rgba(255,133,133,.18); color:var(--bad); }} .skipped {{ background:rgba(249,196,65,.18); color:var(--yellow); }}
+    .grid {{ display:grid; grid-template-columns:repeat(12,minmax(0,1fr)); gap:18px; margin:22px 0; }} .card {{ min-width:0; overflow:hidden; border:1px solid rgba(227,227,215,.12); background:linear-gradient(180deg,rgba(255,255,255,.07),rgba(255,255,255,.035)); border-radius:24px; padding:22px; box-shadow:0 20px 60px rgba(0,0,0,.22); }}
+    .span-3{{grid-column:span 3 / span 3}} .span-4{{grid-column:span 4 / span 4}} .span-6{{grid-column:span 6 / span 6}} .span-12{{grid-column:1 / -1}} .metric{{font-size:36px;font-weight:900;line-height:1;margin-top:8px;overflow-wrap:anywhere}} .label{{color:var(--muted);font-size:13px}}
+    dl {{ display:grid; grid-template-columns:170px minmax(0,1fr); gap:10px 14px; }} dt {{ color:var(--muted); }} dd {{ margin:0; overflow-wrap:anywhere; }} .table-wrap{{overflow-x:auto}} table{{width:100%;min-width:650px;border-collapse:collapse;font-size:13px;table-layout:fixed}} th,td{{text-align:left;padding:10px 8px;border-bottom:1px solid rgba(227,227,215,.09);overflow-wrap:anywhere}}
+    .events{{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px}} .event-card{{border:1px solid rgba(227,227,215,.12);background:rgba(0,0,0,.17);border-radius:18px;padding:16px;min-width:0}} .kind{{color:var(--blue);font-size:13px;font-weight:800}}
+    .actions{{display:flex;gap:10px;flex-wrap:wrap}} .button{{display:inline-flex;padding:11px 14px;border-radius:14px;background:var(--orange);color:var(--black);text-decoration:none;font-weight:900}} .button.secondary{{background:rgba(227,227,215,.08);color:var(--gray)}}
+    @media(max-width:900px){{header{{display:block}} .span-3,.span-4,.span-6{{grid-column:1 / -1}} dl{{grid-template-columns:1fr}}}}
+  </style>
+</head>
+<body>
+<header>
+  <div><span class='pill'>Public campaign</span><h1>{_esc(c['name'])}</h1><p>Merchant campaign proof, enrollments, attribution activity and Nostr relay receipts.</p></div>
+  <div class='pill'>{_esc(c['commission_bps'])} bps · {_esc(c['window_days'])}d window</div>
+</header>
+<main>
+  <section class='grid'>
+    <div class='card span-3'><div class='label'>Enrollments</div><div class='metric'>{_esc(totals['enrollments'])}</div></div>
+    <div class='card span-3'><div class='label'>Clicks</div><div class='metric'>{_esc(totals['clicks'])}</div></div>
+    <div class='card span-3'><div class='label'>Conversions</div><div class='metric'>{_esc(totals['conversions'])}</div></div>
+    <div class='card span-3'><div class='label'>Pending sats</div><div class='metric'>{_esc(totals['pending_sats'])}</div></div>
+  </section>
+  <section class='grid'>
+    <div class='card span-6'><h2>Campaign terms</h2><dl>
+      <dt>Campaign ID</dt><dd><code>{_esc(c['id'])}</code></dd>
+      <dt>Merchant npub</dt><dd><code>{_esc(c['merchant_pubkey'])}</code></dd>
+      <dt>Merchant hex</dt><dd><code>{_esc(c.get('merchant_pubkey_hex'))}</code></dd>
+      <dt>Reward bps</dt><dd>{_esc(c['commission_bps'])} bps</dd>
+      <dt>Destination</dt><dd><a href='{_esc(c['destination_url'])}'>{_esc(c['destination_url'])}</a></dd>
+      <dt>Campaign event</dt><dd><a href='/nostr/events/{_esc(c['nostr_event_id'])}'>{_esc(_short(c['nostr_event_id']))}</a></dd>
+    </dl></div>
+    <div class='card span-6'><h2>Demo links</h2><p>Use a referral link to test redirect tracking, or open the JSON summary for integrations.</p><div class='actions'>
+      <a class='button' href='{_esc(ref_url) if ref_url else '#'}'>Open latest ref link</a>
+      <a class='button secondary' href='/campaigns/{_esc(campaign_id)}/summary'>JSON summary</a>
+      <a class='button secondary' href='/dashboard'>Dashboard</a>
+    </div></div>
+  </section>
+  <section class='grid'>
+    <div class='card span-6'><h2>Affiliates enrolled</h2><div class='table-wrap'><table><thead><tr><th>Enrollment</th><th>Affiliate</th><th>Ref</th><th>Event</th></tr></thead><tbody>{enroll_rows}</tbody></table></div></div>
+    <div class='card span-6'><h2>Recent conversions</h2><div class='table-wrap'><table><thead><tr><th>Conversion</th><th>Click</th><th>Commission</th><th>Receipt</th></tr></thead><tbody>{conversion_rows}</tbody></table></div></div>
+  </section>
+  <section class='card span-12'><h2>Nostr proof timeline</h2><div class='events'>{event_cards}</div></section>
+</main>
+</body>
+</html>
+"""
 
 
 @app.get("/flows/{conversion_id}/receipt", response_class=HTMLResponse)
@@ -1278,7 +1414,7 @@ async function refresh(){
   $('health-pill').textContent = `${data.health.db} · Nostr publish ${data.health.nostr_publish ? 'on' : 'off'}`;
   const metrics = [['Campaigns',data.counts.campaigns],['Enrollments',data.counts.enrollments],['Clicks',data.counts.clicks],['Conversions',data.counts.conversions],['Pending sats',data.counts.pending_sats],['Published events',data.counts.published_events]];
   $('metrics').innerHTML = metrics.map(m=>`<div class="card metric-card"><div class="label">${m[0]}</div><div class="metric">${m[1]}</div></div>`).join('');
-  $('campaigns').innerHTML = table(data.campaigns, [['ID','id',v=>`<code>${v}</code>`],['Name','name'],['bps','commission_bps'],['Event','nostr_event_id',v=>`<a href="/nostr/events/${v}">${short(v)}</a>`]]);
+  $('campaigns').innerHTML = table(data.campaigns, [['ID','id',v=>`<code>${v}</code>`],['Name','name'],['bps','commission_bps'],['Event','nostr_event_id',v=>`<a href="/nostr/events/${v}">${short(v)}</a>`],['Page','id',v=>`<a href="/campaigns/${v}/page">open</a>`]]);
   $('conversions').innerHTML = table(data.conversions, [['ID','id',v=>`<code>${v}</code>`],['Affiliate','affiliate_pubkey',short],['sats','commission_sats'],['Event','nostr_event_id',v=>`<a href="/nostr/events/${v}">${short(v)}</a>`],['Receipt','id',v=>`<a href="/flows/${v}/receipt">open</a>`]]);
   $('events').innerHTML = table(data.events, [['Kind','kind'],['Entity','entity_type',(v,r)=>`${v}<br><code>${r.entity_id}</code>`],['Relay','relay_status',status],['Event','event_id',v=>`<a href="/nostr/events/${v}">${short(v)}</a>`],['Relays','relays',(v)=>v.map(r=>`${status(r.status)} ${r.relay_url.replace('wss://','')}`).join('<br>')]]);
 }

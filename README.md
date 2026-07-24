@@ -38,6 +38,9 @@ python scripts/e2e.py
 - `POST /clicks/simulate`
 - `POST /merchant/conversions` — merchant webhook with `Authorization: Bearer <merchant_api_key>`
 - `POST /campaigns`
+- `GET /campaigns/{campaign_id}`
+- `GET /campaigns/{campaign_id}/summary`
+- `GET /campaigns/{campaign_id}/page`
 - `POST /enrollments`
 - `GET /r/{ref_code}`
 - `POST /conversions`

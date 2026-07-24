@@ -35,6 +35,16 @@ def test_demo_flow_creates_conversion_and_proof(tmp_path, monkeypatch):
     dashboard = client.get('/dashboard')
     assert dashboard.status_code == 200
     assert 'Nostr Affiliate POC Dashboard' in dashboard.text
+    campaign_summary = client.get(f"/campaigns/{data['campaign']['campaign_id']}/summary")
+    assert campaign_summary.status_code == 200
+    campaign_summary_json = campaign_summary.json()
+    assert campaign_summary_json['campaign']['id'] == data['campaign']['campaign_id']
+    assert campaign_summary_json['totals']['enrollments'] >= 1
+    assert campaign_summary_json['totals']['conversions'] >= 1
+    campaign_page = client.get(f"/campaigns/{data['campaign']['campaign_id']}/page")
+    assert campaign_page.status_code == 200
+    assert 'Public campaign' in campaign_page.text
+    assert data['campaign']['campaign_id'] in campaign_page.text
     dashboard_data = client.get('/dashboard/data')
     assert dashboard_data.status_code == 200
     assert dashboard_data.json()['counts']['conversions'] >= 1
