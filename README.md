@@ -44,8 +44,10 @@ python scripts/e2e.py
 - `POST /enrollments`
 - `GET /r/{ref_code}`
 - `POST /conversions`
-- `GET /affiliates/{affiliate_pubkey}`
 - `GET /proofs`
+- `GET /affiliates/{npub_or_hex}`
+- `GET /affiliates/{npub_or_hex}/summary`
+- `GET /affiliates/{npub_or_hex}/profile`
 - `GET /nostr/events/{event_id}`
 - `POST /demo`
 

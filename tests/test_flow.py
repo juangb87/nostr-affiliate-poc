@@ -45,6 +45,18 @@ def test_demo_flow_creates_conversion_and_proof(tmp_path, monkeypatch):
     assert campaign_page.status_code == 200
     assert 'Public campaign' in campaign_page.text
     assert data['campaign']['campaign_id'] in campaign_page.text
+    affiliate_summary = client.get(f"/affiliates/{data['enrollment']['affiliate_pubkey']}/summary")
+    assert affiliate_summary.status_code == 200
+    affiliate_summary_json = affiliate_summary.json()
+    assert affiliate_summary_json['identity']['npub'] == data['enrollment']['affiliate_pubkey']
+    assert affiliate_summary_json['totals']['enrollments'] >= 1
+    assert affiliate_summary_json['totals']['conversions'] >= 1
+    affiliate_profile = client.get(f"/affiliates/{data['enrollment']['affiliate_pubkey']}/profile")
+    assert affiliate_profile.status_code == 200
+    assert 'Affiliate public profile' in affiliate_profile.text
+    assert data['enrollment']['affiliate_pubkey'] in affiliate_profile.text
+    affiliate_profile_hex = client.get(f"/affiliates/{data['enrollment']['affiliate_pubkey_hex']}/profile")
+    assert affiliate_profile_hex.status_code == 200
     dashboard_data = client.get('/dashboard/data')
     assert dashboard_data.status_code == 200
     assert dashboard_data.json()['counts']['conversions'] >= 1
