@@ -11,7 +11,9 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from fastapi import Cookie, FastAPI, Header, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from nostr_sdk import Client, EventBuilder, Keys, Kind, PublicKey, RelayUrl, Tag
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, text
@@ -28,7 +30,23 @@ DEFAULT_AFFILIATE_NPUB = "npub16ghkhw9d4g9x6pxp6l6dtyjqaeuavwucrq8gpkt60x0kx9fzq
 app = FastAPI(
     title="Nostr Affiliate POC",
     description="MVP: campaign → enrollment → redirect click → conversion → real Nostr proof → pending Lightning payout.",
-    version="0.3.0",
+    version="0.4.0",
+)
+
+
+def tracking_cors_origins() -> list[str]:
+    raw = os.getenv(
+        "TRACKING_CORS_ORIGINS",
+        "https://shapersfit.com,https://www.shapersfit.com,https://shapersfit.myshopify.com",
+    )
+    return [origin.strip() for origin in raw.split(",") if origin.strip()]
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=tracking_cors_origins(),
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
 _ENGINE: Engine | None = None
@@ -73,6 +91,26 @@ def hid(prefix: str) -> str:
 
 def sha(value: str) -> str:
     return "sha256:" + hashlib.sha256(value.encode()).hexdigest()
+
+
+def safe_text(value: Any, max_len: int = 1000) -> str:
+    if value is None:
+        return ""
+    return str(value).replace("\x00", "").replace("\r", " ").replace("\n", " ").strip()[:max_len]
+
+
+def absolute_url(url: str) -> str:
+    value = safe_text(url, 3000)
+    if not value.startswith(("http://", "https://")):
+        value = "https://" + value.lstrip("/")
+    return value
+
+
+def add_query_params(url: str, params: dict[str, str]) -> str:
+    parsed = urlparse(absolute_url(url))
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query.update({k: v for k, v in params.items() if v})
+    return urlunparse(parsed._replace(query=urlencode(query)))
 
 
 def order_total_sats(order_total: float, currency: str, sats_per_usd: int | None = None) -> int:
@@ -265,6 +303,26 @@ def init_db() -> None:
         landing_url TEXT,
         created_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS tracking_events (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        ref_code TEXT,
+        click_id TEXT,
+        shop TEXT,
+        url TEXT,
+        path TEXT,
+        referrer TEXT,
+        order_id_hash TEXT,
+        order_name TEXT,
+        checkout_token_hash TEXT,
+        order_total REAL,
+        currency TEXT,
+        user_agent_hash TEXT,
+        ip_hash TEXT,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS conversions (
         id TEXT PRIMARY KEY,
         order_id_hash TEXT NOT NULL,
@@ -360,6 +418,45 @@ class ConversionIn(BaseModel):
 
 class SimulateClickIn(BaseModel):
     ref_code: str
+
+
+class BumbeiTrackIn(BaseModel):
+    type: str = Field("page_view", description="Browser event type, e.g. page_view")
+    shop: Optional[str] = None
+    bb_ref: Optional[str] = None
+    bumbei_ref: Optional[str] = None
+    affiliate: Optional[str] = None
+    ref: Optional[str] = None
+    bb_click_id: Optional[str] = None
+    click_id: Optional[str] = None
+    url: Optional[str] = None
+    path: Optional[str] = None
+    query: Optional[str] = None
+    referrer: Optional[str] = None
+    user_agent: Optional[str] = None
+    ts: Optional[str] = None
+
+
+class BumbeiConversionIn(BaseModel):
+    type: str = Field("checkout_completed", description="Browser/pixel conversion event type")
+    shop: Optional[str] = None
+    bb_ref: Optional[str] = None
+    bumbei_ref: Optional[str] = None
+    affiliate: Optional[str] = None
+    ref: Optional[str] = None
+    bb_click_id: Optional[str] = None
+    click_id: Optional[str] = None
+    order_id: Optional[str] = None
+    order_name: Optional[str] = None
+    checkout_token: Optional[str] = None
+    total_price: Optional[float | str] = None
+    currency: Optional[str] = None
+    url: Optional[str] = None
+    path: Optional[str] = None
+    referrer: Optional[str] = None
+    user_agent: Optional[str] = None
+    ts: Optional[str] = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class MerchantConversionIn(BaseModel):
@@ -543,8 +640,7 @@ def redirect_click(ref_code: str, request: Request) -> RedirectResponse:
                 "created_at": now(),
             },
         )
-    sep = "&" if "?" in camp["destination_url"] else "?"
-    url = f"{camp['destination_url']}{sep}bb_click_id={click_id}&bb_ref={ref_code}"
+    url = add_query_params(camp["destination_url"], {"bb_click_id": click_id, "bb_ref": ref_code})
     resp = RedirectResponse(url, status_code=302)
     resp.set_cookie("bb_click_id", click_id, max_age=60 * 60 * 24 * int(camp["window_days"]), httponly=True, samesite="lax")
     return resp
@@ -665,9 +761,125 @@ def simulate_click(body: SimulateClickIn) -> dict[str, Any]:
                 "created_at": now(),
             },
         )
-    sep = "&" if "?" in camp["destination_url"] else "?"
-    redirect_url = f"{camp['destination_url']}{sep}bb_click_id={click_id}&bb_ref={body.ref_code}"
+    redirect_url = add_query_params(camp["destination_url"], {"bb_click_id": click_id, "bb_ref": body.ref_code})
     return {"click_id": click_id, "ref_code": body.ref_code, "campaign_id": enr["campaign_id"], "affiliate_pubkey": enr["affiliate_pubkey"], "redirect_url": redirect_url}
+
+
+def _tracking_ref(payload: Any) -> str:
+    return safe_text(
+        getattr(payload, "bb_ref", None)
+        or getattr(payload, "bumbei_ref", None)
+        or getattr(payload, "affiliate", None)
+        or getattr(payload, "ref", None),
+        200,
+    )
+
+
+def _tracking_click_id(payload: Any) -> str:
+    return safe_text(getattr(payload, "bb_click_id", None) or getattr(payload, "click_id", None), 120)
+
+
+def _request_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "").split(",", 1)[0].strip()
+    return forwarded or (request.client.host if request.client else "unknown")
+
+
+def store_tracking_event(kind: str, body: BumbeiTrackIn | BumbeiConversionIn, request: Request) -> dict[str, Any]:
+    init_db()
+    ref_code = _tracking_ref(body)
+    click_id = _tracking_click_id(body)
+    if not ref_code and not click_id:
+        raise HTTPException(400, "missing bb_ref or bb_click_id")
+
+    payload = body.model_dump(mode="json")
+    event_id = hid("evt")
+    user_agent = safe_text(getattr(body, "user_agent", None) or request.headers.get("user-agent", ""), 500)
+    order_id = safe_text(getattr(body, "order_id", None), 300)
+    checkout_token = safe_text(getattr(body, "checkout_token", None), 300)
+    total_price = getattr(body, "total_price", None)
+    try:
+        order_total = float(total_price) if total_price not in (None, "") else None
+    except (TypeError, ValueError):
+        order_total = None
+
+    with engine().begin() as c:
+        click = asdict(c.execute(text("SELECT * FROM clicks WHERE id=:id"), {"id": click_id}).fetchone()) if click_id else None
+        if click and not ref_code:
+            ref_code = click["ref_code"]
+        c.execute(
+            text(
+                """
+                INSERT INTO tracking_events (id, kind, event_type, ref_code, click_id, shop, url, path,
+                referrer, order_id_hash, order_name, checkout_token_hash, order_total, currency,
+                user_agent_hash, ip_hash, payload_json, created_at)
+                VALUES (:id, :kind, :event_type, :ref_code, :click_id, :shop, :url, :path,
+                :referrer, :order_id_hash, :order_name, :checkout_token_hash, :order_total, :currency,
+                :user_agent_hash, :ip_hash, :payload_json, :created_at)
+                """
+            ),
+            {
+                "id": event_id,
+                "kind": kind,
+                "event_type": safe_text(getattr(body, "type", None) or kind, 80),
+                "ref_code": ref_code or None,
+                "click_id": click_id or None,
+                "shop": safe_text(getattr(body, "shop", None), 120) or None,
+                "url": safe_text(getattr(body, "url", None), 3000) or None,
+                "path": safe_text(getattr(body, "path", None), 1000) or None,
+                "referrer": safe_text(getattr(body, "referrer", None), 2000) or None,
+                "order_id_hash": sha(order_id) if order_id else None,
+                "order_name": safe_text(getattr(body, "order_name", None), 200) or None,
+                "checkout_token_hash": sha(checkout_token) if checkout_token else None,
+                "order_total": order_total,
+                "currency": safe_text(getattr(body, "currency", None), 20).upper() or None,
+                "user_agent_hash": sha(user_agent) if user_agent else None,
+                "ip_hash": sha(_request_ip(request)),
+                "payload_json": json.dumps(payload, sort_keys=True, default=str),
+                "created_at": now(),
+            },
+        )
+    return {
+        "ok": True,
+        "event_id": event_id,
+        "kind": kind,
+        "type": safe_text(getattr(body, "type", None) or kind, 80),
+        "bb_ref": ref_code or None,
+        "bb_click_id": click_id or None,
+    }
+
+
+@app.post("/bumbei/track", tags=["Bumbei tracking"])
+def bumbei_track(body: BumbeiTrackIn, request: Request) -> dict[str, Any]:
+    """Record a browser-side landing/page-view event from a merchant storefront."""
+    return store_tracking_event("track", body, request)
+
+
+@app.post("/bumbei/conversion", tags=["Bumbei tracking"])
+def bumbei_conversion(body: BumbeiConversionIn, request: Request) -> dict[str, Any]:
+    """Record a browser/pixel conversion signal. Use /merchant/conversions for payout-grade server-side proofs."""
+    result = store_tracking_event("conversion", body, request)
+    result["note"] = "browser conversion stored; use /merchant/conversions for payout-grade Nostr proof"
+    return result
+
+
+@app.get("/bumbei/status", tags=["Bumbei tracking"])
+def bumbei_status(limit: int = 10) -> dict[str, Any]:
+    """Safe aggregate debug status for browser tracking events."""
+    init_db()
+    limit = max(0, min(limit, 50))
+    with engine().connect() as c:
+        total = c.execute(text("SELECT COUNT(*) FROM tracking_events")).scalar_one()
+        counts = {r._mapping["kind"]: r._mapping["count"] for r in c.execute(text("SELECT kind, COUNT(*) AS count FROM tracking_events GROUP BY kind")).fetchall()}
+        recent = [dict(r._mapping) for r in c.execute(
+            text("""
+                SELECT id, kind, event_type, ref_code AS bb_ref, click_id AS bb_click_id, shop, path, created_at
+                FROM tracking_events
+                ORDER BY created_at DESC
+                LIMIT :limit
+            """),
+            {"limit": limit},
+        ).fetchall()]
+    return {"ok": True, "total_events": total, "counts": counts, "recent": recent, "cors_origins": tracking_cors_origins()}
 
 
 @app.get("/dashboard/data")

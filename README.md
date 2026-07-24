@@ -33,6 +33,9 @@ python scripts/e2e.py
 - `GET /dashboard`
 - `GET /dashboard/data`
 - `GET /bb.js` — lightweight tracking snippet that captures `bb_click_id`/`bb_ref`
+- `POST /bumbei/track` — public browser-side landing/page-view tracker for Shopify/theme scripts
+- `POST /bumbei/conversion` — public browser/pixel conversion signal logger; use `/merchant/conversions` for payout-grade server-side proofs
+- `GET /bumbei/status` — safe aggregate tracking debug status
 - `GET /demo-merchant` — demo landing/checkout page using the snippet
 - `POST /demo-merchant/checkout` — demo-only checkout trigger
 - `POST /clicks/simulate`
