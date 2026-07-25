@@ -32,7 +32,7 @@ DEFAULT_AFFILIATE_NPUB = "npub16ghkhw9d4g9x6pxp6l6dtyjqaeuavwucrq8gpkt60x0kx9fzq
 app = FastAPI(
     title="Nostr Affiliate POC",
     description="MVP: campaign → enrollment → redirect click → conversion → real Nostr proof → pending Lightning payout.",
-    version="0.6.0",
+    version="0.6.1",
 )
 
 
@@ -343,6 +343,15 @@ def init_db() -> None:
         error TEXT,
         created_at TEXT NOT NULL,
         processed_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS shopify_webhook_receipts (
+        webhook_id TEXT PRIMARY KEY,
+        shop_domain TEXT NOT NULL,
+        topic TEXT NOT NULL,
+        status TEXT NOT NULL,
+        reason TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS conversions (
         id TEXT PRIMARY KEY,
@@ -1035,6 +1044,34 @@ def shopify_note_attributes(payload: dict[str, Any]) -> dict[str, str]:
     return attributes
 
 
+def record_shopify_webhook_receipt(
+    webhook_id: str, shop: str, topic: str, status: str, reason: Optional[str] = None
+) -> None:
+    """Store minimal signed-delivery telemetry without retaining Shopify payload or order data."""
+    init_db()
+    timestamp = now()
+    with engine().begin() as c:
+        c.execute(
+            text(
+                """
+                INSERT INTO shopify_webhook_receipts
+                (webhook_id, shop_domain, topic, status, reason, created_at, updated_at)
+                VALUES (:webhook_id, :shop, :topic, :status, :reason, :timestamp, :timestamp)
+                ON CONFLICT(webhook_id) DO UPDATE SET
+                    status=:status, reason=:reason, updated_at=:timestamp
+                """
+            ),
+            {
+                "webhook_id": webhook_id,
+                "shop": shop,
+                "topic": topic,
+                "status": status,
+                "reason": safe_text(reason, 300) if reason else None,
+                "timestamp": timestamp,
+            },
+        )
+
+
 def enqueue_shopify_paid_order(
     *, webhook_id: str, order_key: str, shop: str, topic: str, click_id: str, order_total: float, currency: str
 ) -> tuple[dict[str, Any], bool, bool]:
@@ -1124,6 +1161,7 @@ def process_shopify_delivery(order_key: str) -> None:
                 ),
                 {"key": order_key, "error": safe_text(str(exc), 500), "processed_at": now()},
             )
+        record_shopify_webhook_receipt(row["webhook_id"], row["shop_domain"], row["topic"], "failed", str(exc))
         return
 
     with engine().begin() as c:
@@ -1137,6 +1175,7 @@ def process_shopify_delivery(order_key: str) -> None:
             ),
             {"key": order_key, "conversion_id": result["conversion_id"], "processed_at": now()},
         )
+    record_shopify_webhook_receipt(row["webhook_id"], row["shop_domain"], row["topic"], "processed")
 
 
 @app.post("/shopify/webhooks/orders-paid", tags=["Shopify"])
@@ -1176,9 +1215,11 @@ async def shopify_orders_paid_webhook(request: Request, background_tasks: Backgr
     if not isinstance(payload, dict):
         raise HTTPException(400, "invalid Shopify webhook payload")
 
+    record_shopify_webhook_receipt(webhook_id, shop, topic, "received")
     attributes = shopify_note_attributes(payload)
     click_id = attributes.get("bb_click_id") or attributes.get("click_id")
     if not click_id:
+        record_shopify_webhook_receipt(webhook_id, shop, topic, "ignored", "missing affiliate attribution")
         return {
             "ok": True,
             "ignored": True,
@@ -1208,6 +1249,7 @@ async def shopify_orders_paid_webhook(request: Request, background_tasks: Backgr
         currency=currency,
     )
     if conflict:
+        record_shopify_webhook_receipt(webhook_id, shop, topic, "conflict", "duplicate order payload mismatch")
         return {
             "ok": True,
             "ignored": False,
@@ -1218,6 +1260,12 @@ async def shopify_orders_paid_webhook(request: Request, background_tasks: Backgr
             "shop": shop,
             "topic": topic,
         }
+    record_shopify_webhook_receipt(
+        webhook_id,
+        shop,
+        topic,
+        "queued" if should_process else "duplicate",
+    )
     if should_process:
         background_tasks.add_task(process_shopify_delivery, order_key)
     return {
@@ -1245,6 +1293,22 @@ def shopify_webhook_status() -> dict[str, Any]:
                 text("SELECT status, COUNT(*) AS count FROM shopify_webhook_deliveries GROUP BY status")
             ).fetchall()
         }
+        receipt_counts = {
+            row._mapping["status"]: row._mapping["count"]
+            for row in c.execute(
+                text("SELECT status, COUNT(*) AS count FROM shopify_webhook_receipts GROUP BY status")
+            ).fetchall()
+        }
+        latest_row = c.execute(
+            text(
+                """
+                SELECT webhook_id, topic, status, reason, created_at, updated_at
+                FROM shopify_webhook_receipts
+                ORDER BY updated_at DESC LIMIT 1
+                """
+            )
+        ).fetchone()
+        latest_receipt = asdict(latest_row) if latest_row else None
     return {
         "ok": True,
         "secret_configured": bool(shopify_webhook_secret()),
@@ -1252,6 +1316,8 @@ def shopify_webhook_status() -> dict[str, Any]:
         "topic": "orders/paid",
         "callback_url": f"{BASE_URL}/shopify/webhooks/orders-paid",
         "deliveries": counts,
+        "receipts": receipt_counts,
+        "latest_receipt": latest_receipt,
     }
 
 

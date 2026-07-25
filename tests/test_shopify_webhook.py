@@ -93,6 +93,8 @@ def test_shopify_orders_paid_requires_valid_hmac_and_creates_authoritative_conve
 
     webhook_status = client.get("/shopify/webhooks/status").json()
     assert webhook_status["deliveries"] == {"processed": 1}
+    assert webhook_status["receipts"] == {"processed": 1}
+    assert webhook_status["latest_receipt"]["status"] == "processed"
 
     duplicate = client.post(
         "/shopify/webhooks/orders-paid",
@@ -169,6 +171,11 @@ def test_shopify_orders_paid_acknowledges_unattributed_orders(tmp_path, monkeypa
         "topic": "orders/paid",
         "webhook_id": "wh_test_1",
     }
+    status = client.get("/shopify/webhooks/status").json()
+    assert status["deliveries"] == {}
+    assert status["receipts"] == {"ignored": 1}
+    assert status["latest_receipt"]["status"] == "ignored"
+    assert status["latest_receipt"]["reason"] == "missing affiliate attribution"
 
 
 def test_shopify_orders_paid_rejects_wrong_shop_and_topic(tmp_path, monkeypatch):
