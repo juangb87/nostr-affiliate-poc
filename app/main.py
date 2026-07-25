@@ -9,7 +9,7 @@ import json
 import os
 import secrets
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from app.nostr_kinds import (
@@ -29,6 +29,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from nostr_sdk import Client, EventBuilder, Keys, Kind, PublicKey, RelayUrl, Tag
 from app.lightning import LightningPaymentError, pay_nwc_invoice, prepare_lnurl_payment
+from app.payment_state import calculate_fee_sats, payment_idempotency_key
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
@@ -43,8 +44,8 @@ DEFAULT_AFFILIATE_NPUB = "npub16ghkhw9d4g9x6pxp6l6dtyjqaeuavwucrq8gpkt60x0kx9fzq
 
 app = FastAPI(
     title="Nostr Affiliate POC",
-    description="MVP: campaign → enrollment → redirect click → conversion → real Nostr proof → pending Lightning payout.",
-    version="0.7.0",
+    description="MVP: campaign → enrollment → attribution → Nostr proofs → durable Lightning payout ledger.",
+    version="0.8.0",
 )
 
 
@@ -102,6 +103,15 @@ def engine() -> Engine:
 
 def asdict(row: Any) -> dict[str, Any] | None:
     return dict(row._mapping) if row else None
+
+
+def public_payout_record(row: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Strip private reconciliation evidence from every public payout representation."""
+    if not row:
+        return row
+    payout = dict(row)
+    payout.pop("bolt11_invoice", None)
+    return payout
 
 
 def hid(prefix: str) -> str:
@@ -199,6 +209,22 @@ def lightning_payouts_enabled() -> bool:
 
 def lightning_max_payout_sats() -> int:
     return max(1, int(os.getenv("LIGHTNING_MAX_PAYOUT_SATS", "1000")))
+
+
+def default_campaign_budget_sats() -> int:
+    return max(0, int(os.getenv("DEFAULT_CAMPAIGN_BUDGET_SATS", "1000000")))
+
+
+def meerat_fee_bps() -> int:
+    return max(0, min(int(os.getenv("MEERAT_FEE_BPS", "1000")), 10_000))
+
+
+def fee_min_sats() -> int:
+    return max(0, int(os.getenv("FEE_MIN_SATS", "10")))
+
+
+def default_return_window_days() -> int:
+    return max(0, int(os.getenv("DEFAULT_RETURN_WINDOW_DAYS", "0")))
 
 
 def nostr_keys() -> Keys:
@@ -468,6 +494,12 @@ def init_db() -> None:
         amount_sats INTEGER NOT NULL,
         lightning_address TEXT,
         status TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'PAYABLE',
+        fee_sats INTEGER NOT NULL DEFAULT 0,
+        fee_state TEXT NOT NULL DEFAULT 'FEE_PENDING',
+        reserved_sats INTEGER NOT NULL DEFAULT 0,
+        return_window_ends_at TEXT,
+        settled_at TEXT,
         payment_hash TEXT,
         bolt11_invoice TEXT,
         payment_provider TEXT,
@@ -480,6 +512,48 @@ def init_db() -> None:
         nostr_event_json TEXT,
         created_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS campaign_budgets (
+        campaign_id TEXT PRIMARY KEY,
+        budget_sats INTEGER NOT NULL,
+        committed_sats INTEGER NOT NULL DEFAULT 0,
+        settled_sats INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS payment_attempts (
+        id TEXT PRIMARY KEY,
+        payout_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        rail TEXT NOT NULL,
+        idempotency_key TEXT UNIQUE NOT NULL,
+        destination TEXT NOT NULL,
+        amount_sats INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        payment_hash TEXT,
+        preimage TEXT,
+        routing_fee_sats INTEGER,
+        error TEXT,
+        attempt_number INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        settled_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS ledger_entries (
+        id TEXT PRIMARY KEY,
+        transaction_id TEXT NOT NULL,
+        campaign_id TEXT NOT NULL,
+        payout_id TEXT NOT NULL,
+        account TEXT NOT NULL,
+        direction TEXT NOT NULL,
+        amount_sats INTEGER NOT NULL,
+        entry_type TEXT NOT NULL,
+        idempotency_key TEXT UNIQUE NOT NULL,
+        created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_payment_attempts_payout ON payment_attempts(payout_id, kind, attempt_number);
+    CREATE INDEX IF NOT EXISTS idx_payment_attempts_recovery ON payment_attempts(status, updated_at);
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_payment_attempts_one_live
+        ON payment_attempts(payout_id, kind) WHERE status IN ('PAYING','UNKNOWN');
+    CREATE INDEX IF NOT EXISTS idx_ledger_entries_payout ON ledger_entries(payout_id, created_at);
     CREATE TABLE IF NOT EXISTS reversals (
         id TEXT PRIMARY KEY,
         conversion_id TEXT UNIQUE NOT NULL,
@@ -526,6 +600,12 @@ def init_db() -> None:
             c.execute(text("ALTER TABLE payouts ADD COLUMN IF NOT EXISTS last_error TEXT"))
             c.execute(text("ALTER TABLE payouts ADD COLUMN IF NOT EXISTS processing_started_at TEXT"))
             c.execute(text("ALTER TABLE payouts ADD COLUMN IF NOT EXISTS paid_at TEXT"))
+            c.execute(text("ALTER TABLE payouts ADD COLUMN IF NOT EXISTS state TEXT NOT NULL DEFAULT 'PAYABLE'"))
+            c.execute(text("ALTER TABLE payouts ADD COLUMN IF NOT EXISTS fee_sats INTEGER NOT NULL DEFAULT 0"))
+            c.execute(text("ALTER TABLE payouts ADD COLUMN IF NOT EXISTS fee_state TEXT NOT NULL DEFAULT 'FEE_PENDING'"))
+            c.execute(text("ALTER TABLE payouts ADD COLUMN IF NOT EXISTS reserved_sats INTEGER NOT NULL DEFAULT 0"))
+            c.execute(text("ALTER TABLE payouts ADD COLUMN IF NOT EXISTS return_window_ends_at TEXT"))
+            c.execute(text("ALTER TABLE payouts ADD COLUMN IF NOT EXISTS settled_at TEXT"))
             c.execute(text("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'"))
             c.execute(text("ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'approved'"))
         else:
@@ -544,6 +624,12 @@ def init_db() -> None:
                 "last_error": "TEXT",
                 "processing_started_at": "TEXT",
                 "paid_at": "TEXT",
+                "state": "TEXT NOT NULL DEFAULT 'PAYABLE'",
+                "fee_sats": "INTEGER NOT NULL DEFAULT 0",
+                "fee_state": "TEXT NOT NULL DEFAULT 'FEE_PENDING'",
+                "reserved_sats": "INTEGER NOT NULL DEFAULT 0",
+                "return_window_ends_at": "TEXT",
+                "settled_at": "TEXT",
             }
             for column, column_type in payout_column_ddl.items():
                 if column not in payout_cols:
@@ -552,6 +638,143 @@ def init_db() -> None:
                 c.execute(text("ALTER TABLE campaigns ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"))
             if "status" not in enrollment_cols:
                 c.execute(text("ALTER TABLE enrollments ADD COLUMN status TEXT NOT NULL DEFAULT 'approved'"))
+        c.execute(text("""
+            UPDATE payouts SET state=CASE
+                WHEN status='paid' THEN 'PUBLISHED'
+                WHEN status IN ('processing','sandbox_processing','payment_unknown') THEN 'PAYING'
+                WHEN status='failed' THEN 'FAILED'
+                WHEN status='on_hold' THEN 'ON_HOLD'
+                WHEN status='reversed' THEN 'CANCELLED'
+                ELSE state END
+            WHERE state='PAYABLE'
+        """))
+
+
+def record_ledger_transaction(
+    c: Any,
+    *,
+    campaign_id: str,
+    payout_id: str,
+    entry_type: str,
+    debit_account: str,
+    credit_account: str,
+    amount_sats: int,
+    idempotency_base: str,
+) -> bool:
+    """Append one balanced debit/credit pair exactly once."""
+    if amount_sats <= 0:
+        return False
+    debit_key = f"{idempotency_base}:debit"
+    if c.execute(text("SELECT 1 FROM ledger_entries WHERE idempotency_key=:key"), {"key": debit_key}).fetchone():
+        return False
+    transaction_id = hid("ledtx")
+    created_at = now()
+    for direction, account in (("debit", debit_account), ("credit", credit_account)):
+        c.execute(
+            text("""
+                INSERT INTO ledger_entries
+                (id, transaction_id, campaign_id, payout_id, account, direction, amount_sats, entry_type, idempotency_key, created_at)
+                VALUES (:id, :transaction_id, :campaign_id, :payout_id, :account, :direction, :amount_sats, :entry_type, :idempotency_key, :created_at)
+            """),
+            {
+                "id": hid("led"),
+                "transaction_id": transaction_id,
+                "campaign_id": campaign_id,
+                "payout_id": payout_id,
+                "account": account,
+                "direction": direction,
+                "amount_sats": amount_sats,
+                "entry_type": entry_type,
+                "idempotency_key": f"{idempotency_base}:{direction}",
+                "created_at": created_at,
+            },
+        )
+    return True
+
+
+def ensure_campaign_budget(c: Any, campaign_id: str) -> dict[str, Any]:
+    c.execute(
+        text("""
+            INSERT INTO campaign_budgets (campaign_id, budget_sats, committed_sats, settled_sats, updated_at)
+            VALUES (:campaign_id, :budget_sats, 0, 0, :updated_at)
+            ON CONFLICT(campaign_id) DO NOTHING
+        """),
+        {"campaign_id": campaign_id, "budget_sats": default_campaign_budget_sats(), "updated_at": now()},
+    )
+    return asdict(c.execute(text("SELECT * FROM campaign_budgets WHERE campaign_id=:id"), {"id": campaign_id}).fetchone())
+
+
+def reserve_campaign_budget(c: Any, campaign_id: str, payout_id: str, amount_sats: int) -> bool:
+    ensure_campaign_budget(c, campaign_id)
+    reserved = c.execute(
+        text("""
+            UPDATE campaign_budgets
+            SET committed_sats=committed_sats+:amount, updated_at=:updated_at
+            WHERE campaign_id=:campaign_id
+              AND committed_sats + settled_sats + :amount <= budget_sats
+        """),
+        {"amount": amount_sats, "updated_at": now(), "campaign_id": campaign_id},
+    )
+    if reserved.rowcount != 1:
+        return False
+    record_ledger_transaction(
+        c,
+        campaign_id=campaign_id,
+        payout_id=payout_id,
+        entry_type="reserve",
+        debit_account="merchant_budget_available",
+        credit_account="payout_reserved",
+        amount_sats=amount_sats,
+        idempotency_base=f"{payout_id}:reserve",
+    )
+    return True
+
+
+def settle_campaign_budget(c: Any, campaign_id: str, payout_id: str, amount_sats: int) -> None:
+    if c.execute(text("SELECT 1 FROM ledger_entries WHERE idempotency_key=:key"), {"key": f"{payout_id}:commission_settled:debit"}).fetchone():
+        return
+    c.execute(
+        text("""
+            UPDATE campaign_budgets
+            SET committed_sats=CASE WHEN committed_sats>=:amount THEN committed_sats-:amount ELSE 0 END,
+                settled_sats=settled_sats+:amount, updated_at=:updated_at
+            WHERE campaign_id=:campaign_id
+        """),
+        {"amount": amount_sats, "updated_at": now(), "campaign_id": campaign_id},
+    )
+    record_ledger_transaction(
+        c,
+        campaign_id=campaign_id,
+        payout_id=payout_id,
+        entry_type="commission_settled",
+        debit_account="payout_reserved",
+        credit_account="affiliate_paid",
+        amount_sats=amount_sats,
+        idempotency_base=f"{payout_id}:commission_settled",
+    )
+
+
+def release_campaign_budget(c: Any, campaign_id: str, payout_id: str, amount_sats: int) -> None:
+    if amount_sats <= 0 or c.execute(text("SELECT 1 FROM ledger_entries WHERE idempotency_key=:key"), {"key": f"{payout_id}:release:debit"}).fetchone():
+        return
+    c.execute(
+        text("""
+            UPDATE campaign_budgets
+            SET committed_sats=CASE WHEN committed_sats>=:amount THEN committed_sats-:amount ELSE 0 END,
+                updated_at=:updated_at WHERE campaign_id=:campaign_id
+        """),
+        {"amount": amount_sats, "updated_at": now(), "campaign_id": campaign_id},
+    )
+    record_ledger_transaction(
+        c,
+        campaign_id=campaign_id,
+        payout_id=payout_id,
+        entry_type="release",
+        debit_account="payout_reserved",
+        credit_account="merchant_budget_available",
+        amount_sats=amount_sats,
+        idempotency_base=f"{payout_id}:release",
+    )
 
 
 @app.on_event("startup")
@@ -644,6 +867,17 @@ class DemoMerchantCheckoutIn(BaseModel):
 class PayoutMarkPaidIn(BaseModel):
     payment_hash: Optional[str] = Field(None, description="Sandbox Lightning payment hash. Generated if omitted.")
     note: Optional[str] = "sandbox payout paid"
+
+
+class CampaignBudgetIn(BaseModel):
+    budget_sats: int = Field(..., ge=0)
+
+
+class AttemptReconcileIn(BaseModel):
+    outcome: str
+    payment_hash: Optional[str] = None
+    routing_fee_sats: Optional[int] = Field(None, ge=0)
+    error: Optional[str] = None
 
 
 class CampaignStatusIn(BaseModel):
@@ -940,13 +1174,21 @@ def create_conversion(body: ConversionIn, bb_click_id: Optional[str] = Cookie(No
             },
         )
         payout_id = hid("pay")
+        fee_sats = calculate_fee_sats(commission_sats, meerat_fee_bps(), fee_min_sats())
+        obligation_sats = commission_sats + fee_sats
+        budget_reserved = reserve_campaign_budget(c, click["campaign_id"], payout_id, obligation_sats)
+        payout_state = "PAYABLE" if budget_reserved else "ON_HOLD"
+        payout_status = "pending" if budget_reserved else "on_hold"
+        return_window_ends_at = (datetime.now(timezone.utc) + timedelta(days=default_return_window_days())).isoformat()
         c.execute(
             text(
                 """
                 INSERT INTO payouts (id, conversion_id, affiliate_pubkey, amount_sats,
-                lightning_address, status, payment_hash, nostr_event_id, nostr_event_json, created_at)
+                lightning_address, status, state, fee_sats, fee_state, reserved_sats,
+                return_window_ends_at, payment_hash, nostr_event_id, nostr_event_json, created_at)
                 VALUES (:id, :conversion_id, :affiliate_pubkey, :amount_sats,
-                :lightning_address, :status, :payment_hash, :nostr_event_id, :nostr_event_json, :created_at)
+                :lightning_address, :status, :state, :fee_sats, :fee_state, :reserved_sats,
+                :return_window_ends_at, :payment_hash, :nostr_event_id, :nostr_event_json, :created_at)
                 """
             ),
             {
@@ -955,14 +1197,28 @@ def create_conversion(body: ConversionIn, bb_click_id: Optional[str] = Cookie(No
                 "affiliate_pubkey": click["affiliate_pubkey"],
                 "amount_sats": commission_sats,
                 "lightning_address": enr["lightning_address"] if enr else None,
-                "status": "pending",
+                "status": payout_status,
+                "state": payout_state,
+                "fee_sats": fee_sats,
+                "fee_state": "FEE_PENDING",
+                "reserved_sats": obligation_sats if budget_reserved else 0,
+                "return_window_ends_at": return_window_ends_at,
                 "payment_hash": None,
                 "nostr_event_id": None,
                 "nostr_event_json": None,
                 "created_at": now(),
             },
         )
-    return {"conversion_id": conversion_id, "affiliate_pubkey": click["affiliate_pubkey"], "commission_sats": commission_sats, "status": "approved", "payout_status": "pending", "nostr_event_id": event["id"], "nostr_event": event, "relay_results": relay_results}
+        if not budget_reserved:
+            camp["status"] = "paused"
+            pause_event = build_campaign_event(camp)
+            pause_relays = publish_event(pause_event)
+            persist_nostr_event(c, pause_event, "campaign", camp["id"], pause_relays)
+            c.execute(
+                text("UPDATE campaigns SET status='paused', nostr_event_id=:event_id, nostr_event_json=:event_json WHERE id=:id"),
+                {"id": camp["id"], "event_id": pause_event["id"], "event_json": json.dumps(pause_event)},
+            )
+    return {"conversion_id": conversion_id, "affiliate_pubkey": click["affiliate_pubkey"], "commission_sats": commission_sats, "fee_sats": fee_sats, "status": "approved", "payout_status": payout_status, "payout_state": payout_state, "nostr_event_id": event["id"], "nostr_event": event, "relay_results": relay_results}
 
 
 @app.post("/conversions/{conversion_id}/reverse")
@@ -1021,6 +1277,20 @@ def reverse_conversion(
             {"id": reversal_id, "conversion_id": conversion_id, "reason": reason, "refund_sats": body.refund_sats, "nostr_event_id": event["id"], "nostr_event_json": json.dumps(event), "created_at": now()},
         )
         c.execute(text("UPDATE conversions SET status='reversed' WHERE id=:id"), {"id": conversion_id})
+        payout = asdict(c.execute(text("SELECT * FROM payouts WHERE conversion_id=:id ORDER BY created_at DESC LIMIT 1"), {"id": conversion_id}).fetchone())
+        if payout and payout.get("state") in {"PAYABLE", "FAILED", "ON_HOLD"}:
+            release_campaign_budget(c, conversion["campaign_id"], payout["id"], int(payout.get("reserved_sats") or 0))
+            c.execute(
+                text("UPDATE payouts SET status='reversed', state='CANCELLED', fee_state='CANCELLED', reserved_sats=0 WHERE id=:id"),
+                {"id": payout["id"]},
+            )
+        elif payout and payout.get("state") in {"SETTLED", "PUBLISHED"} and int(payout.get("reserved_sats") or 0) > 0:
+            # The commission is already a settled fact; cancel only the still-unpaid Meerat fee.
+            release_campaign_budget(c, conversion["campaign_id"], payout["id"], int(payout["reserved_sats"]))
+            c.execute(
+                text("UPDATE payouts SET fee_state='CANCELLED', reserved_sats=0 WHERE id=:id"),
+                {"id": payout["id"]},
+            )
     return {
         "ok": True,
         "duplicate": False,
@@ -1659,6 +1929,7 @@ def affiliate_public_data(affiliate_pubkey: str) -> dict[str, Any]:
         "pending_sats": sum(int(p["amount_sats"]) for p in payouts if p["status"] == "pending"),
         "published_events": sum(1 for ev in events if ev["relay_status"] == "published"),
     }
+    payouts = [public_payout_record(p) for p in payouts]
     return {
         "identity": {"npub": identity["npub"], "hex": identity["hex"]},
         "affiliate_pubkey": identity["npub"],
@@ -1753,6 +2024,190 @@ def affiliate_public_profile(affiliate_pubkey: str) -> str:
 """
 
 
+@app.get("/admin/campaigns/{campaign_id}/budget")
+def campaign_budget_detail(campaign_id: str, authorization: Optional[str] = Header(None)) -> dict[str, Any]:
+    require_payout_admin_key(authorization)
+    init_db()
+    with engine().begin() as c:
+        campaign = c.execute(text("SELECT 1 FROM campaigns WHERE id=:id"), {"id": campaign_id}).fetchone()
+        if not campaign:
+            raise HTTPException(404, "campaign not found")
+        budget = ensure_campaign_budget(c, campaign_id)
+    return {"budget": budget, "available_sats": max(0, budget["budget_sats"] - budget["committed_sats"] - budget["settled_sats"])}
+
+
+@app.put("/admin/campaigns/{campaign_id}/budget")
+def update_campaign_budget(
+    campaign_id: str,
+    body: CampaignBudgetIn,
+    authorization: Optional[str] = Header(None),
+) -> dict[str, Any]:
+    require_payout_admin_key(authorization)
+    init_db()
+    with engine().begin() as c:
+        if not c.execute(text("SELECT 1 FROM campaigns WHERE id=:id"), {"id": campaign_id}).fetchone():
+            raise HTTPException(404, "campaign not found")
+        budget = ensure_campaign_budget(c, campaign_id)
+        if body.budget_sats < budget["committed_sats"] + budget["settled_sats"]:
+            raise HTTPException(409, "budget cannot be lower than committed plus settled sats")
+        c.execute(
+            text("UPDATE campaign_budgets SET budget_sats=:budget, updated_at=:updated_at WHERE campaign_id=:id"),
+            {"id": campaign_id, "budget": body.budget_sats, "updated_at": now()},
+        )
+        budget = asdict(c.execute(text("SELECT * FROM campaign_budgets WHERE campaign_id=:id"), {"id": campaign_id}).fetchone())
+    return {"ok": True, "budget": budget}
+
+
+@app.post("/admin/payouts/{payout_id}/release-hold")
+def release_payout_hold(payout_id: str, authorization: Optional[str] = Header(None)) -> dict[str, Any]:
+    require_payout_admin_key(authorization)
+    init_db()
+    with engine().begin() as c:
+        payout = asdict(c.execute(text("SELECT * FROM payouts WHERE id=:id"), {"id": payout_id}).fetchone())
+        if not payout:
+            raise HTTPException(404, "payout not found")
+        if payout["state"] == "PAYABLE":
+            return {"ok": True, "duplicate": True, "payout_id": payout_id, "payout_state": "PAYABLE"}
+        if payout["state"] != "ON_HOLD":
+            raise HTTPException(409, f"payout state {payout['state']} is not ON_HOLD")
+        conversion = asdict(c.execute(text("SELECT campaign_id FROM conversions WHERE id=:id"), {"id": payout["conversion_id"]}).fetchone())
+        obligation_sats = int(payout["amount_sats"]) + int(payout.get("fee_sats") or 0)
+        if not reserve_campaign_budget(c, conversion["campaign_id"], payout_id, obligation_sats):
+            raise HTTPException(409, "campaign budget is still insufficient")
+        c.execute(
+            text("UPDATE payouts SET state='PAYABLE', status='pending', reserved_sats=:reserved_sats, last_error=NULL WHERE id=:id AND state='ON_HOLD'"),
+            {"id": payout_id, "reserved_sats": obligation_sats},
+        )
+    return {"ok": True, "duplicate": False, "payout_id": payout_id, "payout_state": "PAYABLE", "reserved_sats": obligation_sats}
+
+
+@app.get("/admin/payouts/{payout_id}/attempts")
+def payout_attempts(payout_id: str, authorization: Optional[str] = Header(None)) -> dict[str, Any]:
+    require_payout_admin_key(authorization)
+    init_db()
+    with engine().connect() as c:
+        if not c.execute(text("SELECT 1 FROM payouts WHERE id=:id"), {"id": payout_id}).fetchone():
+            raise HTTPException(404, "payout not found")
+        attempts = [dict(row._mapping) for row in c.execute(
+            text("SELECT * FROM payment_attempts WHERE payout_id=:id ORDER BY attempt_number, created_at"),
+            {"id": payout_id},
+        ).fetchall()]
+    for attempt in attempts:
+        attempt.pop("preimage", None)
+    return {"payout_id": payout_id, "attempts": attempts}
+
+
+@app.get("/admin/payouts/{payout_id}/ledger")
+def payout_ledger(payout_id: str, authorization: Optional[str] = Header(None)) -> dict[str, Any]:
+    require_payout_admin_key(authorization)
+    init_db()
+    with engine().connect() as c:
+        if not c.execute(text("SELECT 1 FROM payouts WHERE id=:id"), {"id": payout_id}).fetchone():
+            raise HTTPException(404, "payout not found")
+        entries = [dict(row._mapping) for row in c.execute(
+            text("SELECT * FROM ledger_entries WHERE payout_id=:id ORDER BY created_at, id"),
+            {"id": payout_id},
+        ).fetchall()]
+    debits = sum(row["amount_sats"] for row in entries if row["direction"] == "debit")
+    credits = sum(row["amount_sats"] for row in entries if row["direction"] == "credit")
+    return {"payout_id": payout_id, "balanced": debits == credits, "debits_sats": debits, "credits_sats": credits, "entries": entries}
+
+
+@app.get("/admin/payment-attempts/recovery")
+def recoverable_payment_attempts(
+    older_than_seconds: int = 60,
+    authorization: Optional[str] = Header(None),
+) -> dict[str, Any]:
+    require_payout_admin_key(authorization)
+    init_db()
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=max(1, older_than_seconds))).isoformat()
+    with engine().connect() as c:
+        attempts = [dict(row._mapping) for row in c.execute(
+            text("""
+                SELECT * FROM payment_attempts
+                WHERE status IN ('PAYING','UNKNOWN') AND updated_at<=:cutoff
+                ORDER BY updated_at
+            """),
+            {"cutoff": cutoff},
+        ).fetchall()]
+    for attempt in attempts:
+        attempt.pop("preimage", None)
+    return {"cutoff": cutoff, "attempts": attempts, "action": "reconcile before any retry"}
+
+
+@app.post("/admin/payment-attempts/{attempt_id}/reconcile")
+def reconcile_payment_attempt(
+    attempt_id: str,
+    body: AttemptReconcileIn,
+    authorization: Optional[str] = Header(None),
+) -> dict[str, Any]:
+    require_payout_admin_key(authorization)
+    outcome = body.outcome.strip().upper()
+    if outcome not in {"SETTLED", "FAILED"}:
+        raise HTTPException(400, "outcome must be SETTLED or FAILED")
+    init_db()
+    with engine().connect() as c:
+        snapshot_attempt = asdict(c.execute(text("SELECT * FROM payment_attempts WHERE id=:id"), {"id": attempt_id}).fetchone())
+        snapshot_payout = asdict(c.execute(text("SELECT * FROM payouts WHERE id=:id"), {"id": snapshot_attempt["payout_id"]}).fetchone()) if snapshot_attempt else None
+    if not snapshot_attempt or not snapshot_payout:
+        raise HTTPException(404, "payment attempt not found")
+    if snapshot_attempt["status"] == outcome:
+        if outcome == "SETTLED" and not snapshot_payout.get("nostr_event_id"):
+            result = finalize_payout_paid(
+                snapshot_payout["id"],
+                snapshot_attempt.get("payment_hash") or snapshot_payout.get("payment_hash"),
+                "Retrying Nostr proof for a reconciled Lightning payout",
+                sandbox=snapshot_attempt["rail"] == "sandbox",
+                provider=snapshot_attempt["rail"],
+                fees_paid_msats=(snapshot_attempt["routing_fee_sats"] * 1000 if snapshot_attempt.get("routing_fee_sats") is not None else None),
+            )
+            result["attempt_id"] = attempt_id
+            return result
+        return {"ok": True, "duplicate": True, "attempt_id": attempt_id, "payout_id": snapshot_payout["id"], "payout_state": snapshot_payout["state"]}
+    with engine().begin() as c:
+        attempt = asdict(c.execute(text("SELECT * FROM payment_attempts WHERE id=:id"), {"id": attempt_id}).fetchone())
+        if not attempt:
+            raise HTTPException(404, "payment attempt not found")
+        payout = asdict(c.execute(text("SELECT * FROM payouts WHERE id=:id"), {"id": attempt["payout_id"]}).fetchone())
+        if attempt["status"] not in {"PAYING", "UNKNOWN"}:
+            raise HTTPException(409, f"attempt status {attempt['status']} cannot be reconciled")
+        if outcome == "FAILED":
+            c.execute(
+                text("UPDATE payment_attempts SET status='FAILED', error=:error, updated_at=:updated_at WHERE id=:id"),
+                {"id": attempt_id, "error": safe_text(body.error or "manually reconciled as unpaid", 500), "updated_at": now()},
+            )
+            c.execute(
+                text("UPDATE payouts SET state='FAILED', status='failed', last_error=:error WHERE id=:id AND state='PAYING'"),
+                {"id": payout["id"], "error": safe_text(body.error or "manually reconciled as unpaid", 500)},
+            )
+            return {"ok": True, "duplicate": False, "attempt_id": attempt_id, "payout_id": payout["id"], "payout_state": "FAILED"}
+        payment_hash = body.payment_hash or attempt.get("payment_hash")
+        if not payment_hash:
+            raise HTTPException(400, "payment_hash is required to reconcile as SETTLED")
+        c.execute(
+            text("""
+                UPDATE payment_attempts SET status='SETTLED', payment_hash=:payment_hash,
+                    routing_fee_sats=:routing_fee_sats, error=NULL, settled_at=:settled_at, updated_at=:updated_at
+                WHERE id=:id
+            """),
+            {"id": attempt_id, "payment_hash": payment_hash, "routing_fee_sats": body.routing_fee_sats, "settled_at": now(), "updated_at": now()},
+        )
+        c.execute(
+            text("UPDATE payouts SET state='SETTLED', status='paid', payment_hash=:payment_hash, settled_at=:settled_at WHERE id=:id"),
+            {"id": payout["id"], "payment_hash": payment_hash, "settled_at": now()},
+        )
+    result = finalize_payout_paid(
+        payout["id"],
+        payment_hash,
+        "Manually reconciled Lightning payout",
+        sandbox=False,
+        provider=attempt["rail"],
+        fees_paid_msats=(body.routing_fee_sats * 1000 if body.routing_fee_sats is not None else None),
+    )
+    result["attempt_id"] = attempt_id
+    return result
+
+
 def payout_data(payout_id: str) -> dict[str, Any]:
     init_db()
     with engine().connect() as c:
@@ -1768,8 +2223,7 @@ def payout_data(payout_id: str) -> dict[str, Any]:
     if event:
         event["event_json"] = json.loads(event["event_json"])
         event["relays"] = relays
-    # BOLT11 is retained privately for reconciliation but never exposed by public payout endpoints.
-    payout.pop("bolt11_invoice", None)
+    payout = public_payout_record(payout)
     return {"payout": payout, "conversion": conversion, "campaign": campaign, "click": click, "enrollment": enrollment, "event": event}
 
 
@@ -1803,6 +2257,7 @@ def finalize_payout_paid(
                 "duplicate": True,
                 "payout_id": payout_id,
                 "payout_status": "paid",
+                "payout_state": payout.get("state") or "PUBLISHED",
                 "payment_hash": payout.get("payment_hash"),
                 "nostr_event_id": payout.get("nostr_event_id"),
                 "nostr_event": existing_event,
@@ -1811,6 +2266,10 @@ def finalize_payout_paid(
             }
         if not conversion or not campaign:
             raise HTTPException(400, "payout is missing conversion/campaign context")
+        reserved_sats = int(payout.get("reserved_sats") or 0)
+        if reserved_sats >= int(payout["amount_sats"]):
+            settle_campaign_budget(c, conversion["campaign_id"], payout_id, int(payout["amount_sats"]))
+            reserved_sats -= int(payout["amount_sats"])
         affiliate_identity = normalize_pubkey(payout["affiliate_pubkey"], "affiliate_pubkey")
         merchant_hex = campaign.get("merchant_pubkey_hex") or normalize_pubkey(campaign["merchant_pubkey"], "merchant_pubkey")["hex"]
         settled_at = str(int(time.time()))
@@ -1825,8 +2284,10 @@ def finalize_payout_paid(
                 ["campaign", conversion["campaign_id"]],
                 ["status", "paid"],
                 ["amount_sats", str(payout["amount_sats"])],
+                ["fee_sats", str(payout.get("fee_sats") or 0)],
                 ["payment_hash", payment_hash],
                 ["settled_at", settled_at],
+                ["rail", provider],
                 ["payment_provider", provider],
                 ["sandbox", "true" if sandbox else "false"],
             ],
@@ -1837,8 +2298,9 @@ def finalize_payout_paid(
         c.execute(
             text("""
                 UPDATE payouts
-                SET status='paid', payment_hash=:payment_hash, payment_provider=:payment_provider,
-                    fees_paid_msats=:fees_paid_msats, paid_at=:paid_at, last_error=NULL,
+                SET status='paid', state='PUBLISHED', payment_hash=:payment_hash, payment_provider=:payment_provider,
+                    fees_paid_msats=:fees_paid_msats, paid_at=:paid_at, settled_at=:settled_at,
+                    reserved_sats=:reserved_sats, last_error=NULL,
                     nostr_event_id=:nostr_event_id, nostr_event_json=:nostr_event_json
                 WHERE id=:id
             """),
@@ -1848,6 +2310,8 @@ def finalize_payout_paid(
                 "payment_provider": provider,
                 "fees_paid_msats": fees_paid_msats,
                 "paid_at": now(),
+                "settled_at": now(),
+                "reserved_sats": reserved_sats,
                 "nostr_event_id": event["id"],
                 "nostr_event_json": json.dumps(event),
             },
@@ -1858,6 +2322,7 @@ def finalize_payout_paid(
         "payout_id": payout_id,
         "conversion_id": payout["conversion_id"],
         "payout_status": "paid",
+        "payout_state": "PUBLISHED",
         "amount_sats": payout["amount_sats"],
         "payment_hash": payment_hash,
         "nostr_event_id": event["id"],
@@ -1878,8 +2343,10 @@ def mark_payout_paid(
     if os.getenv("SANDBOX_PAYOUT_MARK_PAID_ENABLED", "false").lower() not in {"1", "true", "yes", "on"}:
         raise HTTPException(404, "sandbox payout route is disabled")
     init_db()
+    payment_hash = body.payment_hash or hashlib.sha256(f"{payout_id}:{time.time()}".encode()).hexdigest()
+    attempt_id: str | None = None
     with engine().begin() as c:
-        payout = asdict(c.execute(text("SELECT status, payment_provider FROM payouts WHERE id=:id"), {"id": payout_id}).fetchone())
+        payout = asdict(c.execute(text("SELECT * FROM payouts WHERE id=:id"), {"id": payout_id}).fetchone())
         if not payout:
             raise HTTPException(404, "payout not found")
         if payout.get("payment_provider") == "nwc":
@@ -1888,8 +2355,9 @@ def mark_payout_paid(
             claimed = c.execute(
                 text(
                     """
-                    UPDATE payouts SET status='sandbox_processing', payment_provider='sandbox'
+                    UPDATE payouts SET status='sandbox_processing', state='PAYING', payment_provider='sandbox'
                     WHERE id=:id AND status IN ('pending', 'failed')
+                      AND state IN ('PAYABLE', 'FAILED')
                       AND (payment_provider IS NULL OR payment_provider='sandbox')
                     """
                 ),
@@ -1897,14 +2365,41 @@ def mark_payout_paid(
             )
             if claimed.rowcount != 1:
                 raise HTTPException(409, "sandbox cannot override this payout state")
-    payment_hash = body.payment_hash or hashlib.sha256(f"{payout_id}:{time.time()}".encode()).hexdigest()
-    return finalize_payout_paid(
+            attempt_number = int(c.execute(text("SELECT COUNT(*) FROM payment_attempts WHERE payout_id=:id AND kind='commission'"), {"id": payout_id}).scalar_one()) + 1
+            attempt_id = hid("att")
+            created_at = now()
+            c.execute(
+                text("""
+                    INSERT INTO payment_attempts
+                    (id, payout_id, kind, rail, idempotency_key, destination, amount_sats,
+                     status, payment_hash, routing_fee_sats, attempt_number, created_at, updated_at, settled_at)
+                    VALUES (:id, :payout_id, 'commission', 'sandbox', :idempotency_key, :destination,
+                            :amount_sats, 'SETTLED', :payment_hash, 0, :attempt_number, :created_at, :updated_at, :settled_at)
+                """),
+                {
+                    "id": attempt_id,
+                    "payout_id": payout_id,
+                    "idempotency_key": payment_idempotency_key(payout_id, "commission", attempt_number),
+                    "destination": payout.get("lightning_address") or "sandbox",
+                    "amount_sats": payout["amount_sats"],
+                    "payment_hash": payment_hash,
+                    "attempt_number": attempt_number,
+                    "created_at": created_at,
+                    "updated_at": created_at,
+                    "settled_at": created_at,
+                },
+            )
+            c.execute(text("UPDATE payouts SET status='paid', state='SETTLED', payment_hash=:payment_hash, settled_at=:settled_at WHERE id=:id"), {"id": payout_id, "payment_hash": payment_hash, "settled_at": created_at})
+    result = finalize_payout_paid(
         payout_id,
         payment_hash,
         body.note,
         sandbox=True,
         provider="sandbox",
     )
+    if attempt_id:
+        result["attempt_id"] = attempt_id
+    return result
 
 
 @app.post("/admin/payouts/{payout_id}/execute")
@@ -1928,6 +2423,7 @@ def execute_payout(
                 "duplicate": True,
                 "payout_id": payout_id,
                 "payout_status": "paid",
+                "payout_state": payout.get("state") or "PUBLISHED",
                 "payment_hash": payout.get("payment_hash"),
                 "nostr_event_id": payout.get("nostr_event_id"),
                 "nostr_event": existing_event,
@@ -1943,26 +2439,60 @@ def execute_payout(
             provider=payout.get("payment_provider") or "nwc",
             fees_paid_msats=payout.get("fees_paid_msats"),
         )
-    if payout["status"] in {"processing", "payment_unknown"}:
-        raise HTTPException(409, f"payout status is {payout['status']}; manual reconciliation required")
+    if payout.get("state") in {"PAYING", "SETTLED"} or payout["status"] in {"processing", "payment_unknown"}:
+        raise HTTPException(409, f"payout state is {payout.get('state')}; manual reconciliation required")
+    if payout.get("state") in {"ON_HOLD", "CANCELLED"}:
+        raise HTTPException(409, f"payout state {payout['state']} is not executable")
+    if payout.get("return_window_ends_at"):
+        try:
+            return_window_ends_at = datetime.fromisoformat(str(payout["return_window_ends_at"]).replace("Z", "+00:00"))
+            if return_window_ends_at > datetime.now(timezone.utc):
+                raise HTTPException(409, "payout return window has not ended")
+        except ValueError as exc:
+            raise HTTPException(500, "payout has an invalid return window") from exc
     if not payout.get("lightning_address"):
         raise HTTPException(400, "payout has no Lightning Address")
     if payout["amount_sats"] > lightning_max_payout_sats():
         raise HTTPException(400, "payout exceeds LIGHTNING_MAX_PAYOUT_SATS")
     with engine().begin() as c:
+        attempt_number = int(c.execute(
+            text("SELECT COUNT(*) FROM payment_attempts WHERE payout_id=:id AND kind='commission'"),
+            {"id": payout_id},
+        ).scalar_one()) + 1
+        attempt_id = hid("att")
+        idempotency_key = payment_idempotency_key(payout_id, "commission", attempt_number)
         claimed = c.execute(
             text(
                 """
                 UPDATE payouts
-                SET status='processing', payment_provider='nwc', attempt_count=attempt_count+1,
+                SET status='processing', state='PAYING', payment_provider='nwc', attempt_count=attempt_count+1,
                     processing_started_at=:started_at, last_error=NULL
-                WHERE id=:id AND status IN ('pending', 'failed')
+                WHERE id=:id AND state IN ('PAYABLE', 'FAILED')
                 """
             ),
             {"id": payout_id, "started_at": now()},
         )
         if claimed.rowcount != 1:
             raise HTTPException(409, "payout could not be claimed for processing")
+        c.execute(
+            text("""
+                INSERT INTO payment_attempts
+                (id, payout_id, kind, rail, idempotency_key, destination, amount_sats,
+                 status, attempt_number, created_at, updated_at)
+                VALUES (:id, :payout_id, 'commission', 'nwc', :idempotency_key, :destination,
+                        :amount_sats, 'PAYING', :attempt_number, :created_at, :updated_at)
+            """),
+            {
+                "id": attempt_id,
+                "payout_id": payout_id,
+                "idempotency_key": idempotency_key,
+                "destination": payout["lightning_address"],
+                "amount_sats": payout["amount_sats"],
+                "attempt_number": attempt_number,
+                "created_at": now(),
+                "updated_at": now(),
+            },
+        )
     try:
         invoice, expected_hash = asyncio.run(prepare_lnurl_payment(payout["lightning_address"], payout["amount_sats"]))
         with engine().begin() as c:
@@ -1970,20 +2500,30 @@ def execute_payout(
                 text(
                     """
                     UPDATE payouts SET bolt11_invoice=:invoice, payment_hash=:payment_hash
-                    WHERE id=:id AND status='processing' AND payment_provider='nwc'
+                    WHERE id=:id AND state='PAYING' AND payment_provider='nwc'
                     """
                 ),
                 {"id": payout_id, "invoice": invoice, "payment_hash": expected_hash},
             )
             if stored.rowcount != 1:
                 raise LightningPaymentError("payout lost its processing claim before payment")
+            c.execute(
+                text("UPDATE payment_attempts SET payment_hash=:payment_hash, updated_at=:updated_at WHERE id=:id AND status='PAYING'"),
+                {"id": attempt_id, "payment_hash": expected_hash, "updated_at": now()},
+            )
         result = asyncio.run(pay_nwc_invoice(invoice, expected_hash))
     except LightningPaymentError as exc:
         failed_status = "payment_unknown" if exc.payment_may_have_succeeded else "failed"
+        attempt_status = "UNKNOWN" if exc.payment_may_have_succeeded else "FAILED"
+        payout_state = "PAYING" if exc.payment_may_have_succeeded else "FAILED"
         with engine().begin() as c:
             c.execute(
-                text("UPDATE payouts SET status=:status, last_error=:error WHERE id=:id AND status='processing'"),
-                {"id": payout_id, "status": failed_status, "error": safe_text(str(exc), 500)},
+                text("UPDATE payment_attempts SET status=:status, error=:error, updated_at=:updated_at WHERE id=:id AND status='PAYING'"),
+                {"id": attempt_id, "status": attempt_status, "error": safe_text(str(exc), 500), "updated_at": now()},
+            )
+            c.execute(
+                text("UPDATE payouts SET status=:status, state=:state, last_error=:error WHERE id=:id AND state='PAYING'"),
+                {"id": payout_id, "status": failed_status, "state": payout_state, "error": safe_text(str(exc), 500)},
             )
         raise HTTPException(502, str(exc)) from exc
     # Payment evidence is committed before Nostr proof construction/publication.
@@ -1992,9 +2532,9 @@ def execute_payout(
             text(
                 """
                 UPDATE payouts
-                SET status='paid', payment_hash=:payment_hash, fees_paid_msats=:fees_paid_msats,
-                    paid_at=:paid_at, last_error=NULL
-                WHERE id=:id AND status='processing' AND payment_provider='nwc'
+                SET status='paid', state='SETTLED', payment_hash=:payment_hash, fees_paid_msats=:fees_paid_msats,
+                    paid_at=:paid_at, settled_at=:settled_at, last_error=NULL
+                WHERE id=:id AND state='PAYING' AND payment_provider='nwc'
                 """
             ),
             {
@@ -2002,11 +2542,22 @@ def execute_payout(
                 "payment_hash": result.payment_hash,
                 "fees_paid_msats": result.fees_paid_msats,
                 "paid_at": now(),
+                "settled_at": now(),
             },
         )
         if recorded.rowcount != 1:
             raise HTTPException(500, "payment succeeded but payout state could not be recorded; manual reconciliation required")
-    return finalize_payout_paid(
+        routing_fee_sats = None if result.fees_paid_msats is None else (int(result.fees_paid_msats) + 999) // 1000
+        c.execute(
+            text("""
+                UPDATE payment_attempts
+                SET status='SETTLED', payment_hash=:payment_hash, routing_fee_sats=:routing_fee_sats,
+                    error=NULL, settled_at=:settled_at, updated_at=:updated_at
+                WHERE id=:id AND status='PAYING'
+            """),
+            {"id": attempt_id, "payment_hash": result.payment_hash, "routing_fee_sats": routing_fee_sats, "settled_at": now(), "updated_at": now()},
+        )
+    finalized = finalize_payout_paid(
         payout_id,
         result.payment_hash,
         "Lightning payout paid via Alby Hub NWC",
@@ -2014,6 +2565,9 @@ def execute_payout(
         provider="nwc",
         fees_paid_msats=result.fees_paid_msats,
     )
+    finalized["attempt_id"] = attempt_id
+    finalized["idempotency_key"] = idempotency_key
+    return finalized
 
 
 @app.get("/payouts/{payout_id}/receipt", response_class=HTMLResponse)
@@ -2098,6 +2652,7 @@ def campaign_public_data(campaign_id: str) -> dict[str, Any]:
         "pending_sats": sum(int(p["amount_sats"]) for p in payouts if p["status"] == "pending"),
         "published_events": sum(1 for ev in events if ev["relay_status"] == "published"),
     }
+    payouts = [public_payout_record(p) for p in payouts]
     campaign["nostr_event"] = json.loads(campaign.pop("nostr_event_json"))
     return {
         "campaign_id": campaign_id,
@@ -2145,6 +2700,7 @@ def flow_receipt_data(conversion_id: str) -> dict[str, Any]:
                 relays_by_event[eid] = [dict(r._mapping) for r in c.execute(text("SELECT relay_url, status, error, created_at FROM nostr_event_relays WHERE event_id=:id"), {"id": eid}).fetchall()]
     for ev in events:
         ev["relays"] = relays_by_event.get(ev["event_id"], [])
+    payout = public_payout_record(payout)
     return {
         "conversion_id": conversion_id,
         "merchant_pubkey": campaign["merchant_pubkey"] if campaign else None,

@@ -120,6 +120,19 @@ def test_ambiguous_nwc_failure_is_not_retried(tmp_path, monkeypatch):
     assert "bolt11_invoice" not in payout
     assert "manual reconciliation" in payout["last_error"]
 
+    flow = client.get(f"/flows/{payout['conversion_id']}").json()
+    public_urls = [
+        f"/flows/{payout['conversion_id']}",
+        f"/campaigns/{flow['campaign']['id']}/summary",
+        f"/affiliates/{flow['affiliate_pubkey']}/summary",
+        f"/payouts/{payout_id}",
+    ]
+    for url in public_urls:
+        public_response = client.get(url)
+        assert public_response.status_code == 200, public_response.text
+        assert "test-bolt11" not in public_response.text
+        assert "bolt11_invoice" not in public_response.text
+
     second = client.post(
         f"/admin/payouts/{payout_id}/execute",
         headers={"Authorization": "Bearer admin-test-key"},

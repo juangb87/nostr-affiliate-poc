@@ -2,7 +2,7 @@
 
 Minimal proof-of-concept for a Nostr-powered affiliate network:
 
-`campaign → enrollment → redirect click → conversion → real Nostr proof → pending Lightning payout`
+`campaign → enrollment → attribution → conversion proof → budgeted ledger → durable Lightning payout`
 
 ## What this MVP proves
 
@@ -12,6 +12,7 @@ Minimal proof-of-concept for a Nostr-powered affiliate network:
 - Conversion proof events with hashed click/order IDs
 - Relay publication status stored in Postgres
 - Lightning payout settlement proofs and reversal proofs
+- Merchant-direct campaign budgets, balanced ledger entries, and crash-safe payment attempts
 
 Events are now real Nostr events signed with Schnorr keys via `nostr-sdk`. If `NOSTR_PUBLISH=true`, the app publishes campaign, enrollment, and conversion proof events to configured public relays.
 
@@ -60,6 +61,14 @@ python scripts/e2e.py
 - `GET /payouts/{payout_id}`
 - `POST /payouts/{payout_id}/mark-paid` — sandbox Lightning payout settlement + kind `2802` proof
 - `GET /payouts/{payout_id}/receipt`
+- `GET /admin/campaigns/{campaign_id}/budget` — payout-admin budget counters
+- `PUT /admin/campaigns/{campaign_id}/budget` — configure a campaign cap
+- `POST /admin/payouts/{payout_id}/release-hold` — reserve a held obligation after top-up
+- `GET /admin/payouts/{payout_id}/attempts` — private attempt history without preimages
+- `GET /admin/payouts/{payout_id}/ledger` — balanced accounting entries
+- `POST /admin/payouts/{payout_id}/execute` — atomically claim and execute via the configured NWC wallet
+- `GET /admin/payment-attempts/recovery` — stale `PAYING`/`UNKNOWN` attempts requiring reconciliation
+- `POST /admin/payment-attempts/{attempt_id}/reconcile` — settle or fail an ambiguous attempt without repaying
 - `GET /nostr/events/{event_id}`
 - `POST /demo`
 
@@ -76,6 +85,14 @@ New events use a unified `v=2` schema:
 Conversion events reference the campaign and enrollment with NIP-01 `a` coordinates. `p` tags always use 64-character hex pubkeys with the role in the fourth element. Fiat fields are separated from `order_total_sats`; raw click/order IDs and customer data remain private.
 
 See [`docs/nostr-schema-v2.md`](docs/nostr-schema-v2.md) for the complete tag schema and cutover policy.
+
+## Payment ledger and state machine
+
+New conversion obligations reserve the full affiliate commission plus a separate Meerat fee against `campaign_budgets`. Payouts follow `PAYABLE → PAYING → SETTLED → PUBLISHED`; insufficient budget produces `ON_HOLD`, while an ambiguous wallet response remains `PAYING` with an `UNKNOWN` attempt until an administrator reconciles it. It is never retried automatically.
+
+Ledger movements are append-only balanced debit/credit pairs. Affiliate settlement moves only the promised commission to `settled_sats`; the separate Meerat fee remains committed with `fee_state=FEE_PENDING` for the provider-adapter sprint.
+
+See [`docs/payment-ledger-sprint2.md`](docs/payment-ledger-sprint2.md) for state transitions, recovery invariants, tables, and admin operations.
 
 ## Railway
 
@@ -98,6 +115,11 @@ Recommended environment variables:
 - `SHOPIFY_WEBHOOK_SECRET`: optional dedicated override for webhook verification; when omitted, `SHOPIFY_SECRET` is used.
 - `SHOPIFY_STORE_DOMAIN`: permanent `*.myshopify.com` domain accepted in signed webhook headers.
 - `SATS_PER_USD`: server-side USD→sats conversion rate used only when merchant reports `currency: "USD"`. Default: `2500`.
+- `PAYOUT_ADMIN_KEY`: bearer secret required by budget, attempt, ledger, recovery, reconciliation, and payout execution endpoints.
+- `DEFAULT_CAMPAIGN_BUDGET_SATS`: initial internal cap for campaigns without an explicit admin budget. Default: `1000000`.
+- `MEERAT_FEE_BPS`: separate merchant-paid Meerat fee in basis points. Default: `1000` (10%).
+- `FEE_MIN_SATS`: minimum Meerat fee when the basis-point fee is non-zero. Default: `10`.
+- `DEFAULT_RETURN_WINDOW_DAYS`: delay metadata before a payout is eligible. Default: `0` for the POC.
 
 ## Merchant tracking snippet
 
