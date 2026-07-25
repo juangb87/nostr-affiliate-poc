@@ -17,6 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from nostr_sdk import Client, EventBuilder, Keys, Kind, PublicKey, RelayUrl, Tag
+from app.lightning import LightningPaymentError, pay_nwc_invoice, prepare_lnurl_payment
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
@@ -167,6 +168,26 @@ def require_merchant_api_key(authorization: Optional[str]) -> str:
         if secrets.compare_digest(token, valid):
             return token
     raise HTTPException(403, "invalid merchant API key")
+
+
+def require_payout_admin_key(authorization: Optional[str]) -> str:
+    expected = os.getenv("PAYOUT_ADMIN_KEY", "").strip()
+    if not expected:
+        raise HTTPException(503, "payout administration is not configured")
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(401, "missing Bearer payout admin key")
+    token = authorization.split(" ", 1)[1].strip()
+    if not secrets.compare_digest(token, expected):
+        raise HTTPException(403, "invalid payout admin key")
+    return token
+
+
+def lightning_payouts_enabled() -> bool:
+    return os.getenv("LIGHTNING_PAYOUTS_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+
+
+def lightning_max_payout_sats() -> int:
+    return max(1, int(os.getenv("LIGHTNING_MAX_PAYOUT_SATS", "1000")))
 
 
 def nostr_keys() -> Keys:
@@ -375,6 +396,13 @@ def init_db() -> None:
         lightning_address TEXT,
         status TEXT NOT NULL,
         payment_hash TEXT,
+        bolt11_invoice TEXT,
+        payment_provider TEXT,
+        fees_paid_msats INTEGER,
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        processing_started_at TEXT,
+        paid_at TEXT,
         nostr_event_id TEXT,
         nostr_event_json TEXT,
         created_at TEXT NOT NULL
@@ -409,13 +437,33 @@ def init_db() -> None:
         if database_url().startswith("postgresql"):
             c.execute(text("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS merchant_pubkey_hex TEXT"))
             c.execute(text("ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS affiliate_pubkey_hex TEXT"))
+            c.execute(text("ALTER TABLE payouts ADD COLUMN IF NOT EXISTS bolt11_invoice TEXT"))
+            c.execute(text("ALTER TABLE payouts ADD COLUMN IF NOT EXISTS payment_provider TEXT"))
+            c.execute(text("ALTER TABLE payouts ADD COLUMN IF NOT EXISTS fees_paid_msats INTEGER"))
+            c.execute(text("ALTER TABLE payouts ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0"))
+            c.execute(text("ALTER TABLE payouts ADD COLUMN IF NOT EXISTS last_error TEXT"))
+            c.execute(text("ALTER TABLE payouts ADD COLUMN IF NOT EXISTS processing_started_at TEXT"))
+            c.execute(text("ALTER TABLE payouts ADD COLUMN IF NOT EXISTS paid_at TEXT"))
         else:
             campaign_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(campaigns)")).fetchall()}
             enrollment_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(enrollments)")).fetchall()}
+            payout_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(payouts)")).fetchall()}
             if "merchant_pubkey_hex" not in campaign_cols:
                 c.execute(text("ALTER TABLE campaigns ADD COLUMN merchant_pubkey_hex TEXT"))
             if "affiliate_pubkey_hex" not in enrollment_cols:
                 c.execute(text("ALTER TABLE enrollments ADD COLUMN affiliate_pubkey_hex TEXT"))
+            payout_column_ddl = {
+                "bolt11_invoice": "TEXT",
+                "payment_provider": "TEXT",
+                "fees_paid_msats": "INTEGER",
+                "attempt_count": "INTEGER NOT NULL DEFAULT 0",
+                "last_error": "TEXT",
+                "processing_started_at": "TEXT",
+                "paid_at": "TEXT",
+            }
+            for column, column_type in payout_column_ddl.items():
+                if column not in payout_cols:
+                    c.execute(text(f"ALTER TABLE payouts ADD COLUMN {column} {column_type}"))
 
 
 @app.on_event("startup")
@@ -1488,6 +1536,8 @@ def payout_data(payout_id: str) -> dict[str, Any]:
     if event:
         event["event_json"] = json.loads(event["event_json"])
         event["relays"] = relays
+    # BOLT11 is retained privately for reconciliation but never exposed by public payout endpoints.
+    payout.pop("bolt11_invoice", None)
     return {"payout": payout, "conversion": conversion, "campaign": campaign, "click": click, "enrollment": enrollment, "event": event}
 
 
@@ -1496,8 +1546,15 @@ def payout_detail(payout_id: str) -> dict[str, Any]:
     return payout_data(payout_id)
 
 
-@app.post("/payouts/{payout_id}/mark-paid")
-def mark_payout_paid(payout_id: str, body: PayoutMarkPaidIn) -> dict[str, Any]:
+def finalize_payout_paid(
+    payout_id: str,
+    payment_hash: str,
+    note: str | None,
+    *,
+    sandbox: bool,
+    provider: str,
+    fees_paid_msats: int | None = None,
+) -> dict[str, Any]:
     init_db()
     with engine().begin() as c:
         payout = asdict(c.execute(text("SELECT * FROM payouts WHERE id=:id"), {"id": payout_id}).fetchone())
@@ -1522,7 +1579,6 @@ def mark_payout_paid(payout_id: str, body: PayoutMarkPaidIn) -> dict[str, Any]:
             }
         if not conversion or not campaign:
             raise HTTPException(400, "payout is missing conversion/campaign context")
-        payment_hash = (body.payment_hash or sha(f"{payout_id}:{time.time()}"))
         affiliate_identity = normalize_pubkey(payout["affiliate_pubkey"], "affiliate_pubkey")
         merchant_hex = campaign.get("merchant_pubkey_hex") or normalize_pubkey(campaign["merchant_pubkey"], "merchant_pubkey")["hex"]
         event = build_nostr_event(
@@ -1542,19 +1598,30 @@ def mark_payout_paid(payout_id: str, body: PayoutMarkPaidIn) -> dict[str, Any]:
                 ["affiliate_npub", affiliate_identity["npub"]],
                 ["amount_sats", str(payout["amount_sats"])],
                 ["payment_hash", payment_hash],
-                ["sandbox", "true"],
+                ["payment_provider", provider],
+                ["sandbox", "true" if sandbox else "false"],
             ],
-            json.dumps({"note": body.note, "lightning_address": payout.get("lightning_address"), "sandbox": True}),
+            json.dumps({"note": note, "lightning_address": payout.get("lightning_address"), "sandbox": sandbox}),
         )
         relay_results = publish_event(event)
         persist_nostr_event(c, event, "payout", payout_id, relay_results)
         c.execute(
             text("""
                 UPDATE payouts
-                SET status='paid', payment_hash=:payment_hash, nostr_event_id=:nostr_event_id, nostr_event_json=:nostr_event_json
+                SET status='paid', payment_hash=:payment_hash, payment_provider=:payment_provider,
+                    fees_paid_msats=:fees_paid_msats, paid_at=:paid_at, last_error=NULL,
+                    nostr_event_id=:nostr_event_id, nostr_event_json=:nostr_event_json
                 WHERE id=:id
             """),
-            {"id": payout_id, "payment_hash": payment_hash, "nostr_event_id": event["id"], "nostr_event_json": json.dumps(event)},
+            {
+                "id": payout_id,
+                "payment_hash": payment_hash,
+                "payment_provider": provider,
+                "fees_paid_msats": fees_paid_msats,
+                "paid_at": now(),
+                "nostr_event_id": event["id"],
+                "nostr_event_json": json.dumps(event),
+            },
         )
     return {
         "ok": True,
@@ -1570,6 +1637,154 @@ def mark_payout_paid(payout_id: str, body: PayoutMarkPaidIn) -> dict[str, Any]:
         "receipt_url": f"{BASE_URL}/payouts/{payout_id}/receipt",
         "flow_receipt_url": f"{BASE_URL}/flows/{payout['conversion_id']}/receipt",
     }
+
+
+@app.post("/payouts/{payout_id}/mark-paid")
+def mark_payout_paid(
+    payout_id: str,
+    body: PayoutMarkPaidIn,
+    authorization: Optional[str] = Header(None),
+) -> dict[str, Any]:
+    require_payout_admin_key(authorization)
+    if os.getenv("SANDBOX_PAYOUT_MARK_PAID_ENABLED", "false").lower() not in {"1", "true", "yes", "on"}:
+        raise HTTPException(404, "sandbox payout route is disabled")
+    init_db()
+    with engine().begin() as c:
+        payout = asdict(c.execute(text("SELECT status, payment_provider FROM payouts WHERE id=:id"), {"id": payout_id}).fetchone())
+        if not payout:
+            raise HTTPException(404, "payout not found")
+        if payout.get("payment_provider") == "nwc":
+            raise HTTPException(409, "sandbox cannot modify a real NWC payout")
+        if payout["status"] != "paid":
+            claimed = c.execute(
+                text(
+                    """
+                    UPDATE payouts SET status='sandbox_processing', payment_provider='sandbox'
+                    WHERE id=:id AND status IN ('pending', 'failed')
+                      AND (payment_provider IS NULL OR payment_provider='sandbox')
+                    """
+                ),
+                {"id": payout_id},
+            )
+            if claimed.rowcount != 1:
+                raise HTTPException(409, "sandbox cannot override this payout state")
+    payment_hash = body.payment_hash or hashlib.sha256(f"{payout_id}:{time.time()}".encode()).hexdigest()
+    return finalize_payout_paid(
+        payout_id,
+        payment_hash,
+        body.note,
+        sandbox=True,
+        provider="sandbox",
+    )
+
+
+@app.post("/admin/payouts/{payout_id}/execute")
+def execute_payout(
+    payout_id: str,
+    authorization: Optional[str] = Header(None),
+) -> dict[str, Any]:
+    require_payout_admin_key(authorization)
+    if not lightning_payouts_enabled():
+        raise HTTPException(503, "Lightning payouts are disabled")
+    init_db()
+    with engine().connect() as c:
+        payout = asdict(c.execute(text("SELECT * FROM payouts WHERE id=:id"), {"id": payout_id}).fetchone())
+    if not payout:
+        raise HTTPException(404, "payout not found")
+    if payout["status"] == "paid":
+        if payout.get("nostr_event_id"):
+            existing_event = json.loads(payout["nostr_event_json"]) if payout.get("nostr_event_json") else None
+            return {
+                "ok": True,
+                "duplicate": True,
+                "payout_id": payout_id,
+                "payout_status": "paid",
+                "payment_hash": payout.get("payment_hash"),
+                "nostr_event_id": payout.get("nostr_event_id"),
+                "nostr_event": existing_event,
+                "receipt_url": f"{BASE_URL}/payouts/{payout_id}/receipt",
+                "flow_receipt_url": f"{BASE_URL}/flows/{payout['conversion_id']}/receipt",
+            }
+        # Payment evidence survived but proof publication did not; retry proof only, never the payment.
+        return finalize_payout_paid(
+            payout_id,
+            payout["payment_hash"],
+            "Retrying Nostr proof for an already paid Lightning payout",
+            sandbox=False,
+            provider=payout.get("payment_provider") or "nwc",
+            fees_paid_msats=payout.get("fees_paid_msats"),
+        )
+    if payout["status"] in {"processing", "payment_unknown"}:
+        raise HTTPException(409, f"payout status is {payout['status']}; manual reconciliation required")
+    if not payout.get("lightning_address"):
+        raise HTTPException(400, "payout has no Lightning Address")
+    if payout["amount_sats"] > lightning_max_payout_sats():
+        raise HTTPException(400, "payout exceeds LIGHTNING_MAX_PAYOUT_SATS")
+    with engine().begin() as c:
+        claimed = c.execute(
+            text(
+                """
+                UPDATE payouts
+                SET status='processing', payment_provider='nwc', attempt_count=attempt_count+1,
+                    processing_started_at=:started_at, last_error=NULL
+                WHERE id=:id AND status IN ('pending', 'failed')
+                """
+            ),
+            {"id": payout_id, "started_at": now()},
+        )
+        if claimed.rowcount != 1:
+            raise HTTPException(409, "payout could not be claimed for processing")
+    try:
+        invoice, expected_hash = asyncio.run(prepare_lnurl_payment(payout["lightning_address"], payout["amount_sats"]))
+        with engine().begin() as c:
+            stored = c.execute(
+                text(
+                    """
+                    UPDATE payouts SET bolt11_invoice=:invoice, payment_hash=:payment_hash
+                    WHERE id=:id AND status='processing' AND payment_provider='nwc'
+                    """
+                ),
+                {"id": payout_id, "invoice": invoice, "payment_hash": expected_hash},
+            )
+            if stored.rowcount != 1:
+                raise LightningPaymentError("payout lost its processing claim before payment")
+        result = asyncio.run(pay_nwc_invoice(invoice, expected_hash))
+    except LightningPaymentError as exc:
+        failed_status = "payment_unknown" if exc.payment_may_have_succeeded else "failed"
+        with engine().begin() as c:
+            c.execute(
+                text("UPDATE payouts SET status=:status, last_error=:error WHERE id=:id AND status='processing'"),
+                {"id": payout_id, "status": failed_status, "error": safe_text(str(exc), 500)},
+            )
+        raise HTTPException(502, str(exc)) from exc
+    # Payment evidence is committed before Nostr proof construction/publication.
+    with engine().begin() as c:
+        recorded = c.execute(
+            text(
+                """
+                UPDATE payouts
+                SET status='paid', payment_hash=:payment_hash, fees_paid_msats=:fees_paid_msats,
+                    paid_at=:paid_at, last_error=NULL
+                WHERE id=:id AND status='processing' AND payment_provider='nwc'
+                """
+            ),
+            {
+                "id": payout_id,
+                "payment_hash": result.payment_hash,
+                "fees_paid_msats": result.fees_paid_msats,
+                "paid_at": now(),
+            },
+        )
+        if recorded.rowcount != 1:
+            raise HTTPException(500, "payment succeeded but payout state could not be recorded; manual reconciliation required")
+    return finalize_payout_paid(
+        payout_id,
+        result.payment_hash,
+        "Lightning payout paid via Alby Hub NWC",
+        sandbox=False,
+        provider="nwc",
+        fees_paid_msats=result.fees_paid_msats,
+    )
 
 
 @app.get("/payouts/{payout_id}/receipt", response_class=HTMLResponse)

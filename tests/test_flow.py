@@ -4,6 +4,8 @@ from app.main import app
 
 def test_demo_flow_creates_conversion_and_proof(tmp_path, monkeypatch):
     monkeypatch.setenv('DATABASE_URL', f'sqlite:///{tmp_path}/test.db')
+    monkeypatch.setenv('PAYOUT_ADMIN_KEY', 'test-payout-admin-key')
+    monkeypatch.setenv('SANDBOX_PAYOUT_MARK_PAID_ENABLED', 'true')
     client = TestClient(app)
     health = client.get('/health')
     assert health.status_code == 200
@@ -71,7 +73,11 @@ def test_demo_flow_creates_conversion_and_proof(tmp_path, monkeypatch):
     payout_detail = client.get(f"/payouts/{payout_id}")
     assert payout_detail.status_code == 200
     assert payout_detail.json()['payout']['status'] == 'pending'
-    paid = client.post(f"/payouts/{payout_id}/mark-paid", json={'payment_hash': 'sandbox_payment_hash_123'})
+    paid = client.post(
+        f"/payouts/{payout_id}/mark-paid",
+        headers={'Authorization': 'Bearer test-payout-admin-key'},
+        json={'payment_hash': 'sandbox_payment_hash_123'},
+    )
     assert paid.status_code == 200, paid.text
     paid_json = paid.json()
     assert paid_json['ok'] is True
@@ -79,7 +85,11 @@ def test_demo_flow_creates_conversion_and_proof(tmp_path, monkeypatch):
     assert paid_json['nostr_event']['kind'] == 39006
     assert ['status', 'paid'] in paid_json['nostr_event']['tags']
     assert any(t[0] == 'p' and t[3] == 'affiliate' for t in paid_json['nostr_event']['tags'])
-    duplicate_paid = client.post(f"/payouts/{payout_id}/mark-paid", json={'payment_hash': 'sandbox_payment_hash_123'})
+    duplicate_paid = client.post(
+        f"/payouts/{payout_id}/mark-paid",
+        headers={'Authorization': 'Bearer test-payout-admin-key'},
+        json={'payment_hash': 'sandbox_payment_hash_123'},
+    )
     assert duplicate_paid.status_code == 200
     assert duplicate_paid.json()['duplicate'] is True
     paid_receipt = client.get(f"/payouts/{payout_id}/receipt")
