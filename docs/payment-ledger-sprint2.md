@@ -33,6 +33,10 @@ PAYABLE ──claim──> PAYING ──wallet evidence──> SETTLED ──Nos
    └── reversal ──> CANCELLED
 
 ON_HOLD ──budget top-up + explicit release──> PAYABLE
+
+PAYING + reversal ──> CANCEL_PENDING
+    ├── reconcile FAILED  ──> CANCELLED + release full reservation
+    └── reconcile SETTLED ──> PUBLISHED + cancel/release only unpaid fee
 ```
 
 An `UNKNOWN` attempt means the payment may have succeeded. The system will not create another attempt until an operator reconciles it as `SETTLED` or definitely `FAILED`.
@@ -60,7 +64,7 @@ One immutable attempt identity per payout, kind, and attempt number:
 - amount, payment hash, routing fee, error, timestamps
 - status: `PAYING`, `SETTLED`, `FAILED`, or `UNKNOWN`
 
-The admin API never returns the preimage. BOLT11 invoices remain private and are not exposed through public payout endpoints or Nostr events.
+The admin API never returns the preimage. Public payout JSON uses a strict allowlist: BOLT11 invoices, Lightning destinations, provider errors, processing timestamps, attempt counters and reserved-budget values remain private. They are not exposed through aggregate flow/campaign/affiliate endpoints or Nostr events.
 
 ### `ledger_entries`
 
@@ -70,7 +74,7 @@ Append-only balanced pairs. Every transaction has equal debit and credit totals:
 - commission settlement: `payout_reserved → affiliate_paid`
 - release/cancellation: `payout_reserved → merchant_budget_available`
 
-Every entry has a unique idempotency key, so replaying settlement or release cannot move counters twice.
+Every entry has a unique idempotency key. PostgreSQL budget rows are locked before checking that key and changing counters, so concurrent reserve, settlement or release calls cannot move counters twice.
 
 ## Operational API
 
@@ -110,6 +114,8 @@ The `SETTLED` path records durable payment evidence and publishes the existing k
 5. If the worker disappears during a provider call, the stale `PAYING` attempt appears in the recovery endpoint.
 6. `UNKNOWN` never transitions to retryable `FAILED` without explicit reconciliation.
 7. There can be only one claimed payout state at a time; atomic `UPDATE ... WHERE state IN ('PAYABLE','FAILED')` prevents concurrent execution claims.
+8. Execution also requires a complete reservation and a non-reversed conversion; legacy unpaid payouts without ledger reservations migrate to `ON_HOLD`.
+9. Reconciliation locks the attempt and payout and uses compare-and-swap status predicates, so conflicting operator outcomes cannot both commit.
 
 ## Configuration
 

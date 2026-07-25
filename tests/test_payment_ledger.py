@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi.testclient import TestClient
 
 import app.main as main
-from app.lightning import LightningPaymentResult, NwcPaymentError
+from app.lightning import LightningPaymentError, LightningPaymentResult, NwcPaymentError
 
 
 ADMIN = {"Authorization": "Bearer admin-test-key"}
@@ -38,7 +38,6 @@ def test_budget_reservation_on_hold_and_balanced_ledger(tmp_path, monkeypatch):
 
     assert payout["state"] == "PAYABLE"
     assert payout["fee_sats"] == 2_000
-    assert payout["reserved_sats"] == 22_000
 
     budget = client.get(f"/admin/campaigns/{campaign_id}/budget", headers=ADMIN)
     assert budget.status_code == 200, budget.text
@@ -59,7 +58,6 @@ def test_budget_reservation_on_hold_and_balanced_ledger(tmp_path, monkeypatch):
     overflow_flow = client.get(f"/flows/{conversion.json()['conversion_id']}").json()
     overflow_payout_id = overflow_flow["payout"]["id"]
     assert overflow_flow["payout"]["state"] == "ON_HOLD"
-    assert overflow_flow["payout"]["reserved_sats"] == 0
     assert client.get(f"/campaigns/{campaign_id}").json()["status"] == "paused"
     assert client.get(f"/admin/campaigns/{campaign_id}/budget", headers=ADMIN).json()["budget"]["committed_sats"] == 22_000
 
@@ -69,6 +67,10 @@ def test_budget_reservation_on_hold_and_balanced_ledger(tmp_path, monkeypatch):
     released = client.post(f"/admin/payouts/{overflow_payout_id}/release-hold", headers=ADMIN)
     assert released.status_code == 200, released.text
     assert released.json()["payout_state"] == "PAYABLE"
+    assert client.get(f"/admin/campaigns/{campaign_id}/budget", headers=ADMIN).json()["budget"]["committed_sats"] == 44_000
+    duplicate_release = client.post(f"/admin/payouts/{overflow_payout_id}/release-hold", headers=ADMIN)
+    assert duplicate_release.status_code == 200
+    assert duplicate_release.json()["duplicate"] is True
     assert client.get(f"/admin/campaigns/{campaign_id}/budget", headers=ADMIN).json()["budget"]["committed_sats"] == 44_000
 
 
@@ -210,10 +212,169 @@ def test_reversal_before_payment_releases_budget(tmp_path, monkeypatch):
     assert reversed_response.status_code == 200, reversed_response.text
     payout = client.get(f"/payouts/{ctx['payout_id']}").json()["payout"]
     assert payout["state"] == "CANCELLED"
-    assert payout["reserved_sats"] == 0
     after = client.get(f"/admin/campaigns/{campaign_id}/budget", headers=ADMIN).json()["budget"]
     assert after["committed_sats"] == 0
     ledger = client.get(f"/admin/payouts/{ctx['payout_id']}/ledger", headers=ADMIN).json()["entries"]
     assert sum(row["amount_sats"] for row in ledger if row["direction"] == "debit") == sum(
         row["amount_sats"] for row in ledger if row["direction"] == "credit"
     )
+
+
+def test_reversal_during_unknown_then_failed_cancels_and_blocks_retry(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    ctx = demo_context(client)
+    payout_id = ctx["payout_id"]
+    conversion_id = ctx["demo"]["conversion"]["conversion_id"]
+    campaign_id = ctx["demo"]["campaign"]["campaign_id"]
+
+    async def fake_prepare(_address: str, _amount_sats: int):
+        return "invoice", "12" * 32
+
+    async def ambiguous(_invoice: str, _expected_hash: str):
+        raise NwcPaymentError("wallet response lost")
+
+    monkeypatch.setattr(main, "prepare_lnurl_payment", fake_prepare)
+    monkeypatch.setattr(main, "pay_nwc_invoice", ambiguous)
+    assert client.post(f"/admin/payouts/{payout_id}/execute", headers=ADMIN).status_code == 502
+    attempt = client.get(f"/admin/payouts/{payout_id}/attempts", headers=ADMIN).json()["attempts"][0]
+
+    reversal = client.post(
+        f"/conversions/{conversion_id}/reverse",
+        headers=MERCHANT,
+        json={"reason": "refund", "refund_sats": 250_000},
+    )
+    assert reversal.status_code == 200, reversal.text
+    assert client.get(f"/payouts/{payout_id}").json()["payout"]["state"] == "CANCEL_PENDING"
+
+    reconciled = client.post(
+        f"/admin/payment-attempts/{attempt['id']}/reconcile",
+        headers=ADMIN,
+        json={"outcome": "FAILED", "error": "wallet confirmed unpaid"},
+    )
+    assert reconciled.status_code == 200, reconciled.text
+    assert reconciled.json()["payout_state"] == "CANCELLED"
+    assert client.get(f"/admin/campaigns/{campaign_id}/budget", headers=ADMIN).json()["budget"]["committed_sats"] == 0
+    assert client.post(f"/admin/payouts/{payout_id}/execute", headers=ADMIN).status_code == 409
+
+
+def test_reversal_during_unknown_then_settled_cancels_only_pending_fee(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    ctx = demo_context(client)
+    payout_id = ctx["payout_id"]
+    conversion_id = ctx["demo"]["conversion"]["conversion_id"]
+    campaign_id = ctx["demo"]["campaign"]["campaign_id"]
+
+    async def fake_prepare(_address: str, _amount_sats: int):
+        return "invoice", "34" * 32
+
+    async def ambiguous(_invoice: str, _expected_hash: str):
+        raise NwcPaymentError("wallet response lost")
+
+    monkeypatch.setattr(main, "prepare_lnurl_payment", fake_prepare)
+    monkeypatch.setattr(main, "pay_nwc_invoice", ambiguous)
+    assert client.post(f"/admin/payouts/{payout_id}/execute", headers=ADMIN).status_code == 502
+    attempt = client.get(f"/admin/payouts/{payout_id}/attempts", headers=ADMIN).json()["attempts"][0]
+    assert client.post(
+        f"/conversions/{conversion_id}/reverse",
+        headers=MERCHANT,
+        json={"reason": "refund", "refund_sats": 250_000},
+    ).status_code == 200
+
+    reconciled = client.post(
+        f"/admin/payment-attempts/{attempt['id']}/reconcile",
+        headers=ADMIN,
+        json={"outcome": "SETTLED", "payment_hash": "34" * 32, "routing_fee_sats": 1},
+    )
+    assert reconciled.status_code == 200, reconciled.text
+    payout = client.get(f"/payouts/{payout_id}").json()["payout"]
+    assert payout["state"] == "PUBLISHED"
+    assert payout["fee_state"] == "CANCELLED"
+    assert "reserved_sats" not in payout
+    budget = client.get(f"/admin/campaigns/{campaign_id}/budget", headers=ADMIN).json()["budget"]
+    assert budget["committed_sats"] == 0
+    assert budget["settled_sats"] == 20_000
+
+
+def test_legacy_paid_without_nostr_proof_is_backfilled_as_settled(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    payout_id = demo_context(client)["payout_id"]
+    with main.engine().begin() as connection:
+        connection.execute(main.text("""
+            UPDATE payouts SET status='paid', state='PUBLISHED', nostr_event_id=NULL, nostr_event_json=NULL
+            WHERE id=:id
+        """), {"id": payout_id})
+    main.init_db()
+    assert client.get(f"/payouts/{payout_id}").json()["payout"]["state"] == "SETTLED"
+
+
+def test_legacy_unreserved_payout_is_held_until_budget_is_reserved(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    ctx = demo_context(client)
+    payout_id = ctx["payout_id"]
+    with main.engine().begin() as connection:
+        connection.execute(main.text("DELETE FROM ledger_entries WHERE payout_id=:id"), {"id": payout_id})
+        connection.execute(main.text("DELETE FROM campaign_budgets"))
+        connection.execute(main.text("UPDATE payouts SET state='PAYABLE', status='pending', reserved_sats=0 WHERE id=:id"), {"id": payout_id})
+    main.init_db()
+    held = client.get(f"/payouts/{payout_id}").json()["payout"]
+    assert held["state"] == "ON_HOLD"
+    assert client.post(f"/admin/payouts/{payout_id}/execute", headers=ADMIN).status_code == 409
+    released = client.post(f"/admin/payouts/{payout_id}/release-hold", headers=ADMIN)
+    assert released.status_code == 200, released.text
+    assert released.json()["payout_state"] == "PAYABLE"
+
+
+def test_reversal_while_provider_call_succeeds_settles_commission_and_releases_fee(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    ctx = demo_context(client)
+    payout_id = ctx["payout_id"]
+    conversion_id = ctx["demo"]["conversion"]["conversion_id"]
+    campaign_id = ctx["demo"]["campaign"]["campaign_id"]
+
+    async def fake_prepare(_address: str, _amount_sats: int):
+        return "invoice", "56" * 32
+
+    async def pay_after_reversal(invoice: str, _expected_hash: str):
+        reversed_result = main.reverse_conversion(
+            conversion_id,
+            main.ReversalIn(reason="refund", refund_sats=250_000),
+            authorization="Bearer bumbei-demo-key",
+        )
+        assert reversed_result["ok"] is True
+        return LightningPaymentResult(payment_hash="56" * 32, fees_paid_msats=1000, invoice=invoice)
+
+    monkeypatch.setattr(main, "prepare_lnurl_payment", fake_prepare)
+    monkeypatch.setattr(main, "pay_nwc_invoice", pay_after_reversal)
+    paid = client.post(f"/admin/payouts/{payout_id}/execute", headers=ADMIN)
+    assert paid.status_code == 200, paid.text
+    payout = client.get(f"/payouts/{payout_id}").json()["payout"]
+    assert payout["state"] == "PUBLISHED"
+    assert payout["fee_state"] == "CANCELLED"
+    budget = client.get(f"/admin/campaigns/{campaign_id}/budget", headers=ADMIN).json()["budget"]
+    assert budget["committed_sats"] == 0
+    assert budget["settled_sats"] == 20_000
+
+
+def test_reversal_while_preparing_invoice_definitively_fails_releases_all_budget(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    ctx = demo_context(client)
+    payout_id = ctx["payout_id"]
+    conversion_id = ctx["demo"]["conversion"]["conversion_id"]
+    campaign_id = ctx["demo"]["campaign"]["campaign_id"]
+
+    async def reversed_before_invoice(_address: str, _amount_sats: int):
+        main.reverse_conversion(
+            conversion_id,
+            main.ReversalIn(reason="refund", refund_sats=250_000),
+            authorization="Bearer bumbei-demo-key",
+        )
+        raise LightningPaymentError("invoice preparation cancelled")
+
+    monkeypatch.setattr(main, "prepare_lnurl_payment", reversed_before_invoice)
+    failed = client.post(f"/admin/payouts/{payout_id}/execute", headers=ADMIN)
+    assert failed.status_code == 502
+    payout = client.get(f"/payouts/{payout_id}").json()["payout"]
+    assert payout["state"] == "CANCELLED"
+    budget = client.get(f"/admin/campaigns/{campaign_id}/budget", headers=ADMIN).json()["budget"]
+    assert budget["committed_sats"] == 0
+    assert budget["settled_sats"] == 0

@@ -60,8 +60,13 @@ def test_real_payout_requires_admin_and_records_nwc_result(tmp_path, monkeypatch
     assert persisted["status"] == "paid"
     assert persisted["payment_provider"] == "nwc"
     assert persisted["fees_paid_msats"] == 123
-    assert persisted["attempt_count"] == 1
-
+    attempts = client.get(
+        f"/admin/payouts/{payout_id}/attempts",
+        headers={"Authorization": "Bearer admin-test-key"},
+    ).json()["attempts"]
+    assert len(attempts) == 1
+    assert attempts[0]["status"] == "SETTLED"
+    assert "bolt11_invoice" not in persisted
     monkeypatch.setenv("SANDBOX_PAYOUT_MARK_PAID_ENABLED", "true")
     sandbox_override = client.post(
         f"/payouts/{payout_id}/mark-paid",
@@ -118,20 +123,28 @@ def test_ambiguous_nwc_failure_is_not_retried(tmp_path, monkeypatch):
     assert payout["status"] == "payment_unknown"
     assert payout["payment_hash"] == "cd" * 32
     assert "bolt11_invoice" not in payout
-    assert "manual reconciliation" in payout["last_error"]
+    assert "last_error" not in payout
+    attempts = client.get(
+        f"/admin/payouts/{payout_id}/attempts",
+        headers={"Authorization": "Bearer admin-test-key"},
+    ).json()["attempts"]
+    assert "manual reconciliation" in attempts[0]["error"]
 
     flow = client.get(f"/flows/{payout['conversion_id']}").json()
     public_urls = [
-        f"/flows/{payout['conversion_id']}",
-        f"/campaigns/{flow['campaign']['id']}/summary",
-        f"/affiliates/{flow['affiliate_pubkey']}/summary",
-        f"/payouts/{payout_id}",
+        (f"/flows/{payout['conversion_id']}", lambda body: body["payout"]),
+        (f"/campaigns/{flow['campaign']['id']}/summary", lambda body: body["payouts"][0]),
+        (f"/affiliates/{flow['affiliate_pubkey']}/summary", lambda body: body["payouts"][0]),
+        (f"/payouts/{payout_id}", lambda body: body["payout"]),
     ]
-    for url in public_urls:
+    private_fields = {"bolt11_invoice", "lightning_address", "last_error", "processing_started_at", "reserved_sats"}
+    for url, payout_selector in public_urls:
         public_response = client.get(url)
         assert public_response.status_code == 200, public_response.text
         assert "test-bolt11" not in public_response.text
-        assert "bolt11_invoice" not in public_response.text
+        assert "affiliate@getalby.com" not in public_response.text
+        public_payout = payout_selector(public_response.json())
+        assert private_fields.isdisjoint(public_payout)
 
     second = client.post(
         f"/admin/payouts/{payout_id}/execute",

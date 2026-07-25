@@ -88,9 +88,11 @@ See [`docs/nostr-schema-v2.md`](docs/nostr-schema-v2.md) for the complete tag sc
 
 ## Payment ledger and state machine
 
-New conversion obligations reserve the full affiliate commission plus a separate Meerat fee against `campaign_budgets`. Payouts follow `PAYABLE → PAYING → SETTLED → PUBLISHED`; insufficient budget produces `ON_HOLD`, while an ambiguous wallet response remains `PAYING` with an `UNKNOWN` attempt until an administrator reconciles it. It is never retried automatically.
+New conversion obligations reserve the full affiliate commission plus a separate Meerat fee against `campaign_budgets`. Payouts follow `PAYABLE → PAYING → SETTLED → PUBLISHED`; insufficient budget produces `ON_HOLD`, while an ambiguous wallet response remains `PAYING` with an `UNKNOWN` attempt until an administrator reconciles it. A reversal during that ambiguity changes the payout to `CANCEL_PENDING`: `FAILED` reconciliation cancels and releases it, while `SETTLED` records the paid commission and cancels only the unpaid Meerat fee. It is never retried automatically.
 
 Ledger movements are append-only balanced debit/credit pairs. Affiliate settlement moves only the promised commission to `settled_sats`; the separate Meerat fee remains committed with `fee_state=FEE_PENDING` for the provider-adapter sprint.
+
+Public payout responses use a strict allowlist. Wallet destinations, BOLT11 invoices, provider errors, internal processing timestamps, attempt counters and reserved-budget values are available only through authenticated operational endpoints.
 
 See [`docs/payment-ledger-sprint2.md`](docs/payment-ledger-sprint2.md) for state transitions, recovery invariants, tables, and admin operations.
 
