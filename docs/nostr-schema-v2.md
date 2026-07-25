@@ -141,13 +141,13 @@ One reversal is emitted per conversion in the current MVP; duplicate submissions
 - Existing kind 39005 conversion events and kind 39006 payout events remain historical v1 records.
 - Meerat does not attempt to delete old relay events.
 - New events created after the production v2 deployment use this schema.
-- The verified production cutover timestamp and first v2 event IDs are recorded below after deployment.
+- Production schema-v2 cutover began at the first verified v2 campaign event below.
 
 ```text
-cutover_utc: PENDING_DEPLOYMENT
-first_campaign_v2: PENDING_DEPLOYMENT
-first_enrollment_v2: PENDING_DEPLOYMENT
-first_conversion_v2: PENDING_DEPLOYMENT
-first_payout_v2: PENDING_DEPLOYMENT
-first_reversal_v2: PENDING_DEPLOYMENT
+cutover_utc: 2026-07-25T20:52:49Z
+first_campaign_v2: 8139dcbbc8929ff6601efa714ba7d9a3bc033f83efdd50fb8039f6c0eb2416fa
+first_enrollment_v2: ac74ae8f810065fc70bf027741290e9114f2765b58c954566296ee4ae56d52cf
+first_conversion_v2: 34991b76e4cd859321c30ac3d1e5d95bac7c3266e156554375199fdab36540de
+first_payout_v2: f422db5cdbef675967b949b240dca8e07daab77023b894389c4b47f32ea3d53a
+first_reversal_v2: ec157b619d988308e304af99570e1d47df72b37116efff62e7abf3558bd5eb7d
 ```
