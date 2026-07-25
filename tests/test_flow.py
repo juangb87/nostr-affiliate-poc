@@ -1,5 +1,6 @@
 from fastapi.testclient import TestClient
 from app.main import app
+from app.nostr_kinds import CAMPAIGN_KIND, CONVERSION_KIND, ENROLLMENT_KIND, PAYOUT_KIND, REVERSAL_KIND
 
 
 def test_demo_flow_creates_conversion_and_proof(tmp_path, monkeypatch):
@@ -16,19 +17,31 @@ def test_demo_flow_creates_conversion_and_proof(tmp_path, monkeypatch):
     assert data['campaign']['merchant_pubkey'].startswith('npub')
     assert len(data['campaign']['merchant_pubkey_hex']) == 64
     assert any(t[0] == 'p' and t[3] == 'merchant' for t in data['campaign']['nostr_event']['tags'])
+    assert data['campaign']['nostr_event']['kind'] == CAMPAIGN_KIND
+    assert ['v', '2'] in data['campaign']['nostr_event']['tags']
+    assert ['status', 'active'] in data['campaign']['nostr_event']['tags']
     bad_campaign = client.post('/campaigns', json={'merchant_pubkey': 'merchant_pubkey_demo', 'destination_url': 'https://example.com'})
     assert bad_campaign.status_code == 400
     assert data['enrollment']['ref_url'].endswith(data['enrollment']['ref_code'])
     assert data['enrollment']['affiliate_pubkey'].startswith('npub')
     assert len(data['enrollment']['affiliate_pubkey_hex']) == 64
     assert any(t[0] == 'p' and t[3] == 'affiliate' for t in data['enrollment']['nostr_event']['tags'])
+    assert data['enrollment']['nostr_event']['kind'] == ENROLLMENT_KIND
+    assert ['v', '2'] in data['enrollment']['nostr_event']['tags']
+    assert ['status', 'approved'] in data['enrollment']['nostr_event']['tags']
     assert data['conversion']['commission_sats'] == 20000
-    assert data['conversion']['nostr_event']['kind'] == 39005
+    assert data['conversion']['nostr_event']['kind'] == CONVERSION_KIND
     assert data['conversion']['nostr_event']['pubkey']
     assert data['conversion']['nostr_event']['sig']
     assert data['conversion']['relay_results']
     assert data['conversion']['relay_results'][0]['status'] == 'skipped'
     assert ['status', 'approved'] in data['conversion']['nostr_event']['tags']
+    assert ['v', '2'] in data['conversion']['nostr_event']['tags']
+    assert any(t[0] == 'a' and t[1].startswith(f"{CAMPAIGN_KIND}:") and t[1].endswith(data['campaign']['campaign_id']) for t in data['conversion']['nostr_event']['tags'])
+    assert any(t[0] == 'a' and t[1].startswith(f"{ENROLLMENT_KIND}:") and t[1].endswith(data['enrollment']['enrollment_id']) for t in data['conversion']['nostr_event']['tags'])
+    assert ['order_fiat_amount', '100.0'] in data['conversion']['nostr_event']['tags']
+    assert ['order_fiat_currency', 'USD'] in data['conversion']['nostr_event']['tags']
+    assert not any(t[0] in {'merchant', 'merchant_npub', 'affiliate', 'affiliate_npub', 'order_currency'} for t in data['conversion']['nostr_event']['tags'])
     proof = client.get('/proofs').json()
     assert len(proof['events']) >= 3
     detail = client.get(f"/nostr/events/{data['conversion']['nostr_event_id']}")
@@ -82,8 +95,10 @@ def test_demo_flow_creates_conversion_and_proof(tmp_path, monkeypatch):
     paid_json = paid.json()
     assert paid_json['ok'] is True
     assert paid_json['payout_status'] == 'paid'
-    assert paid_json['nostr_event']['kind'] == 39006
+    assert paid_json['nostr_event']['kind'] == PAYOUT_KIND
     assert ['status', 'paid'] in paid_json['nostr_event']['tags']
+    assert ['v', '2'] in paid_json['nostr_event']['tags']
+    assert ['e', data['conversion']['nostr_event_id']] in paid_json['nostr_event']['tags']
     assert any(t[0] == 'p' and t[3] == 'affiliate' for t in paid_json['nostr_event']['tags'])
     duplicate_paid = client.post(
         f"/payouts/{payout_id}/mark-paid",
@@ -98,6 +113,23 @@ def test_demo_flow_creates_conversion_and_proof(tmp_path, monkeypatch):
     flow_after_payout = client.get(f"/flows/{data['conversion']['conversion_id']}").json()
     assert flow_after_payout['payout']['status'] == 'paid'
     assert len(flow_after_payout['events']) >= 4
+    reversal = client.post(
+        f"/conversions/{data['conversion']['conversion_id']}/reverse",
+        json={'reason': 'refund', 'refund_sats': 250000, 'note': 'test refund'},
+    )
+    assert reversal.status_code == 200, reversal.text
+    reversal_json = reversal.json()
+    assert reversal_json['nostr_event']['kind'] == REVERSAL_KIND
+    assert ['v', '2'] in reversal_json['nostr_event']['tags']
+    assert ['e', data['conversion']['nostr_event_id']] in reversal_json['nostr_event']['tags']
+    assert ['reason', 'refund'] in reversal_json['nostr_event']['tags']
+    assert ['refund_sats', '250000'] in reversal_json['nostr_event']['tags']
+    duplicate_reversal = client.post(
+        f"/conversions/{data['conversion']['conversion_id']}/reverse",
+        json={'reason': 'refund', 'refund_sats': 250000},
+    )
+    assert duplicate_reversal.status_code == 200
+    assert duplicate_reversal.json()['duplicate'] is True
     receipt_page = client.get(f"/flows/{data['conversion']['conversion_id']}/receipt")
     assert receipt_page.status_code == 200
     assert 'Flow receipt' in receipt_page.text
@@ -161,3 +193,18 @@ def test_demo_flow_creates_conversion_and_proof(tmp_path, monkeypatch):
     assert demo_checkout.json()['ok'] is True
     assert demo_checkout.json()['order_total_sats'] == 250000
     assert demo_checkout.json()['receipt_url'].endswith(f"/flows/{demo_checkout.json()['conversion_id']}/receipt")
+
+    terminated = client.post(f"/enrollments/{data['enrollment']['enrollment_id']}/status", json={'status': 'terminated'})
+    assert terminated.status_code == 200, terminated.text
+    assert terminated.json()['nostr_event']['kind'] == ENROLLMENT_KIND
+    assert ['status', 'terminated'] in terminated.json()['nostr_event']['tags']
+    assert ['d', data['enrollment']['enrollment_id']] in terminated.json()['nostr_event']['tags']
+    reapproved = client.post(f"/enrollments/{data['enrollment']['enrollment_id']}/status", json={'status': 'approved'})
+    assert reapproved.status_code == 200
+    paused = client.post(f"/campaigns/{data['campaign']['campaign_id']}/status", json={'status': 'paused'})
+    assert paused.status_code == 200, paused.text
+    assert paused.json()['nostr_event']['kind'] == CAMPAIGN_KIND
+    assert ['status', 'paused'] in paused.json()['nostr_event']['tags']
+    assert ['d', data['campaign']['campaign_id']] in paused.json()['nostr_event']['tags']
+    reactivate = client.post(f"/campaigns/{data['campaign']['campaign_id']}/status", json={'status': 'active'})
+    assert reactivate.status_code == 200

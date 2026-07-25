@@ -11,7 +11,7 @@ Minimal proof-of-concept for a Nostr-powered affiliate network:
 - Last-click attribution using `click_id`
 - Conversion proof events with hashed click/order IDs
 - Relay publication status stored in Postgres
-- Pending Lightning payout rows for future settlement
+- Lightning payout settlement proofs and reversal proofs
 
 Events are now real Nostr events signed with Schnorr keys via `nostr-sdk`. If `NOSTR_PUBLISH=true`, the app publishes campaign, enrollment, and conversion proof events to configured public relays.
 
@@ -44,21 +44,38 @@ python scripts/e2e.py
 - `POST /clicks/simulate`
 - `POST /merchant/conversions` — merchant webhook with `Authorization: Bearer <merchant_api_key>`
 - `POST /campaigns`
+- `POST /campaigns/{campaign_id}/status` — republishes the addressable campaign event
 - `GET /campaigns/{campaign_id}`
 - `GET /campaigns/{campaign_id}/summary`
 - `GET /campaigns/{campaign_id}/page`
 - `POST /enrollments`
+- `POST /enrollments/{enrollment_id}/status` — republishes the addressable enrollment event
 - `GET /r/{ref_code}`
 - `POST /conversions`
+- `POST /conversions/{conversion_id}/reverse` — immutable refund/fraud/chargeback proof
 - `GET /proofs`
 - `GET /affiliates/{npub_or_hex}`
 - `GET /affiliates/{npub_or_hex}/summary`
 - `GET /affiliates/{npub_or_hex}/profile`
 - `GET /payouts/{payout_id}`
-- `POST /payouts/{payout_id}/mark-paid` — sandbox Lightning payout settlement + kind `39006` proof
+- `POST /payouts/{payout_id}/mark-paid` — sandbox Lightning payout settlement + kind `2802` proof
 - `GET /payouts/{payout_id}/receipt`
 - `GET /nostr/events/{event_id}`
 - `POST /demo`
+
+## Nostr event schema v2
+
+New events use a unified `v=2` schema:
+
+- `39001` campaign — addressable, stable `d=campaign_id`, status can be republished.
+- `39002` enrollment — addressable, stable `d=enrollment_id`, status can be republished.
+- `2801` conversion — immutable fact.
+- `2802` payout — immutable fact referencing the conversion Nostr event with `e`.
+- `2803` reversal — immutable fact referencing the conversion Nostr event with `e`.
+
+Conversion events reference the campaign and enrollment with NIP-01 `a` coordinates. `p` tags always use 64-character hex pubkeys with the role in the fourth element. Fiat fields are separated from `order_total_sats`; raw click/order IDs and customer data remain private.
+
+See [`docs/nostr-schema-v2.md`](docs/nostr-schema-v2.md) for the complete tag schema and cutover policy.
 
 ## Railway
 
@@ -143,4 +160,4 @@ The endpoint verifies `X-Shopify-Hmac-Sha256` against the unmodified request bod
 
 ## Privacy note
 
-Clicks and order IDs are not published raw. Conversion proof events include only hashes such as `click_hash` and `conversion_hash`.
+Clicks and order IDs are not published raw. Conversion proof events include only hashes such as `click_hash` and `order_hash`.

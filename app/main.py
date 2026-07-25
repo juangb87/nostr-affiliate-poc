@@ -12,6 +12,17 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from app.nostr_kinds import (
+    CAMPAIGN_KIND,
+    CAMPAIGN_STATUSES,
+    CONVERSION_KIND,
+    ENROLLMENT_KIND,
+    ENROLLMENT_STATUSES,
+    PAYOUT_KIND,
+    REVERSAL_KIND,
+    REVERSAL_REASONS,
+    SCHEMA_VERSION,
+)
 from fastapi import BackgroundTasks, Cookie, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
@@ -33,7 +44,7 @@ DEFAULT_AFFILIATE_NPUB = "npub16ghkhw9d4g9x6pxp6l6dtyjqaeuavwucrq8gpkt60x0kx9fzq
 app = FastAPI(
     title="Nostr Affiliate POC",
     description="MVP: campaign → enrollment → redirect click → conversion → real Nostr proof → pending Lightning payout.",
-    version="0.6.1",
+    version="0.7.0",
 )
 
 
@@ -207,6 +218,62 @@ def build_nostr_event(kind: int, tags: list[list[str]], content: str = "") -> di
     return data
 
 
+def address_coordinate(kind: int, entity_id: str) -> str:
+    return f"{kind}:{nostr_keys().public_key().to_hex()}:{entity_id}"
+
+
+def fiat_order_tags(order_total: float, currency: str) -> list[list[str]]:
+    normalized = currency.upper().strip()
+    if normalized in {"USD", "USDC"}:
+        return [["order_fiat_amount", str(order_total)], ["order_fiat_currency", normalized]]
+    return []
+
+
+def build_campaign_event(campaign: dict[str, Any], terms_url: Optional[str] = None) -> dict[str, Any]:
+    merchant_hex = campaign.get("merchant_pubkey_hex") or normalize_pubkey(campaign["merchant_pubkey"], "merchant_pubkey")["hex"]
+    content = {"name": campaign["name"]}
+    if terms_url:
+        content["terms_url"] = terms_url
+    return build_nostr_event(
+        CAMPAIGN_KIND,
+        [
+            ["v", SCHEMA_VERSION],
+            ["d", campaign["id"]],
+            ["type", "affiliate_campaign"],
+            ["p", merchant_hex, "", "merchant"],
+            ["campaign", campaign["id"]],
+            ["status", campaign.get("status") or "active"],
+            ["state_revision", str(time.time_ns())],
+            ["commission_bps", str(campaign["commission_bps"])],
+            ["window_days", str(campaign["window_days"])],
+            ["payout", "sats"],
+            ["terms", campaign["terms_hash"]],
+            ["destination", campaign["destination_url"]],
+        ],
+        json.dumps(content),
+    )
+
+
+def build_enrollment_event(enrollment: dict[str, Any], campaign: dict[str, Any]) -> dict[str, Any]:
+    merchant_hex = campaign.get("merchant_pubkey_hex") or normalize_pubkey(campaign["merchant_pubkey"], "merchant_pubkey")["hex"]
+    affiliate_hex = enrollment.get("affiliate_pubkey_hex") or normalize_pubkey(enrollment["affiliate_pubkey"], "affiliate_pubkey")["hex"]
+    return build_nostr_event(
+        ENROLLMENT_KIND,
+        [
+            ["v", SCHEMA_VERSION],
+            ["d", enrollment["id"]],
+            ["type", "affiliate_enrollment"],
+            ["p", merchant_hex, "", "merchant"],
+            ["p", affiliate_hex, "", "affiliate"],
+            ["campaign", enrollment["campaign_id"]],
+            ["status", enrollment.get("status") or "approved"],
+            ["state_revision", str(time.time_ns())],
+            ["terms", campaign["terms_hash"]],
+        ],
+        "",
+    )
+
+
 async def _publish_event(event_json: dict[str, Any], relays: list[str]) -> list[dict[str, str]]:
     from nostr_sdk import Event
 
@@ -306,6 +373,7 @@ def init_db() -> None:
         window_days INTEGER NOT NULL,
         destination_url TEXT NOT NULL,
         terms_hash TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active',
         nostr_event_id TEXT NOT NULL,
         nostr_event_json TEXT NOT NULL,
         created_at TEXT NOT NULL
@@ -317,6 +385,7 @@ def init_db() -> None:
         affiliate_pubkey_hex TEXT,
         lightning_address TEXT,
         ref_code TEXT UNIQUE NOT NULL,
+        status TEXT NOT NULL DEFAULT 'approved',
         nostr_event_id TEXT NOT NULL,
         nostr_event_json TEXT NOT NULL,
         created_at TEXT NOT NULL
@@ -407,6 +476,15 @@ def init_db() -> None:
         nostr_event_json TEXT,
         created_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS reversals (
+        id TEXT PRIMARY KEY,
+        conversion_id TEXT UNIQUE NOT NULL,
+        reason TEXT NOT NULL,
+        refund_sats INTEGER,
+        nostr_event_id TEXT NOT NULL,
+        nostr_event_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS nostr_events (
         event_id TEXT PRIMARY KEY,
         kind INTEGER NOT NULL,
@@ -444,6 +522,8 @@ def init_db() -> None:
             c.execute(text("ALTER TABLE payouts ADD COLUMN IF NOT EXISTS last_error TEXT"))
             c.execute(text("ALTER TABLE payouts ADD COLUMN IF NOT EXISTS processing_started_at TEXT"))
             c.execute(text("ALTER TABLE payouts ADD COLUMN IF NOT EXISTS paid_at TEXT"))
+            c.execute(text("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'"))
+            c.execute(text("ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'approved'"))
         else:
             campaign_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(campaigns)")).fetchall()}
             enrollment_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(enrollments)")).fetchall()}
@@ -464,6 +544,10 @@ def init_db() -> None:
             for column, column_type in payout_column_ddl.items():
                 if column not in payout_cols:
                     c.execute(text(f"ALTER TABLE payouts ADD COLUMN {column} {column_type}"))
+            if "status" not in campaign_cols:
+                c.execute(text("ALTER TABLE campaigns ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"))
+            if "status" not in enrollment_cols:
+                c.execute(text("ALTER TABLE enrollments ADD COLUMN status TEXT NOT NULL DEFAULT 'approved'"))
 
 
 @app.on_event("startup")
@@ -558,6 +642,20 @@ class PayoutMarkPaidIn(BaseModel):
     note: Optional[str] = "sandbox payout paid"
 
 
+class CampaignStatusIn(BaseModel):
+    status: str
+
+
+class EnrollmentStatusIn(BaseModel):
+    status: str
+
+
+class ReversalIn(BaseModel):
+    reason: str
+    refund_sats: Optional[int] = Field(None, ge=0)
+    note: Optional[str] = None
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     init_db()
@@ -569,6 +667,14 @@ def health() -> dict[str, Any]:
         "nostr_publish": nostr_publish_enabled(),
         "relays": nostr_relays(),
         "sats_per_usd": DEFAULT_SATS_PER_USD,
+        "nostr_schema_version": SCHEMA_VERSION,
+        "nostr_kinds": {
+            "campaign": CAMPAIGN_KIND,
+            "enrollment": ENROLLMENT_KIND,
+            "conversion": CONVERSION_KIND,
+            "payout": PAYOUT_KIND,
+            "reversal": REVERSAL_KIND,
+        },
     }
 
 
@@ -578,22 +684,18 @@ def create_campaign(body: CampaignIn) -> dict[str, Any]:
     campaign_id = hid("camp")
     merchant = normalize_pubkey(body.merchant_pubkey, "merchant_pubkey")
     terms_hash = sha(body.terms_url)
-    event = build_nostr_event(
-        39001,
-        [
-            ["d", campaign_id],
-            ["type", "affiliate_campaign"],
-            ["p", merchant["hex"], "", "merchant"],
-            ["merchant", merchant["hex"]],
-            ["merchant_npub", merchant["npub"]],
-            ["commission_bps", str(body.commission_bps)],
-            ["window_days", str(body.attribution_window_days)],
-            ["payout", "sats"],
-            ["terms", terms_hash],
-            ["destination", body.destination_url],
-        ],
-        json.dumps({"name": body.name, "terms_url": body.terms_url}),
-    )
+    campaign_row = {
+        "id": campaign_id,
+        "merchant_pubkey": merchant["npub"],
+        "merchant_pubkey_hex": merchant["hex"],
+        "name": body.name,
+        "commission_bps": body.commission_bps,
+        "window_days": body.attribution_window_days,
+        "destination_url": body.destination_url,
+        "terms_hash": terms_hash,
+        "status": "active",
+    }
+    event = build_campaign_event(campaign_row, body.terms_url)
     relay_results = publish_event(event)
     with engine().begin() as c:
         persist_nostr_event(c, event, "campaign", campaign_id, relay_results)
@@ -601,9 +703,9 @@ def create_campaign(body: CampaignIn) -> dict[str, Any]:
             text(
                 """
                 INSERT INTO campaigns (id, merchant_pubkey, merchant_pubkey_hex, name, commission_bps, window_days,
-                destination_url, terms_hash, nostr_event_id, nostr_event_json, created_at)
+                destination_url, terms_hash, status, nostr_event_id, nostr_event_json, created_at)
                 VALUES (:id, :merchant_pubkey, :merchant_pubkey_hex, :name, :commission_bps, :window_days,
-                :destination_url, :terms_hash, :nostr_event_id, :nostr_event_json, :created_at)
+                :destination_url, :terms_hash, :status, :nostr_event_id, :nostr_event_json, :created_at)
                 """
             ),
             {
@@ -615,6 +717,7 @@ def create_campaign(body: CampaignIn) -> dict[str, Any]:
                 "window_days": body.attribution_window_days,
                 "destination_url": body.destination_url,
                 "terms_hash": terms_hash,
+                "status": "active",
                 "nostr_event_id": event["id"],
                 "nostr_event_json": json.dumps(event),
                 "created_at": now(),
@@ -633,6 +736,26 @@ def get_campaign(campaign_id: str) -> dict[str, Any]:
     return campaign
 
 
+@app.post("/campaigns/{campaign_id}/status")
+def update_campaign_status(campaign_id: str, body: CampaignStatusIn) -> dict[str, Any]:
+    init_db()
+    status = body.status.strip().lower()
+    if status not in CAMPAIGN_STATUSES:
+        raise HTTPException(400, f"invalid campaign status; use {', '.join(sorted(CAMPAIGN_STATUSES))}")
+    with engine().begin() as c:
+        campaign = asdict(c.execute(text("SELECT * FROM campaigns WHERE id=:id"), {"id": campaign_id}).fetchone())
+        if not campaign:
+            raise HTTPException(404, "campaign not found")
+        if campaign.get("status") == status:
+            return {"ok": True, "duplicate": True, "campaign_id": campaign_id, "status": status, "nostr_event_id": campaign["nostr_event_id"], "nostr_event": json.loads(campaign["nostr_event_json"])}
+        campaign["status"] = status
+        event = build_campaign_event(campaign)
+        relay_results = publish_event(event)
+        persist_nostr_event(c, event, "campaign", campaign_id, relay_results)
+        c.execute(text("UPDATE campaigns SET status=:status, nostr_event_id=:event_id, nostr_event_json=:event_json WHERE id=:id"), {"id": campaign_id, "status": status, "event_id": event["id"], "event_json": json.dumps(event)})
+    return {"ok": True, "duplicate": False, "campaign_id": campaign_id, "status": status, "nostr_event_id": event["id"], "nostr_event": event, "relay_results": relay_results}
+
+
 @app.post("/enrollments")
 def create_enrollment(body: EnrollmentIn) -> dict[str, Any]:
     init_db()
@@ -643,23 +766,14 @@ def create_enrollment(body: EnrollmentIn) -> dict[str, Any]:
     enrollment_id = hid("enr")
     ref_code = hid("ref")
     affiliate = normalize_pubkey(body.affiliate_pubkey, "affiliate_pubkey")
-    merchant_hex = camp.get("merchant_pubkey_hex") or normalize_pubkey(camp["merchant_pubkey"], "merchant_pubkey")["hex"]
-    event = build_nostr_event(
-        39002,
-        [
-            ["d", enrollment_id],
-            ["type", "affiliate_enrollment"],
-            ["campaign", body.campaign_id],
-            ["p", merchant_hex, "", "merchant"],
-            ["p", affiliate["hex"], "", "affiliate"],
-            ["merchant", merchant_hex],
-            ["merchant_npub", camp["merchant_pubkey"]],
-            ["affiliate", affiliate["hex"]],
-            ["affiliate_npub", affiliate["npub"]],
-            ["terms", camp["terms_hash"]],
-        ],
-        "",
-    )
+    enrollment_row = {
+        "id": enrollment_id,
+        "campaign_id": body.campaign_id,
+        "affiliate_pubkey": affiliate["npub"],
+        "affiliate_pubkey_hex": affiliate["hex"],
+        "status": "approved",
+    }
+    event = build_enrollment_event(enrollment_row, camp)
     relay_results = publish_event(event)
     with engine().begin() as c:
         persist_nostr_event(c, event, "enrollment", enrollment_id, relay_results)
@@ -667,9 +781,9 @@ def create_enrollment(body: EnrollmentIn) -> dict[str, Any]:
             text(
                 """
                 INSERT INTO enrollments (id, campaign_id, affiliate_pubkey, affiliate_pubkey_hex, lightning_address,
-                ref_code, nostr_event_id, nostr_event_json, created_at)
+                ref_code, status, nostr_event_id, nostr_event_json, created_at)
                 VALUES (:id, :campaign_id, :affiliate_pubkey, :affiliate_pubkey_hex, :lightning_address,
-                :ref_code, :nostr_event_id, :nostr_event_json, :created_at)
+                :ref_code, :status, :nostr_event_id, :nostr_event_json, :created_at)
                 """
             ),
             {
@@ -679,12 +793,34 @@ def create_enrollment(body: EnrollmentIn) -> dict[str, Any]:
                 "affiliate_pubkey_hex": affiliate["hex"],
                 "lightning_address": body.lightning_address,
                 "ref_code": ref_code,
+                "status": "approved",
                 "nostr_event_id": event["id"],
                 "nostr_event_json": json.dumps(event),
                 "created_at": now(),
             },
         )
     return {"enrollment_id": enrollment_id, "affiliate_pubkey": affiliate["npub"], "affiliate_pubkey_hex": affiliate["hex"], "ref_code": ref_code, "ref_url": f"{BASE_URL}/r/{ref_code}", "nostr_event_id": event["id"], "nostr_event": event, "relay_results": relay_results}
+
+
+@app.post("/enrollments/{enrollment_id}/status")
+def update_enrollment_status(enrollment_id: str, body: EnrollmentStatusIn) -> dict[str, Any]:
+    init_db()
+    status = body.status.strip().lower()
+    if status not in ENROLLMENT_STATUSES:
+        raise HTTPException(400, f"invalid enrollment status; use {', '.join(sorted(ENROLLMENT_STATUSES))}")
+    with engine().begin() as c:
+        enrollment = asdict(c.execute(text("SELECT * FROM enrollments WHERE id=:id"), {"id": enrollment_id}).fetchone())
+        if not enrollment:
+            raise HTTPException(404, "enrollment not found")
+        if enrollment.get("status") == status:
+            return {"ok": True, "duplicate": True, "enrollment_id": enrollment_id, "status": status, "nostr_event_id": enrollment["nostr_event_id"], "nostr_event": json.loads(enrollment["nostr_event_json"])}
+        campaign = asdict(c.execute(text("SELECT * FROM campaigns WHERE id=:id"), {"id": enrollment["campaign_id"]}).fetchone())
+        enrollment["status"] = status
+        event = build_enrollment_event(enrollment, campaign)
+        relay_results = publish_event(event)
+        persist_nostr_event(c, event, "enrollment", enrollment_id, relay_results)
+        c.execute(text("UPDATE enrollments SET status=:status, nostr_event_id=:event_id, nostr_event_json=:event_json WHERE id=:id"), {"id": enrollment_id, "status": status, "event_id": event["id"], "event_json": json.dumps(event)})
+    return {"ok": True, "duplicate": False, "enrollment_id": enrollment_id, "status": status, "nostr_event_id": event["id"], "nostr_event": event, "relay_results": relay_results}
 
 
 @app.get("/r/{ref_code}")
@@ -695,6 +831,10 @@ def redirect_click(ref_code: str, request: Request) -> RedirectResponse:
         if not enr:
             raise HTTPException(404, "ref code not found")
         camp = asdict(c.execute(text("SELECT * FROM campaigns WHERE id=:id"), {"id": enr["campaign_id"]}).fetchone())
+        if enr.get("status") != "approved":
+            raise HTTPException(409, "enrollment is not approved")
+        if not camp or camp.get("status") != "active":
+            raise HTTPException(409, "campaign is not active")
         click_id = hid("clk")
         ip = request.client.host if request.client else "unknown"
         ua = request.headers.get("user-agent", "")
@@ -734,29 +874,31 @@ def create_conversion(body: ConversionIn, bb_click_id: Optional[str] = Cookie(No
             raise HTTPException(404, "click not found")
         camp = asdict(c.execute(text("SELECT * FROM campaigns WHERE id=:id"), {"id": click["campaign_id"]}).fetchone())
         enr = asdict(c.execute(text("SELECT * FROM enrollments WHERE ref_code=:ref"), {"ref": click["ref_code"]}).fetchone())
+        if not camp or camp.get("status") != "active":
+            raise HTTPException(409, "campaign is not active")
+        if not enr or enr.get("status") != "approved":
+            raise HTTPException(409, "enrollment is not approved")
         total_sats = order_total_sats(body.order_total, body.currency, body.sats_per_usd)
-        commission_sats = round(total_sats * int(camp["commission_bps"]) / 10000)
+        commission_sats = int(total_sats * int(camp["commission_bps"]) / 10000)
         conversion_id = hid("conv")
-        event = build_nostr_event(
-            39005,
-            [
-                ["type", "affiliate_conversion"],
-                ["campaign", click["campaign_id"]],
-                ["p", (camp.get("merchant_pubkey_hex") or normalize_pubkey(camp["merchant_pubkey"], "merchant_pubkey")["hex"]), "", "merchant"],
-                ["p", (enr.get("affiliate_pubkey_hex") if enr else None) or normalize_pubkey(click["affiliate_pubkey"], "affiliate_pubkey")["hex"], "", "affiliate"],
-                ["merchant", (camp.get("merchant_pubkey_hex") or normalize_pubkey(camp["merchant_pubkey"], "merchant_pubkey")["hex"])],
-                ["merchant_npub", camp["merchant_pubkey"]],
-                ["affiliate", ((enr.get("affiliate_pubkey_hex") if enr else None) or normalize_pubkey(click["affiliate_pubkey"], "affiliate_pubkey")["hex"])],
-                ["affiliate_npub", click["affiliate_pubkey"]],
-                ["click_hash", sha(click_id)],
-                ["conversion_hash", sha(body.order_id)],
-                ["order_total_sats", str(total_sats)],
-                ["order_currency", body.currency.upper()],
-                ["commission_sats", str(commission_sats)],
-                ["status", "approved"],
-            ],
-            "",
-        )
+        merchant_hex = camp.get("merchant_pubkey_hex") or normalize_pubkey(camp["merchant_pubkey"], "merchant_pubkey")["hex"]
+        affiliate_hex = (enr.get("affiliate_pubkey_hex") if enr else None) or normalize_pubkey(click["affiliate_pubkey"], "affiliate_pubkey")["hex"]
+        conversion_tags = [
+            ["v", SCHEMA_VERSION],
+            ["type", "affiliate_conversion"],
+            ["p", merchant_hex, "", "merchant"],
+            ["p", affiliate_hex, "", "affiliate"],
+            ["campaign", click["campaign_id"]],
+            ["a", address_coordinate(CAMPAIGN_KIND, click["campaign_id"])],
+            ["a", address_coordinate(ENROLLMENT_KIND, enr["id"])],
+            ["click_hash", sha(click_id)],
+            ["order_hash", sha(body.order_id)],
+            ["order_total_sats", str(total_sats)],
+            ["commission_sats", str(commission_sats)],
+            ["commission_bps", str(camp["commission_bps"])],
+            ["status", "approved"],
+        ] + fiat_order_tags(body.order_total, body.currency)
+        event = build_nostr_event(CONVERSION_KIND, conversion_tags, "")
         relay_results = publish_event(event)
         persist_nostr_event(c, event, "conversion", conversion_id, relay_results)
         c.execute(
@@ -809,6 +951,70 @@ def create_conversion(body: ConversionIn, bb_click_id: Optional[str] = Cookie(No
     return {"conversion_id": conversion_id, "affiliate_pubkey": click["affiliate_pubkey"], "commission_sats": commission_sats, "status": "approved", "payout_status": "pending", "nostr_event_id": event["id"], "nostr_event": event, "relay_results": relay_results}
 
 
+@app.post("/conversions/{conversion_id}/reverse")
+def reverse_conversion(conversion_id: str, body: ReversalIn) -> dict[str, Any]:
+    init_db()
+    reason = body.reason.strip().lower()
+    if reason not in REVERSAL_REASONS:
+        raise HTTPException(400, f"invalid reversal reason; use {', '.join(sorted(REVERSAL_REASONS))}")
+    with engine().begin() as c:
+        existing = asdict(c.execute(text("SELECT * FROM reversals WHERE conversion_id=:id"), {"id": conversion_id}).fetchone())
+        if existing:
+            return {
+                "ok": True,
+                "duplicate": True,
+                "reversal_id": existing["id"],
+                "conversion_id": conversion_id,
+                "nostr_event_id": existing["nostr_event_id"],
+                "nostr_event": json.loads(existing["nostr_event_json"]),
+            }
+        conversion = asdict(c.execute(text("SELECT * FROM conversions WHERE id=:id"), {"id": conversion_id}).fetchone())
+        if not conversion:
+            raise HTTPException(404, "conversion not found")
+        campaign = asdict(c.execute(text("SELECT * FROM campaigns WHERE id=:id"), {"id": conversion["campaign_id"]}).fetchone())
+        click = asdict(c.execute(text("SELECT * FROM clicks WHERE id=:id"), {"id": conversion["click_id"]}).fetchone())
+        enrollment = asdict(c.execute(text("SELECT * FROM enrollments WHERE ref_code=:ref"), {"ref": click["ref_code"] if click else None}).fetchone()) if click else None
+        if not campaign or not enrollment:
+            raise HTTPException(400, "conversion is missing campaign/enrollment context")
+        merchant_hex = campaign.get("merchant_pubkey_hex") or normalize_pubkey(campaign["merchant_pubkey"], "merchant_pubkey")["hex"]
+        affiliate_hex = enrollment.get("affiliate_pubkey_hex") or normalize_pubkey(conversion["affiliate_pubkey"], "affiliate_pubkey")["hex"]
+        tags = [
+            ["v", SCHEMA_VERSION],
+            ["type", "affiliate_reversal"],
+            ["e", conversion["nostr_event_id"]],
+            ["p", merchant_hex, "", "merchant"],
+            ["p", affiliate_hex, "", "affiliate"],
+            ["campaign", conversion["campaign_id"]],
+            ["reason", reason],
+            ["reversed_at", str(int(time.time()))],
+        ]
+        if body.refund_sats is not None:
+            tags.append(["refund_sats", str(body.refund_sats)])
+        reversal_id = hid("rev")
+        event = build_nostr_event(REVERSAL_KIND, tags, "")
+        relay_results = publish_event(event)
+        persist_nostr_event(c, event, "reversal", reversal_id, relay_results)
+        c.execute(
+            text("""
+                INSERT INTO reversals (id, conversion_id, reason, refund_sats, nostr_event_id, nostr_event_json, created_at)
+                VALUES (:id, :conversion_id, :reason, :refund_sats, :nostr_event_id, :nostr_event_json, :created_at)
+            """),
+            {"id": reversal_id, "conversion_id": conversion_id, "reason": reason, "refund_sats": body.refund_sats, "nostr_event_id": event["id"], "nostr_event_json": json.dumps(event), "created_at": now()},
+        )
+        c.execute(text("UPDATE conversions SET status='reversed' WHERE id=:id"), {"id": conversion_id})
+    return {
+        "ok": True,
+        "duplicate": False,
+        "reversal_id": reversal_id,
+        "conversion_id": conversion_id,
+        "reason": reason,
+        "refund_sats": body.refund_sats,
+        "nostr_event_id": event["id"],
+        "nostr_event": event,
+        "relay_results": relay_results,
+    }
+
+
 @app.post("/clicks/simulate")
 def simulate_click(body: SimulateClickIn) -> dict[str, Any]:
     """Dashboard helper: create a click without following a browser redirect."""
@@ -818,6 +1024,10 @@ def simulate_click(body: SimulateClickIn) -> dict[str, Any]:
         if not enr:
             raise HTTPException(404, "ref code not found")
         camp = asdict(c.execute(text("SELECT * FROM campaigns WHERE id=:id"), {"id": enr["campaign_id"]}).fetchone())
+        if enr.get("status") != "approved":
+            raise HTTPException(409, "enrollment is not approved")
+        if not camp or camp.get("status") != "active":
+            raise HTTPException(409, "campaign is not active")
         click_id = hid("clk")
         c.execute(
             text(
@@ -1407,7 +1617,8 @@ def affiliate_public_data(affiliate_pubkey: str) -> dict[str, Any]:
             {"npub": identity["npub"], "hex": identity["hex"]},
         ).fetchall()]
         payouts = [dict(r._mapping) for r in c.execute(text("SELECT * FROM payouts WHERE affiliate_pubkey=:npub OR affiliate_pubkey=:hex ORDER BY created_at DESC"), {"npub": identity["npub"], "hex": identity["hex"]}).fetchall()]
-        entity_ids = [e["id"] for e in enrollments] + [v["id"] for v in conversions] + [p["id"] for p in payouts]
+        reversals = [dict(r._mapping) for r in c.execute(text("SELECT r.* FROM reversals r JOIN conversions v ON r.conversion_id=v.id WHERE v.affiliate_pubkey=:npub OR v.affiliate_pubkey=:hex ORDER BY r.created_at DESC"), {"npub": identity["npub"], "hex": identity["hex"]}).fetchall()]
+        entity_ids = [e["id"] for e in enrollments] + [v["id"] for v in conversions] + [p["id"] for p in payouts] + [r["id"] for r in reversals]
         events: list[dict[str, Any]] = []
         relays_by_event: dict[str, list[dict[str, Any]]] = {}
         for entity_id in entity_ids:
@@ -1424,6 +1635,7 @@ def affiliate_public_data(affiliate_pubkey: str) -> dict[str, Any]:
         "enrollments": len(enrollments),
         "clicks": len(clicks),
         "conversions": len(conversions),
+        "reversals": len(reversals),
         "commission_sats": sum(int(v["commission_sats"]) for v in conversions),
         "pending_sats": sum(int(p["amount_sats"]) for p in payouts if p["status"] == "pending"),
         "published_events": sum(1 for ev in events if ev["relay_status"] == "published"),
@@ -1442,6 +1654,7 @@ def affiliate_public_data(affiliate_pubkey: str) -> dict[str, Any]:
         "clicks": clicks,
         "conversions": conversions,
         "payouts": payouts,
+        "reversals": reversals,
         "events": events,
         "links": {
             "profile": f"{BASE_URL}/affiliates/{identity['npub']}/profile",
@@ -1581,27 +1794,24 @@ def finalize_payout_paid(
             raise HTTPException(400, "payout is missing conversion/campaign context")
         affiliate_identity = normalize_pubkey(payout["affiliate_pubkey"], "affiliate_pubkey")
         merchant_hex = campaign.get("merchant_pubkey_hex") or normalize_pubkey(campaign["merchant_pubkey"], "merchant_pubkey")["hex"]
+        settled_at = str(int(time.time()))
         event = build_nostr_event(
-            39006,
+            PAYOUT_KIND,
             [
-                ["d", payout_id],
+                ["v", SCHEMA_VERSION],
                 ["type", "affiliate_payout"],
-                ["status", "paid"],
-                ["payout", payout_id],
-                ["conversion", payout["conversion_id"]],
-                ["campaign", conversion["campaign_id"]],
+                ["e", conversion["nostr_event_id"]],
                 ["p", merchant_hex, "", "merchant"],
                 ["p", affiliate_identity["hex"], "", "affiliate"],
-                ["merchant", merchant_hex],
-                ["merchant_npub", campaign["merchant_pubkey"]],
-                ["affiliate", affiliate_identity["hex"]],
-                ["affiliate_npub", affiliate_identity["npub"]],
+                ["campaign", conversion["campaign_id"]],
+                ["status", "paid"],
                 ["amount_sats", str(payout["amount_sats"])],
                 ["payment_hash", payment_hash],
+                ["settled_at", settled_at],
                 ["payment_provider", provider],
                 ["sandbox", "true" if sandbox else "false"],
             ],
-            json.dumps({"note": note, "lightning_address": payout.get("lightning_address"), "sandbox": sandbox}),
+            json.dumps({"sandbox": sandbox}),
         )
         relay_results = publish_event(event)
         persist_nostr_event(c, event, "payout", payout_id, relay_results)
@@ -1848,7 +2058,8 @@ def campaign_public_data(campaign_id: str) -> dict[str, Any]:
         clicks = [dict(r._mapping) for r in c.execute(text("SELECT * FROM clicks WHERE campaign_id=:id ORDER BY created_at DESC"), {"id": campaign_id}).fetchall()]
         conversions = [dict(r._mapping) for r in c.execute(text("SELECT * FROM conversions WHERE campaign_id=:id ORDER BY created_at DESC"), {"id": campaign_id}).fetchall()]
         payouts = [dict(r._mapping) for r in c.execute(text("SELECT p.* FROM payouts p JOIN conversions v ON p.conversion_id=v.id WHERE v.campaign_id=:id ORDER BY p.created_at DESC"), {"id": campaign_id}).fetchall()]
-        entity_ids = [campaign_id] + [e["id"] for e in enrollments] + [v["id"] for v in conversions] + [p["id"] for p in payouts]
+        reversals = [dict(r._mapping) for r in c.execute(text("SELECT r.* FROM reversals r JOIN conversions v ON r.conversion_id=v.id WHERE v.campaign_id=:id ORDER BY r.created_at DESC"), {"id": campaign_id}).fetchall()]
+        entity_ids = [campaign_id] + [e["id"] for e in enrollments] + [v["id"] for v in conversions] + [p["id"] for p in payouts] + [r["id"] for r in reversals]
         events: list[dict[str, Any]] = []
         relays_by_event: dict[str, list[dict[str, Any]]] = {}
         for entity_id in entity_ids:
@@ -1863,6 +2074,7 @@ def campaign_public_data(campaign_id: str) -> dict[str, Any]:
         "enrollments": len(enrollments),
         "clicks": len(clicks),
         "conversions": len(conversions),
+        "reversals": len(reversals),
         "commission_sats": sum(int(v["commission_sats"]) for v in conversions),
         "pending_sats": sum(int(p["amount_sats"]) for p in payouts if p["status"] == "pending"),
         "published_events": sum(1 for ev in events if ev["relay_status"] == "published"),
@@ -1876,6 +2088,7 @@ def campaign_public_data(campaign_id: str) -> dict[str, Any]:
         "clicks": clicks,
         "conversions": conversions,
         "payouts": payouts,
+        "reversals": reversals,
         "events": events,
         "links": {
             "page": f"{BASE_URL}/campaigns/{campaign_id}/page",
@@ -1900,7 +2113,8 @@ def flow_receipt_data(conversion_id: str) -> dict[str, Any]:
         campaign = asdict(c.execute(text("SELECT * FROM campaigns WHERE id=:id"), {"id": conversion["campaign_id"]}).fetchone())
         enrollment = asdict(c.execute(text("SELECT * FROM enrollments WHERE ref_code=:ref"), {"ref": click["ref_code"] if click else None}).fetchone()) if click else None
         payout = asdict(c.execute(text("SELECT * FROM payouts WHERE conversion_id=:id ORDER BY created_at DESC LIMIT 1"), {"id": conversion_id}).fetchone())
-        event_ids = [eid for eid in [campaign.get("nostr_event_id") if campaign else None, enrollment.get("nostr_event_id") if enrollment else None, conversion.get("nostr_event_id"), payout.get("nostr_event_id") if payout else None] if eid]
+        reversal = asdict(c.execute(text("SELECT * FROM reversals WHERE conversion_id=:id ORDER BY created_at DESC LIMIT 1"), {"id": conversion_id}).fetchone())
+        event_ids = [eid for eid in [campaign.get("nostr_event_id") if campaign else None, enrollment.get("nostr_event_id") if enrollment else None, conversion.get("nostr_event_id"), payout.get("nostr_event_id") if payout else None, reversal.get("nostr_event_id") if reversal else None] if eid]
         events: list[dict[str, Any]] = []
         relays_by_event: dict[str, list[dict[str, Any]]] = {}
         if event_ids:
@@ -1921,6 +2135,7 @@ def flow_receipt_data(conversion_id: str) -> dict[str, Any]:
         "click": click,
         "conversion": conversion,
         "payout": payout,
+        "reversal": reversal,
         "events": events,
         "links": {
             "campaign_event": f"/nostr/events/{campaign['nostr_event_id']}" if campaign else None,
