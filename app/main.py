@@ -30,7 +30,7 @@ DEFAULT_AFFILIATE_NPUB = "npub16ghkhw9d4g9x6pxp6l6dtyjqaeuavwucrq8gpkt60x0kx9fzq
 app = FastAPI(
     title="Nostr Affiliate POC",
     description="MVP: campaign → enrollment → redirect click → conversion → real Nostr proof → pending Lightning payout.",
-    version="0.4.0",
+    version="0.5.0",
 )
 
 
@@ -420,7 +420,7 @@ class SimulateClickIn(BaseModel):
     ref_code: str
 
 
-class BumbeiTrackIn(BaseModel):
+class BrowserEventIn(BaseModel):
     type: str = Field("page_view", description="Browser event type, e.g. page_view")
     shop: Optional[str] = None
     bb_ref: Optional[str] = None
@@ -437,7 +437,7 @@ class BumbeiTrackIn(BaseModel):
     ts: Optional[str] = None
 
 
-class BumbeiConversionIn(BaseModel):
+class BrowserConversionIn(BaseModel):
     type: str = Field("checkout_completed", description="Browser/pixel conversion event type")
     shop: Optional[str] = None
     bb_ref: Optional[str] = None
@@ -784,7 +784,7 @@ def _request_ip(request: Request) -> str:
     return forwarded or (request.client.host if request.client else "unknown")
 
 
-def store_tracking_event(kind: str, body: BumbeiTrackIn | BumbeiConversionIn, request: Request) -> dict[str, Any]:
+def store_tracking_event(kind: str, body: BrowserEventIn | BrowserConversionIn, request: Request) -> dict[str, Any]:
     init_db()
     ref_code = _tracking_ref(body)
     click_id = _tracking_click_id(body)
@@ -848,22 +848,22 @@ def store_tracking_event(kind: str, body: BumbeiTrackIn | BumbeiConversionIn, re
     }
 
 
-@app.post("/bumbei/track", tags=["Bumbei tracking"])
-def bumbei_track(body: BumbeiTrackIn, request: Request) -> dict[str, Any]:
+@app.post("/v1/events", tags=["Tracking"])
+def create_browser_event(body: BrowserEventIn, request: Request) -> dict[str, Any]:
     """Record a browser-side landing/page-view event from a merchant storefront."""
     return store_tracking_event("track", body, request)
 
 
-@app.post("/bumbei/conversion", tags=["Bumbei tracking"])
-def bumbei_conversion(body: BumbeiConversionIn, request: Request) -> dict[str, Any]:
+@app.post("/v1/conversions", tags=["Tracking"])
+def create_browser_conversion(body: BrowserConversionIn, request: Request) -> dict[str, Any]:
     """Record a browser/pixel conversion signal. Use /merchant/conversions for payout-grade server-side proofs."""
     result = store_tracking_event("conversion", body, request)
     result["note"] = "browser conversion stored; use /merchant/conversions for payout-grade Nostr proof"
     return result
 
 
-@app.get("/bumbei/status", tags=["Bumbei tracking"])
-def bumbei_status(limit: int = 10) -> dict[str, Any]:
+@app.get("/v1/tracking/status", tags=["Tracking"])
+def tracking_status(limit: int = 10) -> dict[str, Any]:
     """Safe aggregate debug status for browser tracking events."""
     init_db()
     limit = max(0, min(limit, 50))
@@ -880,6 +880,24 @@ def bumbei_status(limit: int = 10) -> dict[str, Any]:
             {"limit": limit},
         ).fetchall()]
     return {"ok": True, "total_events": total, "counts": counts, "recent": recent, "cors_origins": tracking_cors_origins()}
+
+
+@app.post("/bumbei/track", include_in_schema=False)
+def legacy_bumbei_track(body: BrowserEventIn, request: Request) -> dict[str, Any]:
+    """Backward-compatible alias for storefronts still using the original POC route."""
+    return create_browser_event(body, request)
+
+
+@app.post("/bumbei/conversion", include_in_schema=False)
+def legacy_bumbei_conversion(body: BrowserConversionIn, request: Request) -> dict[str, Any]:
+    """Backward-compatible alias for pixels still using the original POC route."""
+    return create_browser_conversion(body, request)
+
+
+@app.get("/bumbei/status", include_in_schema=False)
+def legacy_bumbei_status(limit: int = 10) -> dict[str, Any]:
+    """Backward-compatible alias for the original POC debug route."""
+    return tracking_status(limit)
 
 
 @app.get("/dashboard/data")

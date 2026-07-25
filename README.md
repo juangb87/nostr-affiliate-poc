@@ -33,9 +33,10 @@ python scripts/e2e.py
 - `GET /dashboard`
 - `GET /dashboard/data`
 - `GET /bb.js` — lightweight tracking snippet that captures `bb_click_id`/`bb_ref`
-- `POST /bumbei/track` — public browser-side landing/page-view tracker for Shopify/theme scripts
-- `POST /bumbei/conversion` — public browser/pixel conversion signal logger; use `/merchant/conversions` for payout-grade server-side proofs
-- `GET /bumbei/status` — safe aggregate tracking debug status
+- `POST /v1/events` — public browser-side landing/page-view tracker for merchant storefronts
+- `POST /v1/conversions` — public browser/pixel conversion signal logger; use `/merchant/conversions` for payout-grade server-side proofs
+- `GET /v1/tracking/status` — safe aggregate tracking debug status
+- Legacy `/bumbei/*` routes remain working as hidden compatibility aliases during migration
 - `GET /demo-merchant` — demo landing/checkout page using the snippet
 - `POST /demo-merchant/checkout` — demo-only checkout trigger
 - `POST /clicks/simulate`
