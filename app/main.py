@@ -30,7 +30,7 @@ DEFAULT_AFFILIATE_NPUB = "npub16ghkhw9d4g9x6pxp6l6dtyjqaeuavwucrq8gpkt60x0kx9fzq
 app = FastAPI(
     title="Nostr Affiliate POC",
     description="MVP: campaign → enrollment → redirect click → conversion → real Nostr proof → pending Lightning payout.",
-    version="0.5.0",
+    version="0.5.1",
 )
 
 
@@ -39,7 +39,12 @@ def tracking_cors_origins() -> list[str]:
         "TRACKING_CORS_ORIGINS",
         "https://shapersfit.com,https://www.shapersfit.com,https://shapersfit.myshopify.com",
     )
-    return [origin.strip() for origin in raw.split(",") if origin.strip()]
+    origins = [origin.strip() for origin in raw.split(",") if origin.strip()]
+    # Shopify Custom Pixels run in a strict sandbox with an opaque origin,
+    # serialized by browsers as the literal Origin header value "null".
+    if "null" not in origins:
+        origins.append("null")
+    return origins
 
 
 app.add_middleware(

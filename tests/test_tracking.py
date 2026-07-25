@@ -41,6 +41,17 @@ def test_v1_tracking_endpoints_are_canonical(tmp_path, monkeypatch):
     assert preflight.status_code == 200
     assert preflight.headers["access-control-allow-origin"] == "https://shapersfit.com"
 
+    pixel_preflight = client.options(
+        "/v1/conversions",
+        headers={
+            "Origin": "null",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type",
+        },
+    )
+    assert pixel_preflight.status_code == 200
+    assert pixel_preflight.headers["access-control-allow-origin"] == "null"
+
     track = client.post(
         "/v1/events",
         headers={"Origin": "https://shapersfit.com"},
