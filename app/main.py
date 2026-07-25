@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import html as html_lib
+import hmac
 import json
 import os
 import secrets
@@ -10,7 +12,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from fastapi import Cookie, FastAPI, Header, HTTPException, Request
+from fastapi import BackgroundTasks, Cookie, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -30,7 +32,7 @@ DEFAULT_AFFILIATE_NPUB = "npub16ghkhw9d4g9x6pxp6l6dtyjqaeuavwucrq8gpkt60x0kx9fzq
 app = FastAPI(
     title="Nostr Affiliate POC",
     description="MVP: campaign → enrollment → redirect click → conversion → real Nostr proof → pending Lightning payout.",
-    version="0.5.1",
+    version="0.6.0",
 )
 
 
@@ -327,6 +329,20 @@ def init_db() -> None:
         ip_hash TEXT,
         payload_json TEXT NOT NULL,
         created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS shopify_webhook_deliveries (
+        webhook_id TEXT PRIMARY KEY,
+        order_key TEXT UNIQUE NOT NULL,
+        shop_domain TEXT NOT NULL,
+        topic TEXT NOT NULL,
+        click_id TEXT NOT NULL,
+        order_total REAL NOT NULL,
+        currency TEXT NOT NULL,
+        status TEXT NOT NULL,
+        conversion_id TEXT,
+        error TEXT,
+        created_at TEXT NOT NULL,
+        processed_at TEXT
     );
     CREATE TABLE IF NOT EXISTS conversions (
         id TEXT PRIMARY KEY,
@@ -932,14 +948,8 @@ def dashboard_data() -> dict[str, Any]:
     return {"health": health(), "counts": counts, "campaigns": campaigns, "enrollments": enrollments, "clicks": clicks, "conversions": conversions, "events": events}
 
 
-@app.post("/merchant/conversions")
-def merchant_conversion_webhook(body: MerchantConversionIn, authorization: Optional[str] = Header(default=None)) -> dict[str, Any]:
-    """Merchant-facing server-to-server conversion webhook.
-
-    The merchant sends back the bb_click_id captured from the referral redirect. Raw
-    order/customer data is not published to Nostr; the conversion proof stores hashes.
-    """
-    require_merchant_api_key(authorization)
+def process_merchant_conversion(body: MerchantConversionIn) -> dict[str, Any]:
+    """Create an idempotent, payout-grade conversion from a trusted merchant signal."""
     init_db()
     order_id_hash = sha(body.order_id)
     payload_hash = sha(json.dumps(body.model_dump(), sort_keys=True, default=str))
@@ -979,6 +989,269 @@ def merchant_conversion_webhook(body: MerchantConversionIn, authorization: Optio
         "json_receipt_url": f"{BASE_URL}/flows/{conversion['conversion_id']}",
         "payload_hash": payload_hash,
         "relay_results": conversion["relay_results"],
+    }
+
+
+@app.post("/merchant/conversions")
+def merchant_conversion_webhook(body: MerchantConversionIn, authorization: Optional[str] = Header(default=None)) -> dict[str, Any]:
+    """Merchant-facing server-to-server conversion webhook.
+
+    The merchant sends back the bb_click_id captured from the referral redirect. Raw
+    order/customer data is not published to Nostr; the conversion proof stores hashes.
+    """
+    require_merchant_api_key(authorization)
+    return process_merchant_conversion(body)
+
+
+def shopify_webhook_secret() -> str:
+    return os.getenv("SHOPIFY_WEBHOOK_SECRET") or os.getenv("SHOPIFY_SECRET", "")
+
+
+def normalized_shopify_store_domain() -> str:
+    raw = os.getenv("SHOPIFY_STORE_DOMAIN", "").strip().lower().rstrip("/")
+    if "://" in raw:
+        raw = raw.split("://", 1)[1]
+    return raw
+
+
+def verify_shopify_webhook(raw_body: bytes, signature: str) -> None:
+    secret = shopify_webhook_secret()
+    if not secret:
+        raise HTTPException(503, "Shopify webhook secret is not configured")
+    expected = base64.b64encode(hmac.new(secret.encode(), raw_body, hashlib.sha256).digest()).decode()
+    if not signature or not hmac.compare_digest(expected, signature):
+        raise HTTPException(401, "invalid Shopify webhook signature")
+
+
+def shopify_note_attributes(payload: dict[str, Any]) -> dict[str, str]:
+    attributes: dict[str, str] = {}
+    for item in payload.get("note_attributes") or []:
+        if not isinstance(item, dict):
+            continue
+        name = safe_text(item.get("name"), 120)
+        value = safe_text(item.get("value"), 500)
+        if name and value:
+            attributes[name] = value
+    return attributes
+
+
+def enqueue_shopify_paid_order(
+    *, webhook_id: str, order_key: str, shop: str, topic: str, click_id: str, order_total: float, currency: str
+) -> tuple[dict[str, Any], bool, bool]:
+    """Persist a minimal webhook inbox row and atomically claim a new Shopify order."""
+    init_db()
+    created_at = now()
+    with engine().begin() as c:
+        inserted = c.execute(
+            text(
+                """
+                INSERT INTO shopify_webhook_deliveries
+                (webhook_id, order_key, shop_domain, topic, click_id, order_total, currency,
+                 status, conversion_id, error, created_at, processed_at)
+                VALUES (:webhook_id, :order_key, :shop_domain, :topic, :click_id, :order_total,
+                        :currency, 'pending', NULL, NULL, :created_at, NULL)
+                ON CONFLICT(order_key) DO NOTHING
+                """
+            ),
+            {
+                "webhook_id": webhook_id,
+                "order_key": order_key,
+                "shop_domain": shop,
+                "topic": topic,
+                "click_id": click_id,
+                "order_total": order_total,
+                "currency": currency,
+                "created_at": created_at,
+            },
+        ).rowcount == 1
+        row = asdict(c.execute(text("SELECT * FROM shopify_webhook_deliveries WHERE order_key=:key"), {"key": order_key}).fetchone())
+        conflict = bool(
+            row
+            and (
+                row["click_id"] != click_id
+                or float(row["order_total"]) != order_total
+                or row["currency"] != currency
+                or row["shop_domain"] != shop
+            )
+        )
+        should_process = inserted
+        if row and row["status"] == "failed" and not conflict:
+            c.execute(
+                text("UPDATE shopify_webhook_deliveries SET status='pending', error=NULL WHERE order_key=:key"),
+                {"key": order_key},
+            )
+            row["status"] = "pending"
+            should_process = True
+    return row, should_process, conflict
+
+
+def process_shopify_delivery(order_key: str) -> None:
+    """Process one claimed Shopify order after the HTTP response has been sent."""
+    with engine().begin() as c:
+        claimed = c.execute(
+            text(
+                """
+                UPDATE shopify_webhook_deliveries
+                SET status='processing', error=NULL
+                WHERE order_key=:key AND status='pending'
+                """
+            ),
+            {"key": order_key},
+        ).rowcount == 1
+        row = asdict(c.execute(text("SELECT * FROM shopify_webhook_deliveries WHERE order_key=:key"), {"key": order_key}).fetchone())
+    if not claimed or not row:
+        return
+
+    try:
+        result = process_merchant_conversion(
+            MerchantConversionIn(
+                order_id=order_key,
+                bb_click_id=row["click_id"],
+                order_total=float(row["order_total"]),
+                currency=row["currency"],
+                metadata={"platform": "shopify", "shop": row["shop_domain"], "topic": row["topic"]},
+            )
+        )
+    except Exception as exc:
+        with engine().begin() as c:
+            c.execute(
+                text(
+                    """
+                    UPDATE shopify_webhook_deliveries
+                    SET status='failed', error=:error, processed_at=:processed_at
+                    WHERE order_key=:key
+                    """
+                ),
+                {"key": order_key, "error": safe_text(str(exc), 500), "processed_at": now()},
+            )
+        return
+
+    with engine().begin() as c:
+        c.execute(
+            text(
+                """
+                UPDATE shopify_webhook_deliveries
+                SET status='processed', conversion_id=:conversion_id, error=NULL, processed_at=:processed_at
+                WHERE order_key=:key
+                """
+            ),
+            {"key": order_key, "conversion_id": result["conversion_id"], "processed_at": now()},
+        )
+
+
+@app.post("/shopify/webhooks/orders-paid", tags=["Shopify"])
+async def shopify_orders_paid_webhook(request: Request, background_tasks: BackgroundTasks) -> dict[str, Any]:
+    """Authenticate and enqueue Shopify's orders/paid webhook for authoritative processing."""
+    max_body_bytes = 5 * 1024 * 1024
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > max_body_bytes:
+                raise HTTPException(413, "Shopify webhook body is too large")
+        except ValueError:
+            raise HTTPException(400, "invalid Content-Length")
+    raw_body = await request.body()
+    if len(raw_body) > max_body_bytes:
+        raise HTTPException(413, "Shopify webhook body is too large")
+    verify_shopify_webhook(raw_body, request.headers.get("x-shopify-hmac-sha256", ""))
+
+    topic = request.headers.get("x-shopify-topic", "").strip().lower()
+    shop = request.headers.get("x-shopify-shop-domain", "").strip().lower()
+    webhook_id = request.headers.get("x-shopify-webhook-id", "").strip()
+    if topic != "orders/paid":
+        raise HTTPException(400, "unexpected Shopify webhook topic")
+    if not webhook_id:
+        raise HTTPException(400, "missing Shopify webhook id")
+
+    configured_shop = normalized_shopify_store_domain()
+    if not configured_shop:
+        raise HTTPException(503, "Shopify store domain is not configured")
+    if shop != configured_shop:
+        raise HTTPException(403, "unexpected Shopify store domain")
+
+    try:
+        payload = json.loads(raw_body)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "invalid Shopify webhook JSON")
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "invalid Shopify webhook payload")
+
+    attributes = shopify_note_attributes(payload)
+    click_id = attributes.get("bb_click_id") or attributes.get("click_id")
+    if not click_id:
+        return {
+            "ok": True,
+            "ignored": True,
+            "reason": "missing affiliate attribution",
+            "shop": shop,
+            "topic": topic,
+            "webhook_id": webhook_id,
+        }
+
+    order_id = safe_text(payload.get("id"), 300)
+    currency = safe_text(payload.get("currency"), 20).upper()
+    try:
+        order_total = float(payload.get("total_price"))
+    except (TypeError, ValueError):
+        raise HTTPException(422, "invalid Shopify order total")
+    if not order_id or not currency or order_total <= 0:
+        raise HTTPException(422, "incomplete Shopify paid order")
+
+    order_key = sha(f"shopify:{shop}:{order_id}")
+    delivery, should_process, conflict = enqueue_shopify_paid_order(
+        webhook_id=webhook_id,
+        order_key=order_key,
+        shop=shop,
+        topic=topic,
+        click_id=click_id,
+        order_total=order_total,
+        currency=currency,
+    )
+    if conflict:
+        return {
+            "ok": True,
+            "ignored": False,
+            "duplicate": True,
+            "conflict": True,
+            "status": delivery["status"],
+            "conversion_id": delivery.get("conversion_id"),
+            "shop": shop,
+            "topic": topic,
+        }
+    if should_process:
+        background_tasks.add_task(process_shopify_delivery, order_key)
+    return {
+        "ok": True,
+        "ignored": False,
+        "duplicate": not should_process,
+        "conflict": False,
+        "queued": delivery["status"] != "processed",
+        "status": delivery["status"],
+        "conversion_id": delivery.get("conversion_id"),
+        "shop": shop,
+        "topic": topic,
+        "webhook_id": webhook_id,
+    }
+
+
+@app.get("/shopify/webhooks/status", tags=["Shopify"])
+def shopify_webhook_status() -> dict[str, Any]:
+    """Expose safe webhook readiness and aggregate inbox state without credentials or order data."""
+    init_db()
+    with engine().connect() as c:
+        counts = {
+            row._mapping["status"]: row._mapping["count"]
+            for row in c.execute(
+                text("SELECT status, COUNT(*) AS count FROM shopify_webhook_deliveries GROUP BY status")
+            ).fetchall()
+        }
+    return {
+        "ok": True,
+        "secret_configured": bool(shopify_webhook_secret()),
+        "store_configured": bool(normalized_shopify_store_domain()),
+        "topic": "orders/paid",
+        "callback_url": f"{BASE_URL}/shopify/webhooks/orders-paid",
+        "deliveries": counts,
     }
 
 

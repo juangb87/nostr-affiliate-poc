@@ -36,6 +36,8 @@ python scripts/e2e.py
 - `POST /v1/events` — public browser-side landing/page-view tracker for merchant storefronts
 - `POST /v1/conversions` — public browser/pixel conversion signal logger; use `/merchant/conversions` for payout-grade server-side proofs
 - `GET /v1/tracking/status` — safe aggregate tracking debug status
+- `POST /shopify/webhooks/orders-paid` — Shopify-signed authoritative paid-order webhook; validates the raw-body HMAC and reads `bb_click_id` from order `note_attributes`
+- `GET /shopify/webhooks/status` — safe readiness check for the Shopify webhook configuration
 - Legacy `/bumbei/*` routes remain working as hidden compatibility aliases during migration
 - `GET /demo-merchant` — demo landing/checkout page using the snippet
 - `POST /demo-merchant/checkout` — demo-only checkout trigger
@@ -75,6 +77,9 @@ Recommended environment variables:
 - `NOSTR_PUBLISH`: set to `true` to publish to relays
 - `NOSTR_RELAYS`: comma-separated relay URLs. Default: `wss://nos.lol,wss://relay.damus.io,wss://relay.primal.net`
 - `MERCHANT_API_KEYS`: comma-separated bearer tokens accepted by `/merchant/conversions`.
+- `SHOPIFY_SECRET`: Shopify app client secret used to verify webhook HMAC signatures.
+- `SHOPIFY_WEBHOOK_SECRET`: optional dedicated override for webhook verification; when omitted, `SHOPIFY_SECRET` is used.
+- `SHOPIFY_STORE_DOMAIN`: permanent `*.myshopify.com` domain accepted in signed webhook headers.
 - `SATS_PER_USD`: server-side USD→sats conversion rate used only when merchant reports `currency: "USD"`. Default: `2500`.
 
 ## Merchant tracking snippet
@@ -125,6 +130,16 @@ Supported currencies:
 Merchants do **not** send `sats_per_usd`; exchange-rate policy stays server-side.
 
 The response includes `order_total_sats`, `receipt_url`, `json_receipt_url`, `nostr_event_id`, payout status, and relay results. Duplicate `order_id` submissions are idempotent and return the original conversion.
+
+## Shopify paid-order webhook
+
+Register the Shopify topic `ORDERS_PAID` with this HTTPS callback:
+
+```text
+https://nostr-affiliate-poc-production.up.railway.app/shopify/webhooks/orders-paid
+```
+
+The endpoint verifies `X-Shopify-Hmac-Sha256` against the unmodified request body, requires the configured shop domain, and reads `bb_click_id` from `note_attributes`. Paid orders without affiliate attribution are acknowledged and ignored so Shopify does not retry them. Attributed paid orders use the same authoritative conversion, Nostr proof, commission, and pending-payout flow as `/merchant/conversions`.
 
 ## Privacy note
 
