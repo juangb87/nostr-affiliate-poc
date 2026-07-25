@@ -44,15 +44,15 @@ python scripts/e2e.py
 - `POST /clicks/simulate`
 - `POST /merchant/conversions` — merchant webhook with `Authorization: Bearer <merchant_api_key>`
 - `POST /campaigns`
-- `POST /campaigns/{campaign_id}/status` — republishes the addressable campaign event
+- `POST /campaigns/{campaign_id}/status` — republishes the addressable campaign event; merchant Bearer API key required
 - `GET /campaigns/{campaign_id}`
 - `GET /campaigns/{campaign_id}/summary`
 - `GET /campaigns/{campaign_id}/page`
 - `POST /enrollments`
-- `POST /enrollments/{enrollment_id}/status` — republishes the addressable enrollment event
+- `POST /enrollments/{enrollment_id}/status` — republishes the addressable enrollment event; merchant Bearer API key required
 - `GET /r/{ref_code}`
 - `POST /conversions`
-- `POST /conversions/{conversion_id}/reverse` — immutable refund/fraud/chargeback proof
+- `POST /conversions/{conversion_id}/reverse` — immutable refund/fraud/chargeback proof; merchant Bearer API key required
 - `GET /proofs`
 - `GET /affiliates/{npub_or_hex}`
 - `GET /affiliates/{npub_or_hex}/summary`

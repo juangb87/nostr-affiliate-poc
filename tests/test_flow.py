@@ -115,6 +115,7 @@ def test_demo_flow_creates_conversion_and_proof(tmp_path, monkeypatch):
     assert len(flow_after_payout['events']) >= 4
     reversal = client.post(
         f"/conversions/{data['conversion']['conversion_id']}/reverse",
+        headers={'Authorization': 'Bearer bumbei-demo-key'},
         json={'reason': 'refund', 'refund_sats': 250000, 'note': 'test refund'},
     )
     assert reversal.status_code == 200, reversal.text
@@ -126,6 +127,7 @@ def test_demo_flow_creates_conversion_and_proof(tmp_path, monkeypatch):
     assert ['refund_sats', '250000'] in reversal_json['nostr_event']['tags']
     duplicate_reversal = client.post(
         f"/conversions/{data['conversion']['conversion_id']}/reverse",
+        headers={'Authorization': 'Bearer bumbei-demo-key'},
         json={'reason': 'refund', 'refund_sats': 250000},
     )
     assert duplicate_reversal.status_code == 200
@@ -194,17 +196,19 @@ def test_demo_flow_creates_conversion_and_proof(tmp_path, monkeypatch):
     assert demo_checkout.json()['order_total_sats'] == 250000
     assert demo_checkout.json()['receipt_url'].endswith(f"/flows/{demo_checkout.json()['conversion_id']}/receipt")
 
-    terminated = client.post(f"/enrollments/{data['enrollment']['enrollment_id']}/status", json={'status': 'terminated'})
+    merchant_headers = {'Authorization': 'Bearer bumbei-demo-key'}
+    assert client.post(f"/enrollments/{data['enrollment']['enrollment_id']}/status", json={'status': 'terminated'}).status_code == 401
+    terminated = client.post(f"/enrollments/{data['enrollment']['enrollment_id']}/status", headers=merchant_headers, json={'status': 'terminated'})
     assert terminated.status_code == 200, terminated.text
     assert terminated.json()['nostr_event']['kind'] == ENROLLMENT_KIND
     assert ['status', 'terminated'] in terminated.json()['nostr_event']['tags']
     assert ['d', data['enrollment']['enrollment_id']] in terminated.json()['nostr_event']['tags']
-    reapproved = client.post(f"/enrollments/{data['enrollment']['enrollment_id']}/status", json={'status': 'approved'})
+    reapproved = client.post(f"/enrollments/{data['enrollment']['enrollment_id']}/status", headers=merchant_headers, json={'status': 'approved'})
     assert reapproved.status_code == 200
-    paused = client.post(f"/campaigns/{data['campaign']['campaign_id']}/status", json={'status': 'paused'})
+    paused = client.post(f"/campaigns/{data['campaign']['campaign_id']}/status", headers=merchant_headers, json={'status': 'paused'})
     assert paused.status_code == 200, paused.text
     assert paused.json()['nostr_event']['kind'] == CAMPAIGN_KIND
     assert ['status', 'paused'] in paused.json()['nostr_event']['tags']
     assert ['d', data['campaign']['campaign_id']] in paused.json()['nostr_event']['tags']
-    reactivate = client.post(f"/campaigns/{data['campaign']['campaign_id']}/status", json={'status': 'active'})
+    reactivate = client.post(f"/campaigns/{data['campaign']['campaign_id']}/status", headers=merchant_headers, json={'status': 'active'})
     assert reactivate.status_code == 200

@@ -741,7 +741,12 @@ def get_campaign(campaign_id: str) -> dict[str, Any]:
 
 
 @app.post("/campaigns/{campaign_id}/status")
-def update_campaign_status(campaign_id: str, body: CampaignStatusIn) -> dict[str, Any]:
+def update_campaign_status(
+    campaign_id: str,
+    body: CampaignStatusIn,
+    authorization: Optional[str] = Header(None),
+) -> dict[str, Any]:
+    require_merchant_api_key(authorization)
     init_db()
     status = body.status.strip().lower()
     if status not in CAMPAIGN_STATUSES:
@@ -807,7 +812,12 @@ def create_enrollment(body: EnrollmentIn) -> dict[str, Any]:
 
 
 @app.post("/enrollments/{enrollment_id}/status")
-def update_enrollment_status(enrollment_id: str, body: EnrollmentStatusIn) -> dict[str, Any]:
+def update_enrollment_status(
+    enrollment_id: str,
+    body: EnrollmentStatusIn,
+    authorization: Optional[str] = Header(None),
+) -> dict[str, Any]:
+    require_merchant_api_key(authorization)
     init_db()
     status = body.status.strip().lower()
     if status not in ENROLLMENT_STATUSES:
@@ -956,7 +966,12 @@ def create_conversion(body: ConversionIn, bb_click_id: Optional[str] = Cookie(No
 
 
 @app.post("/conversions/{conversion_id}/reverse")
-def reverse_conversion(conversion_id: str, body: ReversalIn) -> dict[str, Any]:
+def reverse_conversion(
+    conversion_id: str,
+    body: ReversalIn,
+    authorization: Optional[str] = Header(None),
+) -> dict[str, Any]:
+    require_merchant_api_key(authorization)
     init_db()
     reason = body.reason.strip().lower()
     if reason not in REVERSAL_REASONS:
