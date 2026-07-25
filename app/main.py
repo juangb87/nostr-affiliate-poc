@@ -334,6 +334,10 @@ def persist_nostr_event(c: Any, event: dict[str, Any], entity_type: str, entity_
             entity_type, entity_id, relay_status, created_at, published_at)
             VALUES (:event_id, :kind, :pubkey, :content, :tags_json, :event_json,
             :entity_type, :entity_id, :relay_status, :created_at, :published_at)
+            ON CONFLICT(event_id) DO UPDATE SET
+                event_json=excluded.event_json,
+                relay_status=excluded.relay_status,
+                published_at=COALESCE(excluded.published_at, nostr_events.published_at)
             """
         ),
         {
