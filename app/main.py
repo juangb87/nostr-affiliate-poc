@@ -29,6 +29,12 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from nostr_sdk import Client, EventBuilder, Keys, Kind, PublicKey, RelayUrl, Tag
 from app.lightning import LightningPaymentError, pay_nwc_invoice, prepare_lnurl_payment
+from app.payment_rails import (
+    NwcPaymentRail,
+    PaymentRailAmbiguousError,
+    PaymentStatus,
+    build_payment_rail,
+)
 from app.payment_state import calculate_fee_sats, payment_idempotency_key
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, text
@@ -44,8 +50,8 @@ DEFAULT_AFFILIATE_NPUB = "npub16ghkhw9d4g9x6pxp6l6dtyjqaeuavwucrq8gpkt60x0kx9fzq
 
 app = FastAPI(
     title="Nostr Affiliate POC",
-    description="MVP: campaign → enrollment → attribution → Nostr proofs → durable Lightning payout ledger.",
-    version="0.8.1",
+    description="MVP: Nostr affiliate proofs, durable ledger, and provider-independent Lightning payment rails.",
+    version="0.9.0",
 )
 
 
@@ -75,6 +81,11 @@ _ENGINE_URL: str | None = None
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def valid_payment_hash(value: Any) -> bool:
+    candidate = str(value or "").lower()
+    return len(candidate) == 64 and all(ch in "0123456789abcdef" for ch in candidate)
 
 
 def database_url() -> str:
@@ -232,6 +243,14 @@ def require_payout_admin_key(authorization: Optional[str]) -> str:
 
 def lightning_payouts_enabled() -> bool:
     return os.getenv("LIGHTNING_PAYOUTS_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+
+
+def configured_payment_rail():
+    """Resolve the explicitly selected rail without performing any provider operation."""
+    if os.getenv("PAYMENT_RAIL", "nwc").strip().lower() == "nwc":
+        # Keep the established NWC hooks injectable for tests while the worker uses the generic contract.
+        return NwcPaymentRail(prepare=prepare_lnurl_payment, pay=pay_nwc_invoice)
+    return build_payment_rail()
 
 
 def lightning_max_payout_sats() -> int:
@@ -557,6 +576,9 @@ def init_db() -> None:
         status TEXT NOT NULL,
         payment_hash TEXT,
         preimage TEXT,
+        provider_reference TEXT,
+        error_code TEXT,
+        retryable INTEGER,
         routing_fee_sats INTEGER,
         error TEXT,
         attempt_number INTEGER NOT NULL,
@@ -635,10 +657,14 @@ def init_db() -> None:
             c.execute(text("ALTER TABLE payouts ADD COLUMN IF NOT EXISTS settled_at TEXT"))
             c.execute(text("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'"))
             c.execute(text("ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'approved'"))
+            c.execute(text("ALTER TABLE payment_attempts ADD COLUMN IF NOT EXISTS provider_reference TEXT"))
+            c.execute(text("ALTER TABLE payment_attempts ADD COLUMN IF NOT EXISTS error_code TEXT"))
+            c.execute(text("ALTER TABLE payment_attempts ADD COLUMN IF NOT EXISTS retryable INTEGER"))
         else:
             campaign_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(campaigns)")).fetchall()}
             enrollment_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(enrollments)")).fetchall()}
             payout_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(payouts)")).fetchall()}
+            attempt_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(payment_attempts)")).fetchall()}
             if "merchant_pubkey_hex" not in campaign_cols:
                 c.execute(text("ALTER TABLE campaigns ADD COLUMN merchant_pubkey_hex TEXT"))
             if "affiliate_pubkey_hex" not in enrollment_cols:
@@ -661,6 +687,10 @@ def init_db() -> None:
             for column, column_type in payout_column_ddl.items():
                 if column not in payout_cols:
                     c.execute(text(f"ALTER TABLE payouts ADD COLUMN {column} {column_type}"))
+            attempt_column_ddl = {"provider_reference": "TEXT", "error_code": "TEXT", "retryable": "INTEGER"}
+            for column, column_type in attempt_column_ddl.items():
+                if column not in attempt_cols:
+                    c.execute(text(f"ALTER TABLE payment_attempts ADD COLUMN {column} {column_type}"))
             if "status" not in campaign_cols:
                 c.execute(text("ALTER TABLE campaigns ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"))
             if "status" not in enrollment_cols:
@@ -948,7 +978,7 @@ class AttemptReconcileIn(BaseModel):
     outcome: str
     payment_hash: Optional[str] = None
     routing_fee_sats: Optional[int] = Field(None, ge=0)
-    error: Optional[str] = None
+    error: Optional[str] = Field(None, description="Required operator audit reason for manual settlement")
 
 
 class CampaignStatusIn(BaseModel):
@@ -2221,6 +2251,20 @@ def payout_ledger(payout_id: str, authorization: Optional[str] = Header(None)) -
     return {"payout_id": payout_id, "balanced": debits == credits, "debits_sats": debits, "credits_sats": credits, "entries": entries}
 
 
+@app.get("/admin/payment-rail/balance")
+def payment_rail_balance(authorization: Optional[str] = Header(None)) -> dict[str, Any]:
+    """Read-only provider balance check; never initiates a payment."""
+    require_payout_admin_key(authorization)
+    try:
+        rail = configured_payment_rail()
+        balance_sats = asyncio.run(rail.get_balance())
+    except RuntimeError as exc:
+        raise HTTPException(501, safe_text(str(exc), 300)) from exc
+    except Exception as exc:
+        raise HTTPException(502, "payment rail balance lookup failed") from exc
+    return {"rail": safe_text(getattr(rail, "name", "unknown"), 50), "balance_sats": int(balance_sats)}
+
+
 @app.get("/admin/payment-attempts/recovery")
 def recoverable_payment_attempts(
     older_than_seconds: int = 60,
@@ -2243,6 +2287,128 @@ def recoverable_payment_attempts(
     return {"cutoff": cutoff, "attempts": attempts, "action": "reconcile before any retry"}
 
 
+def _apply_provider_refresh_result(attempt_id: str, result: Any) -> dict[str, Any]:
+    """Apply read-only provider evidence with an attempt+payout CAS; never sends payment."""
+    with engine().begin() as c:
+        suffix = " FOR UPDATE" if c.engine.dialect.name == "postgresql" else ""
+        attempt = asdict(c.execute(text(f"SELECT * FROM payment_attempts WHERE id=:id{suffix}"), {"id": attempt_id}).fetchone())
+        if not attempt or attempt["status"] != "UNKNOWN":
+            raise HTTPException(409, "payment attempt is no longer UNKNOWN")
+        payout = asdict(c.execute(text(f"SELECT * FROM payouts WHERE id=:id{suffix}"), {"id": attempt["payout_id"]}).fetchone())
+        latest_id = c.execute(text("""
+            SELECT id FROM payment_attempts WHERE payout_id=:payout_id AND kind=:kind
+            ORDER BY attempt_number DESC, created_at DESC LIMIT 1
+        """), {"payout_id": attempt["payout_id"], "kind": attempt["kind"]}).scalar_one()
+        if (not payout or latest_id != attempt_id or payout.get("payment_provider") != attempt["rail"]
+                or payout.get("state") not in {"PAYING", "CANCEL_PENDING"}):
+            raise HTTPException(409, "stale payment attempt cannot be refreshed")
+        if result.provider_reference and result.provider_reference != attempt.get("provider_reference"):
+            raise HTTPException(409, "provider reference does not match the current attempt")
+        if result.status == PaymentStatus.FAILURE:
+            if result.retryable:
+                raise HTTPException(409, "provider failure is retryable and not definitive")
+            error = safe_text(result.error or "provider confirmed payment failure", 500)
+            changed = c.execute(text("""
+                UPDATE payment_attempts SET status='FAILED', error=:error, error_code=:code,
+                    retryable=0, updated_at=:updated_at WHERE id=:id AND status='UNKNOWN'
+            """), {"id": attempt_id, "error": error, "code": result.error_code, "updated_at": now()})
+            if changed.rowcount != 1:
+                raise HTTPException(409, "payment attempt was concurrently refreshed")
+            conversion = asdict(c.execute(text("SELECT campaign_id,status FROM conversions WHERE id=:id"), {"id": payout["conversion_id"]}).fetchone())
+            if payout["state"] == "CANCEL_PENDING" and conversion.get("status") == "reversed":
+                release_campaign_budget(c, conversion["campaign_id"], payout["id"], int(payout.get("reserved_sats") or 0), movement="provider_reconciled_reversal_release")
+                target_state, target_status = "CANCELLED", "reversed"
+                changed_payout = c.execute(text("""
+                    UPDATE payouts SET state='CANCELLED', status='reversed', fee_state='CANCELLED',
+                        reserved_sats=0, last_error=:error
+                    WHERE id=:id AND state='CANCEL_PENDING' AND payment_provider=:rail
+                """), {"id": payout["id"], "rail": attempt["rail"], "error": error})
+            else:
+                target_state, target_status = "FAILED", "failed"
+                changed_payout = c.execute(text("""
+                    UPDATE payouts SET state='FAILED', status='failed', last_error=:error
+                    WHERE id=:id AND state='PAYING' AND payment_provider=:rail
+                """), {"id": payout["id"], "rail": attempt["rail"], "error": error})
+            if changed_payout.rowcount != 1:
+                raise HTTPException(409, "payout was concurrently refreshed")
+            return {"ok": True, "resolved": True, "attempt_id": attempt_id, "payout_id": payout["id"], "payout_state": target_state, "status": target_status.upper()}
+
+        payment_hash = str(result.payment_hash or "").lower()
+        if result.status != PaymentStatus.SUCCESS or not valid_payment_hash(payment_hash):
+            raise HTTPException(409, "provider settlement evidence is incomplete")
+        existing_hash = str(attempt.get("payment_hash") or "").lower()
+        if existing_hash and (not valid_payment_hash(existing_hash) or not hmac.compare_digest(existing_hash, payment_hash)):
+            raise HTTPException(409, "provider payment hash does not match prepared evidence")
+        changed = c.execute(text("""
+            UPDATE payment_attempts SET status='SETTLED', payment_hash=:payment_hash,
+                routing_fee_sats=:fee, error=NULL, retryable=0, settled_at=:settled_at, updated_at=:updated_at
+            WHERE id=:id AND status='UNKNOWN'
+        """), {"id": attempt_id, "payment_hash": payment_hash, "fee": result.fee_paid_sats, "settled_at": now(), "updated_at": now()})
+        changed_payout = c.execute(text("""
+            UPDATE payouts SET state='SETTLED', status='paid', payment_hash=:payment_hash, settled_at=:settled_at
+            WHERE id=:id AND state IN ('PAYING','CANCEL_PENDING') AND payment_provider=:rail
+        """), {"id": payout["id"], "rail": attempt["rail"], "payment_hash": payment_hash, "settled_at": now()})
+        if changed.rowcount != 1 or changed_payout.rowcount != 1:
+            raise HTTPException(409, "attempt and payout were concurrently refreshed")
+    finalized = finalize_payout_paid(
+        payout["id"], payment_hash, "Provider-confirmed Lightning payout",
+        sandbox=False, provider=attempt["rail"],
+        fees_paid_msats=(result.fee_paid_sats * 1000 if result.fee_paid_sats is not None else None),
+    )
+    apply_existing_reversal_for_payout(payout["id"])
+    finalized["attempt_id"] = attempt_id
+    finalized["resolved"] = True
+    return finalized
+
+
+@app.post("/admin/payment-attempts/{attempt_id}/refresh")
+def refresh_payment_attempt(
+    attempt_id: str,
+    authorization: Optional[str] = Header(None),
+) -> dict[str, Any]:
+    """Query the configured provider for an existing attempt; never sends a payment."""
+    require_payout_admin_key(authorization)
+    init_db()
+    with engine().connect() as c:
+        attempt = asdict(c.execute(text("SELECT * FROM payment_attempts WHERE id=:id"), {"id": attempt_id}).fetchone())
+    if not attempt:
+        raise HTTPException(404, "payment attempt not found")
+    if attempt["status"] != "UNKNOWN":
+        raise HTTPException(409, f"attempt status {attempt['status']} does not require refresh")
+    try:
+        rail = configured_payment_rail()
+    except RuntimeError as exc:
+        raise HTTPException(503, safe_text(str(exc), 300)) from exc
+    if safe_text(getattr(rail, "name", ""), 50).lower() != attempt["rail"]:
+        raise HTTPException(409, "configured payment rail does not match attempt rail")
+    reference = attempt.get("provider_reference")
+    if not reference:
+        raise HTTPException(409, "attempt has no provider reference for read-only refresh")
+    try:
+        result = asyncio.run(rail.lookup_payment(reference))
+    except Exception as exc:
+        raise HTTPException(502, "payment lookup failed; attempt remains unresolved") from exc
+    if result is None or result.status == PaymentStatus.PENDING:
+        return {
+            "ok": True,
+            "resolved": False,
+            "attempt_id": attempt_id,
+            "payout_id": attempt["payout_id"],
+            "status": "UNKNOWN",
+            "action": "manual reconciliation required",
+        }
+    if result.status in {PaymentStatus.FAILURE, PaymentStatus.SUCCESS}:
+        return _apply_provider_refresh_result(attempt_id, result)
+    return {
+        "ok": True,
+        "resolved": False,
+        "attempt_id": attempt_id,
+        "payout_id": attempt["payout_id"],
+        "status": "UNKNOWN",
+        "action": "provider evidence incomplete; manual reconciliation required",
+    }
+
+
 @app.post("/admin/payment-attempts/{attempt_id}/reconcile")
 def reconcile_payment_attempt(
     attempt_id: str,
@@ -2251,14 +2417,19 @@ def reconcile_payment_attempt(
 ) -> dict[str, Any]:
     require_payout_admin_key(authorization)
     outcome = body.outcome.strip().upper()
-    if outcome not in {"SETTLED", "FAILED"}:
-        raise HTTPException(400, "outcome must be SETTLED or FAILED")
+    if outcome != "SETTLED":
+        raise HTTPException(400, "manual reconciliation only supports SETTLED")
+    audit_reason = safe_text(body.error, 500)
+    if not audit_reason:
+        raise HTTPException(400, "an operator audit reason is required")
     init_db()
     with engine().connect() as c:
         snapshot_attempt = asdict(c.execute(text("SELECT * FROM payment_attempts WHERE id=:id"), {"id": attempt_id}).fetchone())
         snapshot_payout = asdict(c.execute(text("SELECT * FROM payouts WHERE id=:id"), {"id": snapshot_attempt["payout_id"]}).fetchone()) if snapshot_attempt else None
     if not snapshot_attempt or not snapshot_payout:
         raise HTTPException(404, "payment attempt not found")
+    if snapshot_attempt["status"] != "UNKNOWN":
+        raise HTTPException(409, f"attempt status {snapshot_attempt['status']} cannot be manually reconciled")
     if snapshot_attempt["status"] == outcome:
         if outcome == "SETTLED" and not snapshot_payout.get("nostr_event_id"):
             result = finalize_payout_paid(
@@ -2281,67 +2452,39 @@ def reconcile_payment_attempt(
             raise HTTPException(404, "payment attempt not found")
         payout = asdict(c.execute(text(f"SELECT * FROM payouts WHERE id=:id{suffix}"), {"id": attempt["payout_id"]}).fetchone())
         conversion = asdict(c.execute(text("SELECT * FROM conversions WHERE id=:id"), {"id": payout["conversion_id"]}).fetchone())
-        if attempt["status"] not in {"PAYING", "UNKNOWN"}:
-            raise HTTPException(409, f"attempt status {attempt['status']} cannot be reconciled")
-        if outcome == "FAILED":
-            error = safe_text(body.error or "manually reconciled as unpaid", 500)
-            reconciled = c.execute(
-                text("""
-                    UPDATE payment_attempts SET status='FAILED', error=:error, updated_at=:updated_at
-                    WHERE id=:id AND status IN ('PAYING','UNKNOWN')
-                """),
-                {"id": attempt_id, "error": error, "updated_at": now()},
-            )
-            if reconciled.rowcount != 1:
-                raise HTTPException(409, "payment attempt was concurrently reconciled")
-            if conversion.get("status") == "reversed":
-                release_campaign_budget(
-                    c,
-                    conversion["campaign_id"],
-                    payout["id"],
-                    int(payout.get("reserved_sats") or 0),
-                    movement="reconciled_reversal_release",
-                )
-                updated = c.execute(
-                    text("""
-                        UPDATE payouts SET state='CANCELLED', status='reversed', fee_state='CANCELLED',
-                            reserved_sats=0, last_error=:error
-                        WHERE id=:id AND state IN ('PAYING','CANCEL_PENDING')
-                    """),
-                    {"id": payout["id"], "error": error},
-                )
-                payout_state = "CANCELLED"
-            else:
-                updated = c.execute(
-                    text("""
-                        UPDATE payouts SET state='FAILED', status='failed', last_error=:error
-                        WHERE id=:id AND state='PAYING'
-                    """),
-                    {"id": payout["id"], "error": error},
-                )
-                payout_state = "FAILED"
-            if updated.rowcount != 1:
-                raise HTTPException(409, "payout was concurrently reconciled")
-            return {"ok": True, "duplicate": False, "attempt_id": attempt_id, "payout_id": payout["id"], "payout_state": payout_state}
-        payment_hash = body.payment_hash or attempt.get("payment_hash")
-        if not payment_hash:
-            raise HTTPException(400, "payment_hash is required to reconcile as SETTLED")
+        if attempt["status"] != "UNKNOWN":
+            raise HTTPException(409, f"attempt status {attempt['status']} cannot be manually reconciled")
+        latest_id = c.execute(text("""
+            SELECT id FROM payment_attempts WHERE payout_id=:payout_id AND kind=:kind
+            ORDER BY attempt_number DESC, created_at DESC LIMIT 1
+        """), {"payout_id": attempt["payout_id"], "kind": attempt["kind"]}).scalar_one()
+        if latest_id != attempt_id or payout.get("payment_provider") != attempt["rail"]:
+            raise HTTPException(409, "stale payment attempt cannot be reconciled")
+        payment_hash = str(body.payment_hash or "").lower()
+        existing_hash = str(attempt.get("payment_hash") or "").lower()
+        if not valid_payment_hash(payment_hash):
+            raise HTTPException(400, "a 64-character hexadecimal payment_hash is required")
+        if not valid_payment_hash(existing_hash) or not hmac.compare_digest(payment_hash, existing_hash):
+            raise HTTPException(409, "manual payment hash does not match prepared attempt evidence")
+        if attempt["rail"] in {"blink", "fake"} and not attempt.get("provider_reference"):
+            raise HTTPException(409, "attempt has no provider reference evidence")
         reconciled = c.execute(
             text("""
                 UPDATE payment_attempts SET status='SETTLED', payment_hash=:payment_hash,
-                    routing_fee_sats=:routing_fee_sats, error=NULL, settled_at=:settled_at, updated_at=:updated_at
-                WHERE id=:id AND status IN ('PAYING','UNKNOWN')
+                    routing_fee_sats=:routing_fee_sats, error=:audit, settled_at=:settled_at, updated_at=:updated_at
+                WHERE id=:id AND status='UNKNOWN'
             """),
-            {"id": attempt_id, "payment_hash": payment_hash, "routing_fee_sats": body.routing_fee_sats, "settled_at": now(), "updated_at": now()},
+            {"id": attempt_id, "payment_hash": payment_hash, "routing_fee_sats": body.routing_fee_sats,
+             "audit": f"manual settlement: {audit_reason}", "settled_at": now(), "updated_at": now()},
         )
         if reconciled.rowcount != 1:
             raise HTTPException(409, "payment attempt was concurrently reconciled")
         updated = c.execute(
             text("""
                 UPDATE payouts SET state='SETTLED', status='paid', payment_hash=:payment_hash, settled_at=:settled_at
-                WHERE id=:id AND state IN ('PAYING','CANCEL_PENDING')
+                WHERE id=:id AND state IN ('PAYING','CANCEL_PENDING') AND payment_provider=:rail
             """),
-            {"id": payout["id"], "payment_hash": payment_hash, "settled_at": now()},
+            {"id": payout["id"], "rail": attempt["rail"], "payment_hash": payment_hash, "settled_at": now()},
         )
         if updated.rowcount != 1:
             raise HTTPException(409, "payout was concurrently reconciled")
@@ -2568,6 +2711,15 @@ def execute_payout(
     require_payout_admin_key(authorization)
     if not lightning_payouts_enabled():
         raise HTTPException(503, "Lightning payouts are disabled")
+    try:
+        rail = configured_payment_rail()
+    except RuntimeError as exc:
+        raise HTTPException(503, safe_text(str(exc), 300)) from exc
+    rail_name = safe_text(getattr(rail, "name", "unknown"), 50).lower()
+    if rail_name not in {"nwc", "blink", "fake"}:
+        raise HTTPException(503, "configured payment rail is not supported")
+    if rail_name == "blink":
+        raise HTTPException(503, "Blink payment execution is disabled pending provider idempotency guarantees")
     init_db()
     with engine().connect() as c:
         payout = asdict(c.execute(text("""
@@ -2632,7 +2784,7 @@ def execute_payout(
             text(
                 """
                 UPDATE payouts
-                SET status='processing', state='PAYING', payment_provider='nwc', attempt_count=attempt_count+1,
+                SET status='processing', state='PAYING', payment_provider=:rail, attempt_count=attempt_count+1,
                     processing_started_at=:started_at, last_error=NULL
                 WHERE id=:id AND state IN ('PAYABLE', 'FAILED')
                   AND reserved_sats >= amount_sats + fee_sats
@@ -2642,7 +2794,7 @@ def execute_payout(
                   )
                 """
             ),
-            {"id": payout_id, "started_at": now()},
+            {"id": payout_id, "rail": rail_name, "started_at": now()},
         )
         if claimed.rowcount != 1:
             raise HTTPException(409, "payout could not be claimed for processing")
@@ -2651,12 +2803,13 @@ def execute_payout(
                 INSERT INTO payment_attempts
                 (id, payout_id, kind, rail, idempotency_key, destination, amount_sats,
                  status, attempt_number, created_at, updated_at)
-                VALUES (:id, :payout_id, 'commission', 'nwc', :idempotency_key, :destination,
+                VALUES (:id, :payout_id, 'commission', :rail, :idempotency_key, :destination,
                         :amount_sats, 'PAYING', :attempt_number, :created_at, :updated_at)
             """),
             {
                 "id": attempt_id,
                 "payout_id": payout_id,
+                "rail": rail_name,
                 "idempotency_key": idempotency_key,
                 "destination": payout["lightning_address"],
                 "amount_sats": payout["amount_sats"],
@@ -2665,39 +2818,117 @@ def execute_payout(
                 "updated_at": now(),
             },
         )
-    try:
-        invoice, expected_hash = asyncio.run(prepare_lnurl_payment(payout["lightning_address"], payout["amount_sats"]))
-        with engine().begin() as c:
-            stored = c.execute(
-                text(
-                    """
+    if isinstance(rail, NwcPaymentRail):
+        async def record_prepared_evidence(invoice: str, payment_hash: str) -> None:
+            if not invoice or not valid_payment_hash(payment_hash):
+                raise LightningPaymentError("prepared NWC evidence is invalid")
+            with engine().begin() as c:
+                latest_id = c.execute(text("""
+                    SELECT id FROM payment_attempts WHERE payout_id=:payout_id AND kind='commission'
+                    ORDER BY attempt_number DESC, created_at DESC LIMIT 1
+                """), {"payout_id": payout_id}).scalar_one_or_none()
+                if latest_id != attempt_id:
+                    raise LightningPaymentError("NWC attempt ownership was lost before payment")
+                attempt_recorded = c.execute(text("""
+                    UPDATE payment_attempts SET payment_hash=:payment_hash, updated_at=:updated_at
+                    WHERE id=:attempt_id AND payout_id=:payout_id AND rail='nwc' AND status='PAYING'
+                """), {"attempt_id": attempt_id, "payout_id": payout_id, "payment_hash": payment_hash.lower(), "updated_at": now()})
+                payout_recorded = c.execute(text("""
                     UPDATE payouts SET bolt11_invoice=:invoice, payment_hash=:payment_hash
-                    WHERE id=:id AND state='PAYING' AND payment_provider='nwc'
-                    """
-                ),
-                {"id": payout_id, "invoice": invoice, "payment_hash": expected_hash},
-            )
-            if stored.rowcount != 1:
-                raise LightningPaymentError("payout lost its processing claim before payment")
-            c.execute(
-                text("UPDATE payment_attempts SET payment_hash=:payment_hash, updated_at=:updated_at WHERE id=:id AND status='PAYING'"),
-                {"id": attempt_id, "payment_hash": expected_hash, "updated_at": now()},
-            )
-        result = asyncio.run(pay_nwc_invoice(invoice, expected_hash))
-    except LightningPaymentError as exc:
-        failed_status = "payment_unknown" if exc.payment_may_have_succeeded else "failed"
-        attempt_status = "UNKNOWN" if exc.payment_may_have_succeeded else "FAILED"
-        payout_state = "PAYING" if exc.payment_may_have_succeeded else "FAILED"
+                    WHERE id=:payout_id AND state='PAYING' AND status='processing'
+                      AND payment_provider='nwc' AND reserved_sats >= amount_sats + fee_sats
+                      AND EXISTS (
+                        SELECT 1 FROM conversions
+                        WHERE conversions.id=payouts.conversion_id AND conversions.status!='reversed'
+                      )
+                """), {"payout_id": payout_id, "invoice": invoice, "payment_hash": payment_hash.lower()})
+                if attempt_recorded.rowcount != 1 or payout_recorded.rowcount != 1:
+                    raise LightningPaymentError("NWC attempt ownership or reservation was lost before payment")
+        rail.set_prepared_evidence_recorder(record_prepared_evidence)
+    try:
+        result = asyncio.run(rail.pay_to_lightning_address(
+            payout["lightning_address"],
+            int(payout["amount_sats"]),
+            f"Meerat affiliate reward {payout_id}",
+            idempotency_key,
+        ))
+    except PaymentRailAmbiguousError as exc:
+        error = safe_text(str(exc), 500)
         with engine().begin() as c:
-            c.execute(
-                text("UPDATE payment_attempts SET status=:status, error=:error, updated_at=:updated_at WHERE id=:id AND status='PAYING'"),
-                {"id": attempt_id, "status": attempt_status, "error": safe_text(str(exc), 500), "updated_at": now()},
-            )
-            payout_updated = c.execute(
-                text("UPDATE payouts SET status=:status, state=:state, last_error=:error WHERE id=:id AND state='PAYING'"),
-                {"id": payout_id, "status": failed_status, "state": payout_state, "error": safe_text(str(exc), 500)},
-            )
-            if not exc.payment_may_have_succeeded and payout_updated.rowcount == 0:
+            c.execute(text("""
+                UPDATE payment_attempts
+                SET status='UNKNOWN', payment_hash=:payment_hash, provider_reference=:provider_reference,
+                    error=:error, retryable=0, updated_at=:updated_at
+                WHERE id=:id AND status='PAYING'
+            """), {
+                "id": attempt_id,
+                "payment_hash": exc.payment_hash,
+                "provider_reference": exc.provider_reference,
+                "error": error,
+                "updated_at": now(),
+            })
+            c.execute(text("""
+                UPDATE payouts SET status='payment_unknown', state='PAYING',
+                    payment_hash=COALESCE(:payment_hash, payment_hash), last_error=:error
+                WHERE id=:id AND state='PAYING'
+            """), {"id": payout_id, "payment_hash": exc.payment_hash, "error": error})
+        raise HTTPException(502, error) from exc
+    except Exception as exc:
+        error = "payment rail failed unexpectedly; manual reconciliation required"
+        with engine().begin() as c:
+            c.execute(text("""
+                UPDATE payment_attempts SET status='UNKNOWN', error=:error, retryable=0, updated_at=:updated_at
+                WHERE id=:id AND status='PAYING'
+            """), {"id": attempt_id, "error": error, "updated_at": now()})
+            c.execute(text("""
+                UPDATE payouts SET status='payment_unknown', state='PAYING', last_error=:error
+                WHERE id=:id AND state='PAYING'
+            """), {"id": payout_id, "error": error})
+        raise HTTPException(502, error) from exc
+
+    if result.status == PaymentStatus.PENDING:
+        with engine().begin() as c:
+            c.execute(text("""
+                UPDATE payment_attempts
+                SET status='UNKNOWN', payment_hash=:payment_hash, provider_reference=:provider_reference,
+                    routing_fee_sats=:routing_fee_sats, error='provider payment pending reconciliation',
+                    retryable=0, updated_at=:updated_at
+                WHERE id=:id AND status='PAYING'
+            """), {
+                "id": attempt_id,
+                "payment_hash": result.payment_hash,
+                "provider_reference": result.provider_reference,
+                "routing_fee_sats": result.fee_paid_sats,
+                "updated_at": now(),
+            })
+            c.execute(text("""
+                UPDATE payouts SET status='payment_unknown', state='PAYING',
+                    payment_hash=COALESCE(:payment_hash, payment_hash), last_error='provider payment pending reconciliation'
+                WHERE id=:id AND state='PAYING'
+            """), {"id": payout_id, "payment_hash": result.payment_hash})
+        raise HTTPException(202, "payment pending; reconciliation required")
+
+    if result.status == PaymentStatus.FAILURE:
+        error = safe_text(result.error or "payment rail rejected the payment", 500)
+        with engine().begin() as c:
+            c.execute(text("""
+                UPDATE payment_attempts
+                SET status='FAILED', provider_reference=:provider_reference, error=:error,
+                    error_code=:error_code, retryable=:retryable, updated_at=:updated_at
+                WHERE id=:id AND status='PAYING'
+            """), {
+                "id": attempt_id,
+                "provider_reference": result.provider_reference,
+                "error": error,
+                "error_code": result.error_code,
+                "retryable": 1 if result.retryable else 0,
+                "updated_at": now(),
+            })
+            payout_updated = c.execute(text("""
+                UPDATE payouts SET status='failed', state='FAILED', last_error=:error
+                WHERE id=:id AND state='PAYING'
+            """), {"id": payout_id, "error": error})
+            if payout_updated.rowcount == 0:
                 current = asdict(c.execute(text("""
                     SELECT p.*, v.campaign_id, v.status AS conversion_status
                     FROM payouts p JOIN conversions v ON v.id=p.conversion_id WHERE p.id=:id
@@ -2710,52 +2941,82 @@ def execute_payout(
                         int(current.get("reserved_sats") or 0),
                         movement="inflight_reversal_release",
                     )
-                    c.execute(
-                        text("""
-                            UPDATE payouts SET status='reversed', state='CANCELLED', fee_state='CANCELLED',
-                                reserved_sats=0, last_error=:error WHERE id=:id AND state='CANCEL_PENDING'
-                        """),
-                        {"id": payout_id, "error": safe_text(str(exc), 500)},
-                    )
-        raise HTTPException(502, str(exc)) from exc
+                    c.execute(text("""
+                        UPDATE payouts SET status='reversed', state='CANCELLED', fee_state='CANCELLED',
+                            reserved_sats=0, last_error=:error WHERE id=:id AND state='CANCEL_PENDING'
+                    """), {"id": payout_id, "error": error})
+        raise HTTPException(502, error)
+
+    payment_hash = str(result.payment_hash or "").lower()
+    prepared_hash = None
+    with engine().connect() as c:
+        prepared_hash = c.execute(text("SELECT payment_hash FROM payment_attempts WHERE id=:id"), {"id": attempt_id}).scalar_one_or_none()
+    hash_mismatch = bool(prepared_hash and valid_payment_hash(prepared_hash) and not hmac.compare_digest(str(prepared_hash).lower(), payment_hash))
+    if result.status != PaymentStatus.SUCCESS or not valid_payment_hash(payment_hash) or hash_mismatch:
+        error = "payment rail returned invalid or mismatched success evidence; manual reconciliation required"
+        with engine().begin() as c:
+            attempt_changed = c.execute(text("""
+                UPDATE payment_attempts SET status='UNKNOWN', error=:error, retryable=0, updated_at=:updated_at
+                WHERE id=:id AND status='PAYING'
+            """), {"id": attempt_id, "error": error, "updated_at": now()})
+            payout_changed = c.execute(text("""
+                UPDATE payouts SET status='payment_unknown', state='PAYING', last_error=:error
+                WHERE id=:id AND state='PAYING' AND payment_provider=:rail
+            """), {"id": payout_id, "rail": rail_name, "error": error})
+            if attempt_changed.rowcount != 1 or payout_changed.rowcount != 1:
+                raise HTTPException(409, "invalid provider result raced with reconciliation")
+        raise HTTPException(502, error)
+    result_payment_hash = payment_hash
     # Payment evidence is committed before Nostr proof construction/publication.
+    fees_paid_msats = result.fee_paid_msats
+    if fees_paid_msats is None and result.fee_paid_sats is not None:
+        fees_paid_msats = int(result.fee_paid_sats) * 1000
     with engine().begin() as c:
+        routing_fee_sats = result.fee_paid_sats
+        attempt_recorded = c.execute(
+            text("""
+                UPDATE payment_attempts
+                SET status='SETTLED', payment_hash=:payment_hash, provider_reference=:provider_reference,
+                    routing_fee_sats=:routing_fee_sats, error=NULL, error_code=NULL, retryable=0,
+                    settled_at=:settled_at, updated_at=:updated_at
+                WHERE id=:id AND status='PAYING'
+            """),
+            {
+                "id": attempt_id,
+                "payment_hash": result_payment_hash,
+                "provider_reference": result.provider_reference,
+                "routing_fee_sats": routing_fee_sats,
+                "settled_at": now(),
+                "updated_at": now(),
+            },
+        )
         recorded = c.execute(
             text(
                 """
                 UPDATE payouts
                 SET status='paid', state='SETTLED', payment_hash=:payment_hash, fees_paid_msats=:fees_paid_msats,
                     paid_at=:paid_at, settled_at=:settled_at, last_error=NULL
-                WHERE id=:id AND state IN ('PAYING','CANCEL_PENDING') AND payment_provider='nwc'
+                WHERE id=:id AND state IN ('PAYING','CANCEL_PENDING') AND payment_provider=:rail
                 """
             ),
             {
                 "id": payout_id,
-                "payment_hash": result.payment_hash,
-                "fees_paid_msats": result.fees_paid_msats,
+                "rail": rail_name,
+                "payment_hash": result_payment_hash,
+                "fees_paid_msats": fees_paid_msats,
                 "paid_at": now(),
                 "settled_at": now(),
             },
         )
-        if recorded.rowcount != 1:
-            raise HTTPException(500, "payment succeeded but payout state could not be recorded; manual reconciliation required")
-        routing_fee_sats = None if result.fees_paid_msats is None else (int(result.fees_paid_msats) + 999) // 1000
-        c.execute(
-            text("""
-                UPDATE payment_attempts
-                SET status='SETTLED', payment_hash=:payment_hash, routing_fee_sats=:routing_fee_sats,
-                    error=NULL, settled_at=:settled_at, updated_at=:updated_at
-                WHERE id=:id AND status='PAYING'
-            """),
-            {"id": attempt_id, "payment_hash": result.payment_hash, "routing_fee_sats": routing_fee_sats, "settled_at": now(), "updated_at": now()},
-        )
+        if attempt_recorded.rowcount != 1 or recorded.rowcount != 1:
+            raise HTTPException(409, "payment succeeded but current attempt ownership was lost; manual reconciliation required")
     finalized = finalize_payout_paid(
         payout_id,
-        result.payment_hash,
-        "Lightning payout paid via Alby Hub NWC",
+        result_payment_hash,
+        f"Lightning payout paid via {rail_name}",
         sandbox=False,
-        provider="nwc",
-        fees_paid_msats=result.fees_paid_msats,
+        provider=rail_name,
+        fees_paid_msats=fees_paid_msats,
     )
     apply_existing_reversal_for_payout(payout_id)
     finalized["attempt_id"] = attempt_id

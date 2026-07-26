@@ -18,7 +18,7 @@ FEE_STATES = {"FEE_PENDING", "FEE_PAYING", "FEE_SETTLED", "FEE_FAILED", "CANCELL
 ATTEMPT_KINDS = {"commission", "fee"}
 ATTEMPT_STATUSES = {"PAYING", "SETTLED", "FAILED", "UNKNOWN"}
 ACTIVE_ATTEMPT_STATUSES = {"PAYING", "UNKNOWN"}
-RAILS = {"nwc", "blink", "sandbox"}
+RAILS = {"nwc", "blink", "fake", "sandbox"}
 
 
 def calculate_fee_sats(commission_sats: int, fee_bps: int, minimum_sats: int) -> int:

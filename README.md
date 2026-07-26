@@ -12,7 +12,7 @@ Minimal proof-of-concept for a Nostr-powered affiliate network:
 - Conversion proof events with hashed click/order IDs
 - Relay publication status stored in Postgres
 - Lightning payout settlement proofs and reversal proofs
-- Merchant-direct campaign budgets, balanced ledger entries, and crash-safe payment attempts
+- Merchant-direct campaign budgets, balanced ledger entries, crash-safe payment attempts, and provider-independent payment rails
 
 Events are now real Nostr events signed with Schnorr keys via `nostr-sdk`. If `NOSTR_PUBLISH=true`, the app publishes campaign, enrollment, and conversion proof events to configured public relays.
 
@@ -66,8 +66,10 @@ python scripts/e2e.py
 - `POST /admin/payouts/{payout_id}/release-hold` — reserve a held obligation after top-up
 - `GET /admin/payouts/{payout_id}/attempts` — private attempt history without preimages
 - `GET /admin/payouts/{payout_id}/ledger` — balanced accounting entries
-- `POST /admin/payouts/{payout_id}/execute` — atomically claim and execute via the configured NWC wallet
+- `POST /admin/payouts/{payout_id}/execute` — atomically claim and execute via the explicitly configured payment rail
+- `GET /admin/payment-rail/balance` — read-only balance for rails that support it
 - `GET /admin/payment-attempts/recovery` — stale `PAYING`/`UNKNOWN` attempts requiring reconciliation
+- `POST /admin/payment-attempts/{attempt_id}/refresh` — provider lookup for an existing attempt; never sends a payment
 - `POST /admin/payment-attempts/{attempt_id}/reconcile` — settle or fail an ambiguous attempt without repaying
 - `GET /nostr/events/{event_id}`
 - `POST /demo`
@@ -96,6 +98,14 @@ Public payout responses use a strict allowlist. Wallet destinations, BOLT11 invo
 
 See [`docs/payment-ledger-sprint2.md`](docs/payment-ledger-sprint2.md) for state transitions, recovery invariants, tables, and admin operations.
 
+## PaymentRail and adapters
+
+Sprint 3 routes execution through a provider-independent `PaymentRail`. `FakePaymentRail` gives deterministic success, failure, pending and recovery scenarios without network access; `NwcPaymentRail` preserves the existing LNURL + Alby Hub NWC path; and `BlinkAdapter` provides an opt-in GraphQL boundary with staging as its default endpoint. A provider `PENDING` result or ambiguous exception remains `UNKNOWN` and is never automatically repaid.
+
+Real rails remain disabled globally unless `LIGHTNING_PAYOUTS_ENABLED=true`, and `/execute` still requires payout-admin authorization plus every budget, return-window, reversal and amount guard. Merely configuring Blink credentials cannot trigger a payment. Sprint 3 does not execute the separate Meerat fee obligation.
+
+See [`docs/payment-rails-sprint3.md`](docs/payment-rails-sprint3.md) for the contract, adapter configuration, recovery behavior and safety invariants.
+
 ## Railway
 
 Railway can run this via the included `Procfile`:
@@ -122,6 +132,14 @@ Recommended environment variables:
 - `MEERAT_FEE_BPS`: separate merchant-paid Meerat fee in basis points. Default: `1000` (10%).
 - `FEE_MIN_SATS`: minimum Meerat fee when the basis-point fee is non-zero. Default: `10`.
 - `DEFAULT_RETURN_WINDOW_DAYS`: delay metadata before a payout is eligible. Default: `0` for the POC.
+- `LIGHTNING_PAYOUTS_ENABLED`: global real/fake rail execution gate. Defaults to `false`.
+- `LIGHTNING_MAX_PAYOUT_SATS`: hard maximum for one admin-triggered affiliate payment.
+- `PAYMENT_RAIL`: `nwc` (default), `fake`, or `blink`.
+- `ALLOW_FAKE_PAYMENT_RAIL`: must also be `true` before `PAYMENT_RAIL=fake` can execute.
+- `NWC_CONNECTION_URI`: private NWC connection used only by the `nwc` adapter.
+- `BLINK_API_KEY`: private Blink API key; required only when `PAYMENT_RAIL=blink`.
+- `BLINK_WALLET_ID`: dedicated merchant BTC wallet id for Blink.
+- `BLINK_GRAPHQL_URL`: Blink GraphQL endpoint; defaults to `https://api.staging.blink.sv/graphql`.
 
 ## Merchant tracking snippet
 

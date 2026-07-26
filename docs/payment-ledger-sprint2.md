@@ -58,7 +58,7 @@ An `UNKNOWN` attempt means the payment may have succeeded. The system will not c
 One immutable attempt identity per payout, kind, and attempt number:
 
 - `kind`: `commission` or `fee`
-- `rail`: currently `nwc` or `sandbox`; adapters may add `blink`
+- `rail`: `nwc`, `blink`, `fake`, or `sandbox`
 - stable SHA-256 `idempotency_key`
 - private destination and optional private preimage
 - amount, payment hash, routing fee, error, timestamps
@@ -88,6 +88,7 @@ GET  /admin/payouts/{payout_id}/attempts
 GET  /admin/payouts/{payout_id}/ledger
 POST /admin/payouts/{payout_id}/execute
 GET  /admin/payment-attempts/recovery?older_than_seconds=60
+POST /admin/payment-attempts/{attempt_id}/refresh
 POST /admin/payment-attempts/{attempt_id}/reconcile
 ```
 
@@ -108,7 +109,7 @@ The `SETTLED` path records durable payment evidence and publishes the existing k
 ## Crash-recovery invariants
 
 1. The payout claim and creation of the `PAYING` attempt commit in one database transaction.
-2. Invoice/payment-hash evidence is stored before calling NWC.
+2. The durable attempt and its idempotency key are stored before calling any payment rail. NWC may prepare a private invoice inside its adapter; Blink can pay a Lightning Address directly.
 3. Wallet success is stored as `SETTLED` before proof publication.
 4. If proof publication fails, retry publishes the proof only and never pays again.
 5. If the worker disappears during a provider call, the stale `PAYING` attempt appears in the recovery endpoint.
