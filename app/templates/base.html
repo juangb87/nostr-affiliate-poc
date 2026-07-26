@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#151615">
+  <title>{% block title %}Meerat{% endblock %}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&family=Unbounded:wght@600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+<a class="skip-link" href="#main">Saltar al contenido</a>
+<div class="mobile-bar">
+  <div class="mobile-top">
+    <a class="brand" href="/app">Meerat<span class="brand-dot">.</span></a>
+    <div class="mobile-account"><code title="{{ account.npub }}">{{ account.npub_short }}</code><button class="link-button" type="button" data-logout>Cerrar sesión</button></div>
+  </div>
+  <nav aria-label="Navegación móvil">
+    {% for item in nav %}<a href="{{ item.href }}" {% if item.active %}aria-current="page"{% endif %}>{{ item.label }}</a>{% endfor %}
+  </nav>
+</div>
+<div class="app-shell">
+  <aside class="sidebar">
+    <a class="brand" href="/app">Meerat<span class="brand-dot">.</span></a>
+    <div class="account-chip">
+      <small>{{ role_label }}</small>
+      <code title="{{ account.npub }}">{{ account.npub_short }}</code>
+    </div>
+    <nav class="nav" aria-label="Navegación principal">
+      {% for item in nav %}<a href="{{ item.href }}" {% if item.active %}aria-current="page"{% endif %}>{{ item.label }}</a>{% endfor %}
+    </nav>
+    <div class="sidebar-footer"><button class="link-button" type="button" data-logout>Cerrar sesión</button></div>
+  </aside>
+  <main class="main" id="main"><div class="content">{% block content %}{% endblock %}</div></main>
+</div>
+<div class="sr-only" role="status" aria-live="polite" data-global-status></div>
+</body>
+</html>

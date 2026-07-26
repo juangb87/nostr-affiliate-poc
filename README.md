@@ -23,7 +23,7 @@ pip install -r requirements.txt
 uvicorn app.main:app --reload
 ```
 
-Open http://localhost:8000/dashboard for the interactive dashboard, or use:
+Open http://localhost:8000/app for the account experience, or use:
 
 ```bash
 python scripts/e2e.py
@@ -31,8 +31,17 @@ python scripts/e2e.py
 
 ## API
 
-- `GET /dashboard`
-- `GET /dashboard/data`
+- `GET /app` — Nostr account entry and role selection
+- `GET /app/merchant` — authenticated, merchant-scoped workspace
+- `GET /app/affiliate` — authenticated, affiliate-scoped workspace
+- `GET /ops` — operator-only technical dashboard
+- `GET /ops/data` — operator-only global dashboard data
+- `GET /dashboard` — compatibility redirect to `/ops`
+- `GET /dashboard/data` — compatibility redirect to `/ops/data`
+- `POST /auth/nostr/challenge` — one-use Nostr login challenge
+- `POST /auth/nostr/verify` — verify a signed challenge and create an opaque session
+- `GET /auth/me` — safe current-account summary
+- `POST /auth/logout` — revoke the current session
 - `GET /bb.js` — lightweight tracking snippet that captures `bb_click_id`/`bb_ref`
 - `POST /v1/events` — public browser-side landing/page-view tracker for merchant storefronts
 - `POST /v1/conversions` — public browser/pixel conversion signal logger; use `/merchant/conversions` for payout-grade server-side proofs
@@ -119,13 +128,18 @@ Recommended environment variables:
 - `BASE_URL`: public Railway URL
 - `DEFAULT_DESTINATION_URL`: merchant checkout URL used for redirect links
 - `DATABASE_URL`: defaults to `sqlite:///./data/poc.db`; supports Railway Postgres URLs (`postgres://...`) for persistence
-- `NOSTR_PRIVATE_KEY`: hex or `nsec...` private key used to sign events
+- `NOSTR_PRIVATE_KEY`: dedicated backend hex or `nsec...` private key used to sign events
+- `APP_SECRET`: stable random secret of at least 32 characters; never use the development default in production
 - `NOSTR_PUBLISH`: set to `true` to publish to relays
 - `NOSTR_RELAYS`: comma-separated relay URLs. Default: `wss://nos.lol,wss://relay.damus.io,wss://relay.primal.net`
 - `MERCHANT_API_KEYS`: comma-separated bearer tokens accepted by `/merchant/conversions`.
 - `SHOPIFY_SECRET`: Shopify app client secret used to verify webhook HMAC signatures.
 - `SHOPIFY_WEBHOOK_SECRET`: optional dedicated override for webhook verification; when omitted, `SHOPIFY_SECRET` is used.
 - `SHOPIFY_STORE_DOMAIN`: permanent `*.myshopify.com` domain accepted in signed webhook headers.
+- `SHOPIFY_MERCHANT_PUBKEY`: merchant identity assigned to authoritative Shopify conversions.
+- `OPS_NOSTR_PUBKEYS`: comma-separated Nostr pubkeys authorized for `/ops`.
+- `MERCHANT_ACCOUNT_BINDINGS`: comma-separated `owner_pubkey:merchant_pubkey` ownership pairs.
+- `ENABLE_LEGACY_DEMO_MUTATIONS`: explicit opt-in for legacy setup/demo mutations; keep `false` in production.
 - `SATS_PER_USD`: server-side USD→sats conversion rate used only when merchant reports `currency: "USD"`. Default: `2500`.
 - `PAYOUT_ADMIN_KEY`: bearer secret required by budget, attempt, ledger, recovery, reconciliation, and payout execution endpoints.
 - `DEFAULT_CAMPAIGN_BUDGET_SATS`: initial internal cap for campaigns without an explicit admin budget. Default: `1000000`.
@@ -168,7 +182,7 @@ Then submit the checkout form to simulate a paid order and trigger the conversio
 
 ```bash
 curl -X POST "$BASE_URL/merchant/conversions" \
-  -H "Authorization: Bearer bumbei-demo-key" \
+  -H "Authorization: Bearer <merchant-api-key>" \
   -H "Content-Type: application/json" \
   -d '{
     "order_id": "order_123",

@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#151615">
+  <title>Entrar · Meerat</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&family=Unbounded:wght@600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/app.css"><script src="/static/app.js" defer></script>
+</head>
+<body><main class="login-shell"><section class="login-card" aria-labelledby="login-title">
+  <a class="brand" href="/">Meerat<span class="brand-dot">.</span></a>
+  <p class="eyebrow" style="margin-top:42px">Tu red de afiliados, verificable</p>
+  <h1 id="login-title">Entrá con tu identidad Nostr.</h1>
+  <p class="lede">Sin contraseñas ni claves privadas compartidas. Tu extensión firma un desafío de un solo uso y Meerat crea una sesión segura.</p>
+  <div class="notice"><div><strong>Acceso por invitación durante el POC.</strong><p>Tu identidad Nostr debe estar asociada previamente a un merchant o a una inscripción de afiliado.</p></div></div>
+  <div class="role-grid">
+    {% if requested_role in [None, '', 'merchant'] %}<button class="role-card" type="button" data-login-role="merchant"><strong>Merchant account</strong><span>Gestioná campañas, conversiones, afiliados y obligaciones de pago.</span></button>{% endif %}
+    {% if requested_role in [None, '', 'affiliate'] %}<button class="role-card" type="button" data-login-role="affiliate"><strong>Affiliate account</strong><span>Copiá tus links, seguí conversiones y verificá tus ganancias.</span></button>{% endif %}
+    {% if requested_role == 'ops' %}<button class="role-card" type="button" data-login-role="ops"><strong>Operations</strong><span>Acceso restringido a diagnóstico, pruebas y operaciones técnicas.</span></button>{% endif %}
+  </div>
+  <p class="login-status" data-login-status aria-live="polite">Usá una extensión compatible con NIP-07, como Alby.</p>
+  <div class="notice"><div><strong>Meerat nunca solicita tu nsec.</strong><p>La firma no mueve fondos ni autoriza pagos.</p></div></div>
+</section></main></body></html>

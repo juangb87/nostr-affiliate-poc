@@ -10,6 +10,7 @@ import os
 import secrets
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 from app.nostr_kinds import (
@@ -25,9 +26,21 @@ from app.nostr_kinds import (
 )
 from fastapi import BackgroundTasks, Cookie, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from nostr_sdk import Client, EventBuilder, Keys, Kind, PublicKey, RelayUrl, Tag
+from app.account_auth import (
+    SESSION_COOKIE,
+    digest as auth_digest,
+    normalize_role,
+    parse_iso,
+    parse_merchant_bindings,
+    parse_pubkey_set,
+    random_token,
+    verify_auth_event,
+)
 from app.lightning import LightningPaymentError, pay_nwc_invoice, prepare_lnurl_payment
 from app.payment_rails import (
     NwcPaymentRail,
@@ -36,6 +49,7 @@ from app.payment_rails import (
     build_payment_rail,
 )
 from app.payment_state import calculate_fee_sats, payment_idempotency_key
+from app.workspaces import affiliate_workspace_data, merchant_workspace_data, short as workspace_short
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
@@ -51,8 +65,12 @@ DEFAULT_AFFILIATE_NPUB = "npub16ghkhw9d4g9x6pxp6l6dtyjqaeuavwucrq8gpkt60x0kx9fzq
 app = FastAPI(
     title="Nostr Affiliate POC",
     description="MVP: Nostr affiliate proofs, durable ledger, and provider-independent Lightning payment rails.",
-    version="0.9.0",
+    version="1.0.0",
 )
+
+APP_DIR = Path(__file__).resolve().parent
+templates = Jinja2Templates(directory=str(APP_DIR / "templates"))
+app.mount("/static", StaticFiles(directory=str(APP_DIR / "static")), name="static")
 
 
 def tracking_cors_origins() -> list[str]:
@@ -74,6 +92,27 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization"],
 )
+
+LEGACY_DEMO_MUTATION_PATHS = {
+    "/campaigns",
+    "/enrollments",
+    "/conversions",
+    "/clicks/simulate",
+    "/demo",
+    "/demo-merchant/checkout",
+}
+
+
+def legacy_demo_mutations_enabled() -> bool:
+    explicit = os.getenv("ENABLE_LEGACY_DEMO_MUTATIONS")
+    return bool(explicit and explicit.lower() in {"1", "true", "yes", "on"})
+
+
+@app.middleware("http")
+async def protect_legacy_demo_mutations(request: Request, call_next: Any) -> Response:
+    if request.method == "POST" and request.url.path in LEGACY_DEMO_MUTATION_PATHS and not legacy_demo_mutations_enabled():
+        return JSONResponse({"detail": "legacy demo mutations are disabled"}, status_code=404)
+    return await call_next(request)
 
 _ENGINE: Engine | None = None
 _ENGINE_URL: str | None = None
@@ -215,18 +254,41 @@ def nostr_publish_enabled() -> bool:
 
 
 def merchant_api_keys() -> set[str]:
-    raw = os.getenv("MERCHANT_API_KEYS", "bumbei-demo-key")
+    raw = os.getenv("MERCHANT_API_KEYS", "")
     return {k.strip() for k in raw.split(",") if k.strip()}
 
 
+def configured_merchant_pubkey_hex() -> str:
+    raw = os.getenv("SHOPIFY_MERCHANT_PUBKEY", "").strip()
+    if not raw:
+        raise HTTPException(503, "merchant identity is not configured")
+    try:
+        return PublicKey.parse(raw).to_hex()
+    except Exception as exc:
+        raise HTTPException(503, "configured merchant identity is invalid") from exc
+
+
 def require_merchant_api_key(authorization: Optional[str]) -> str:
+    valid_keys = merchant_api_keys()
+    if not valid_keys:
+        raise HTTPException(503, "merchant API authentication is not configured")
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(401, "missing Bearer merchant API key")
     token = authorization.split(" ", 1)[1].strip()
-    for valid in merchant_api_keys():
+    for valid in valid_keys:
         if secrets.compare_digest(token, valid):
-            return token
+            return configured_merchant_pubkey_hex()
     raise HTTPException(403, "invalid merchant API key")
+
+
+def require_merchant_ownership(record: dict[str, Any], authorized_merchant_hex: str) -> None:
+    candidate = record.get("merchant_pubkey_hex") or record.get("merchant_pubkey")
+    try:
+        record_merchant_hex = PublicKey.parse(str(candidate or "")).to_hex()
+    except Exception as exc:
+        raise HTTPException(500, "record has an invalid merchant identity") from exc
+    if not secrets.compare_digest(record_merchant_hex, authorized_merchant_hex):
+        raise HTTPException(403, "merchant API key cannot access this merchant")
 
 
 def require_payout_admin_key(authorization: Optional[str]) -> str:
@@ -273,11 +335,22 @@ def default_return_window_days() -> int:
     return max(0, int(os.getenv("DEFAULT_RETURN_WINDOW_DAYS", "0")))
 
 
+def validate_runtime_security() -> None:
+    if not database_url().startswith("postgresql"):
+        return
+    if not BASE_URL.startswith("https://"):
+        raise RuntimeError("BASE_URL must use https in production")
+    if not os.getenv("NOSTR_PRIVATE_KEY") and (APP_SECRET == "dev-secret-change-me" or len(APP_SECRET) < 32):
+        raise RuntimeError("production requires NOSTR_PRIVATE_KEY or a strong APP_SECRET")
+
+
 def nostr_keys() -> Keys:
     secret = os.getenv("NOSTR_PRIVATE_KEY")
     if secret:
         return Keys.parse(secret)
-    # Deterministic dev key for local tests only. Production should set NOSTR_PRIVATE_KEY.
+    if database_url().startswith("postgresql") and (APP_SECRET == "dev-secret-change-me" or len(APP_SECRET) < 32):
+        raise RuntimeError("refusing to derive a production Nostr key from an insecure APP_SECRET")
+    # Deterministic fallback is limited to tests/development or a strong production secret.
     derived = hashlib.sha256((APP_SECRET + ":nostr-dev-key").encode()).hexdigest()
     return Keys.parse(derived)
 
@@ -633,6 +706,51 @@ def init_db() -> None:
         error TEXT,
         created_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS accounts (
+        id TEXT PRIMARY KEY,
+        nostr_pubkey_hex TEXT UNIQUE NOT NULL,
+        npub TEXT UNIQUE NOT NULL,
+        display_name TEXT,
+        status TEXT NOT NULL DEFAULT 'active',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        last_login_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS account_roles (
+        account_id TEXT NOT NULL,
+        role TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (account_id, role)
+    );
+    CREATE TABLE IF NOT EXISTS auth_challenges (
+        id TEXT PRIMARY KEY,
+        challenge_hash TEXT UNIQUE NOT NULL,
+        client_hash TEXT,
+        role TEXT NOT NULL,
+        relay TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        consumed_at TEXT,
+        created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS account_sessions (
+        id TEXT PRIMARY KEY,
+        account_id TEXT NOT NULL,
+        role TEXT NOT NULL,
+        token_hash TEXT UNIQUE NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        revoked_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS merchant_account_links (
+        account_id TEXT NOT NULL,
+        merchant_pubkey_hex TEXT NOT NULL,
+        source TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (account_id, merchant_pubkey_hex)
+    );
+    CREATE INDEX IF NOT EXISTS idx_account_sessions_token ON account_sessions(token_hash, revoked_at, expires_at);
+    CREATE INDEX IF NOT EXISTS idx_merchant_account_links_account ON merchant_account_links(account_id);
     """
     if database_url().startswith("sqlite"):
         ddl = ddl.replace("id INTEGER PRIMARY KEY GENERATED BY DEFAULT AS IDENTITY", "id INTEGER PRIMARY KEY AUTOINCREMENT")
@@ -660,11 +778,13 @@ def init_db() -> None:
             c.execute(text("ALTER TABLE payment_attempts ADD COLUMN IF NOT EXISTS provider_reference TEXT"))
             c.execute(text("ALTER TABLE payment_attempts ADD COLUMN IF NOT EXISTS error_code TEXT"))
             c.execute(text("ALTER TABLE payment_attempts ADD COLUMN IF NOT EXISTS retryable INTEGER"))
+            c.execute(text("ALTER TABLE auth_challenges ADD COLUMN IF NOT EXISTS client_hash TEXT"))
         else:
             campaign_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(campaigns)")).fetchall()}
             enrollment_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(enrollments)")).fetchall()}
             payout_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(payouts)")).fetchall()}
             attempt_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(payment_attempts)")).fetchall()}
+            challenge_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(auth_challenges)")).fetchall()}
             if "merchant_pubkey_hex" not in campaign_cols:
                 c.execute(text("ALTER TABLE campaigns ADD COLUMN merchant_pubkey_hex TEXT"))
             if "affiliate_pubkey_hex" not in enrollment_cols:
@@ -695,6 +815,9 @@ def init_db() -> None:
                 c.execute(text("ALTER TABLE campaigns ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"))
             if "status" not in enrollment_cols:
                 c.execute(text("ALTER TABLE enrollments ADD COLUMN status TEXT NOT NULL DEFAULT 'approved'"))
+            if "client_hash" not in challenge_cols:
+                c.execute(text("ALTER TABLE auth_challenges ADD COLUMN client_hash TEXT"))
+        c.execute(text("CREATE INDEX IF NOT EXISTS idx_auth_challenges_rate ON auth_challenges(client_hash, created_at)"))
         c.execute(text("""
             UPDATE payouts SET state=CASE
                 WHEN status='paid' AND nostr_event_id IS NOT NULL THEN 'PUBLISHED'
@@ -880,6 +1003,7 @@ def release_campaign_budget(
 
 @app.on_event("startup")
 def startup() -> None:
+    validate_runtime_security()
     init_db()
 
 
@@ -995,6 +1119,14 @@ class ReversalIn(BaseModel):
     note: Optional[str] = None
 
 
+class AuthChallengeIn(BaseModel):
+    role: str
+
+
+class AuthVerifyIn(BaseModel):
+    event: dict[str, Any]
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     init_db()
@@ -1015,6 +1147,244 @@ def health() -> dict[str, Any]:
             "reversal": REVERSAL_KIND,
         },
     }
+
+
+def _auth_event_challenge(event_json: dict[str, Any]) -> str:
+    tags = event_json.get("tags") if isinstance(event_json, dict) else None
+    values = [tag[1] for tag in (tags or []) if isinstance(tag, list) and len(tag) >= 2 and tag[0] == "challenge"]
+    if len(values) != 1 or not isinstance(values[0], str) or not values[0]:
+        raise HTTPException(400, "authentication event requires exactly one challenge tag")
+    return values[0]
+
+
+def _grant_role_if_authorized(c: Any, account_id: str, pubkey_hex: str, role: str) -> bool:
+    authorized = False
+    if role == "affiliate":
+        authorized = bool(c.execute(text("SELECT 1 FROM enrollments WHERE affiliate_pubkey_hex=:hex OR affiliate_pubkey=:hex LIMIT 1"), {"hex": pubkey_hex}).fetchone())
+    elif role == "merchant":
+        direct = c.execute(text("SELECT 1 FROM campaigns WHERE merchant_pubkey_hex=:hex OR merchant_pubkey=:hex LIMIT 1"), {"hex": pubkey_hex}).fetchone()
+        authorized = bool(direct)
+        try:
+            bindings = parse_merchant_bindings(os.getenv("MERCHANT_ACCOUNT_BINDINGS", ""))
+        except ValueError as exc:
+            raise HTTPException(503, "merchant account binding configuration is invalid") from exc
+        c.execute(
+            text("DELETE FROM merchant_account_links WHERE account_id=:account_id AND source='environment_binding'"),
+            {"account_id": account_id},
+        )
+        for owner_hex, merchant_hex in bindings:
+            if owner_hex != pubkey_hex:
+                continue
+            exists = c.execute(text("SELECT 1 FROM campaigns WHERE merchant_pubkey_hex=:hex OR merchant_pubkey=:hex LIMIT 1"), {"hex": merchant_hex}).fetchone()
+            if not exists:
+                continue
+            authorized = True
+            c.execute(
+                text("""
+                    INSERT INTO merchant_account_links (account_id, merchant_pubkey_hex, source, created_at)
+                    VALUES (:account_id, :merchant_hex, 'environment_binding', :created_at)
+                    ON CONFLICT (account_id, merchant_pubkey_hex) DO NOTHING
+                """),
+                {"account_id": account_id, "merchant_hex": merchant_hex, "created_at": now()},
+            )
+    elif role == "ops":
+        try:
+            authorized = pubkey_hex in parse_pubkey_set(os.getenv("OPS_NOSTR_PUBKEYS", ""))
+        except ValueError as exc:
+            raise HTTPException(503, "operator allowlist configuration is invalid") from exc
+    if authorized:
+        c.execute(
+            text("""
+                INSERT INTO account_roles (account_id, role, created_at)
+                VALUES (:account_id, :role, :created_at)
+                ON CONFLICT (account_id, role) DO NOTHING
+            """),
+            {"account_id": account_id, "role": role, "created_at": now()},
+        )
+    return authorized
+
+
+def _session_account(request: Request, required_role: str | None = None) -> dict[str, Any] | None:
+    token = request.cookies.get(SESSION_COOKIE)
+    if not token:
+        return None
+    init_db()
+    with engine().begin() as c:
+        row = c.execute(
+            text("""
+                SELECT s.id AS session_id, s.account_id, s.role, s.expires_at,
+                       a.nostr_pubkey_hex, a.npub, a.display_name, a.status
+                FROM account_sessions s JOIN accounts a ON a.id=s.account_id
+                WHERE s.token_hash=:token_hash AND s.revoked_at IS NULL
+                LIMIT 1
+            """),
+            {"token_hash": auth_digest(token)},
+        ).fetchone()
+        session = asdict(row)
+        if not session or session["status"] != "active" or parse_iso(session["expires_at"]) <= datetime.now(timezone.utc):
+            return None
+        if required_role and session["role"] != required_role:
+            return None
+        if required_role and not _grant_role_if_authorized(c, session["account_id"], session["nostr_pubkey_hex"], required_role):
+            c.execute(text("UPDATE account_sessions SET revoked_at=:now WHERE id=:id"), {"now": now(), "id": session["session_id"]})
+            return None
+        c.execute(text("UPDATE account_sessions SET last_seen_at=:now WHERE id=:id"), {"now": now(), "id": session["session_id"]})
+        return session
+
+
+def require_account_session(request: Request, role: str) -> dict[str, Any]:
+    session = _session_account(request, role)
+    if not session:
+        raise HTTPException(401, f"{role} sign-in required")
+    return session
+
+
+@app.post("/auth/nostr/challenge", tags=["Accounts"])
+def create_auth_challenge(body: AuthChallengeIn, request: Request) -> dict[str, Any]:
+    try:
+        role = normalize_role(body.role)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    init_db()
+    challenge = random_token(32)
+    challenge_id = hid("chl")
+    created_at = datetime.now(timezone.utc)
+    expires_at = created_at + timedelta(minutes=3)
+    client_hash = hmac.new(APP_SECRET.encode(), _request_ip(request).encode(), hashlib.sha256).hexdigest()
+    cutoff = (created_at - timedelta(minutes=1)).isoformat()
+    with engine().begin() as c:
+        c.execute(text("DELETE FROM auth_challenges WHERE expires_at<:now"), {"now": created_at.isoformat()})
+        recent_client = int(
+            c.execute(
+                text("SELECT COUNT(*) FROM auth_challenges WHERE client_hash=:client_hash AND created_at>=:cutoff"),
+                {"client_hash": client_hash, "cutoff": cutoff},
+            ).scalar_one()
+        )
+        if recent_client >= 20:
+            raise HTTPException(429, "too many authentication challenges; retry shortly")
+        recent_global = int(
+            c.execute(
+                text("SELECT COUNT(*) FROM auth_challenges WHERE created_at>=:cutoff"),
+                {"cutoff": cutoff},
+            ).scalar_one()
+        )
+        if recent_global >= 3000:
+            raise HTTPException(429, "authentication service is busy; retry shortly")
+        c.execute(
+            text("""
+                INSERT INTO auth_challenges
+                (id, challenge_hash, client_hash, role, relay, expires_at, consumed_at, created_at)
+                VALUES (:id, :challenge_hash, :client_hash, :role, :relay, :expires_at, NULL, :created_at)
+            """),
+            {
+                "id": challenge_id,
+                "challenge_hash": auth_digest(challenge),
+                "client_hash": client_hash,
+                "role": role,
+                "relay": BASE_URL,
+                "expires_at": expires_at.isoformat(),
+                "created_at": created_at.isoformat(),
+            },
+        )
+    return {
+        "challenge": challenge,
+        "role": role,
+        "relay": BASE_URL,
+        "kind": 22242,
+        "expires_at": expires_at.isoformat(),
+    }
+
+
+@app.post("/auth/nostr/verify", tags=["Accounts"])
+def verify_auth_login(body: AuthVerifyIn, response: Response) -> dict[str, Any]:
+    challenge = _auth_event_challenge(body.event)
+    init_db()
+    session_token = random_token(32)
+    with engine().begin() as c:
+        challenge_row = asdict(c.execute(text("SELECT * FROM auth_challenges WHERE challenge_hash=:hash LIMIT 1"), {"hash": auth_digest(challenge)}).fetchone())
+        if not challenge_row:
+            raise HTTPException(404, "authentication challenge not found")
+        if challenge_row["consumed_at"]:
+            raise HTTPException(409, "authentication challenge was already used")
+        if parse_iso(challenge_row["expires_at"]) <= datetime.now(timezone.utc):
+            raise HTTPException(410, "authentication challenge expired")
+        try:
+            identity = verify_auth_event(
+                body.event,
+                expected_challenge=challenge,
+                expected_role=challenge_row["role"],
+                expected_relay=challenge_row["relay"],
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        consumed = c.execute(
+            text("UPDATE auth_challenges SET consumed_at=:now WHERE id=:id AND consumed_at IS NULL"),
+            {"now": now(), "id": challenge_row["id"]},
+        )
+        if consumed.rowcount != 1:
+            raise HTTPException(409, "authentication challenge was already used")
+
+        existing = asdict(c.execute(text("SELECT * FROM accounts WHERE nostr_pubkey_hex=:hex"), {"hex": identity["hex"]}).fetchone())
+        account_id = existing["id"] if existing else hid("acct")
+        timestamp = now()
+        if existing:
+            c.execute(text("UPDATE accounts SET npub=:npub, updated_at=:now, last_login_at=:now WHERE id=:id"), {"npub": identity["npub"], "now": timestamp, "id": account_id})
+        else:
+            c.execute(
+                text("""
+                    INSERT INTO accounts (id, nostr_pubkey_hex, npub, status, created_at, updated_at, last_login_at)
+                    VALUES (:id, :hex, :npub, 'active', :now, :now, :now)
+                """),
+                {"id": account_id, "hex": identity["hex"], "npub": identity["npub"], "now": timestamp},
+            )
+        role = challenge_row["role"]
+        if not _grant_role_if_authorized(c, account_id, identity["hex"], role):
+            raise HTTPException(403, f"this Nostr identity is not authorized as {role}")
+        session_id = hid("ses")
+        expires_at = (datetime.now(timezone.utc) + timedelta(hours=12)).isoformat()
+        c.execute(
+            text("""
+                INSERT INTO account_sessions (id, account_id, role, token_hash, created_at, expires_at, last_seen_at, revoked_at)
+                VALUES (:id, :account_id, :role, :token_hash, :now, :expires_at, :now, NULL)
+            """),
+            {
+                "id": session_id,
+                "account_id": account_id,
+                "role": role,
+                "token_hash": auth_digest(session_token),
+                "now": timestamp,
+                "expires_at": expires_at,
+            },
+        )
+    response.set_cookie(
+        SESSION_COOKIE,
+        session_token,
+        max_age=12 * 60 * 60,
+        httponly=True,
+        secure=BASE_URL.startswith("https://"),
+        samesite="lax",
+        path="/",
+    )
+    return {"ok": True, "account": {"npub": identity["npub"], "role": role}, "redirect": f"/app/{role}" if role != "ops" else "/ops"}
+
+
+@app.get("/auth/me", tags=["Accounts"])
+def auth_me(request: Request) -> dict[str, Any]:
+    session = _session_account(request)
+    if not session:
+        raise HTTPException(401, "not authenticated")
+    return {"authenticated": True, "account": {"npub": session["npub"], "role": session["role"], "display_name": session.get("display_name")}}
+
+
+@app.post("/auth/logout", tags=["Accounts"])
+def auth_logout(request: Request, response: Response) -> dict[str, Any]:
+    token = request.cookies.get(SESSION_COOKIE)
+    if token:
+        init_db()
+        with engine().begin() as c:
+            c.execute(text("UPDATE account_sessions SET revoked_at=:now WHERE token_hash=:hash AND revoked_at IS NULL"), {"now": now(), "hash": auth_digest(token)})
+    response.delete_cookie(SESSION_COOKIE, path="/", secure=BASE_URL.startswith("https://"), httponly=True, samesite="lax")
+    return {"ok": True}
 
 
 @app.post("/campaigns")
@@ -1081,7 +1451,7 @@ def update_campaign_status(
     body: CampaignStatusIn,
     authorization: Optional[str] = Header(None),
 ) -> dict[str, Any]:
-    require_merchant_api_key(authorization)
+    authorized_merchant_hex = require_merchant_api_key(authorization)
     init_db()
     status = body.status.strip().lower()
     if status not in CAMPAIGN_STATUSES:
@@ -1090,6 +1460,7 @@ def update_campaign_status(
         campaign = asdict(c.execute(text("SELECT * FROM campaigns WHERE id=:id"), {"id": campaign_id}).fetchone())
         if not campaign:
             raise HTTPException(404, "campaign not found")
+        require_merchant_ownership(campaign, authorized_merchant_hex)
         if campaign.get("status") == status:
             return {"ok": True, "duplicate": True, "campaign_id": campaign_id, "status": status, "nostr_event_id": campaign["nostr_event_id"], "nostr_event": json.loads(campaign["nostr_event_json"])}
         campaign["status"] = status
@@ -1152,7 +1523,7 @@ def update_enrollment_status(
     body: EnrollmentStatusIn,
     authorization: Optional[str] = Header(None),
 ) -> dict[str, Any]:
-    require_merchant_api_key(authorization)
+    authorized_merchant_hex = require_merchant_api_key(authorization)
     init_db()
     status = body.status.strip().lower()
     if status not in ENROLLMENT_STATUSES:
@@ -1161,9 +1532,12 @@ def update_enrollment_status(
         enrollment = asdict(c.execute(text("SELECT * FROM enrollments WHERE id=:id"), {"id": enrollment_id}).fetchone())
         if not enrollment:
             raise HTTPException(404, "enrollment not found")
+        campaign = asdict(c.execute(text("SELECT * FROM campaigns WHERE id=:id"), {"id": enrollment["campaign_id"]}).fetchone())
+        if not campaign:
+            raise HTTPException(404, "campaign not found")
+        require_merchant_ownership(campaign, authorized_merchant_hex)
         if enrollment.get("status") == status:
             return {"ok": True, "duplicate": True, "enrollment_id": enrollment_id, "status": status, "nostr_event_id": enrollment["nostr_event_id"], "nostr_event": json.loads(enrollment["nostr_event_json"])}
-        campaign = asdict(c.execute(text("SELECT * FROM campaigns WHERE id=:id"), {"id": enrollment["campaign_id"]}).fetchone())
         enrollment["status"] = status
         event = build_enrollment_event(enrollment, campaign)
         relay_results = publish_event(event)
@@ -1368,7 +1742,7 @@ def reverse_conversion(
     body: ReversalIn,
     authorization: Optional[str] = Header(None),
 ) -> dict[str, Any]:
-    require_merchant_api_key(authorization)
+    authorized_merchant_hex = require_merchant_api_key(authorization)
     init_db()
     reason = body.reason.strip().lower()
     if reason not in REVERSAL_REASONS:
@@ -1377,6 +1751,10 @@ def reverse_conversion(
         conversion = asdict(c.execute(text("SELECT * FROM conversions WHERE id=:id"), {"id": conversion_id}).fetchone())
         if not conversion:
             raise HTTPException(404, "conversion not found")
+        campaign = asdict(c.execute(text("SELECT * FROM campaigns WHERE id=:id"), {"id": conversion["campaign_id"]}).fetchone())
+        if not campaign:
+            raise HTTPException(400, "conversion is missing campaign context")
+        require_merchant_ownership(campaign, authorized_merchant_hex)
         existing = asdict(c.execute(text("SELECT * FROM reversals WHERE conversion_id=:id"), {"id": conversion_id}).fetchone())
         if existing:
             apply_reversal_to_payout(c, conversion)
@@ -1388,7 +1766,6 @@ def reverse_conversion(
                 "nostr_event_id": existing["nostr_event_id"],
                 "nostr_event": json.loads(existing["nostr_event_json"]),
             }
-        campaign = asdict(c.execute(text("SELECT * FROM campaigns WHERE id=:id"), {"id": conversion["campaign_id"]}).fetchone())
         click = asdict(c.execute(text("SELECT * FROM clicks WHERE id=:id"), {"id": conversion["click_id"]}).fetchone())
         enrollment = asdict(c.execute(text("SELECT * FROM enrollments WHERE ref_code=:ref"), {"ref": click["ref_code"] if click else None}).fetchone()) if click else None
         if not campaign or not enrollment:
@@ -1606,7 +1983,6 @@ def legacy_bumbei_status(limit: int = 10) -> dict[str, Any]:
     return tracking_status(limit)
 
 
-@app.get("/dashboard/data")
 def dashboard_data() -> dict[str, Any]:
     init_db()
     with engine().connect() as c:
@@ -1633,14 +2009,19 @@ def dashboard_data() -> dict[str, Any]:
     return {"health": health(), "counts": counts, "campaigns": campaigns, "enrollments": enrollments, "clicks": clicks, "conversions": conversions, "events": events}
 
 
-def process_merchant_conversion(body: MerchantConversionIn) -> dict[str, Any]:
+def process_merchant_conversion(body: MerchantConversionIn, authorized_merchant_hex: str) -> dict[str, Any]:
     """Create an idempotent, payout-grade conversion from a trusted merchant signal."""
     init_db()
     order_id_hash = sha(body.order_id)
     payload_hash = sha(json.dumps(body.model_dump(), sort_keys=True, default=str))
     with engine().connect() as c:
-        existing = asdict(c.execute(text("SELECT id, nostr_event_id FROM conversions WHERE order_id_hash=:h"), {"h": order_id_hash}).fetchone())
+        existing = asdict(c.execute(text("""
+            SELECT v.id, v.nostr_event_id, c.merchant_pubkey, c.merchant_pubkey_hex
+            FROM conversions v JOIN campaigns c ON c.id=v.campaign_id
+            WHERE v.order_id_hash=:h
+        """), {"h": order_id_hash}).fetchone())
     if existing:
+        require_merchant_ownership(existing, authorized_merchant_hex)
         return {
             "ok": True,
             "duplicate": True,
@@ -1650,6 +2031,15 @@ def process_merchant_conversion(body: MerchantConversionIn) -> dict[str, Any]:
             "json_receipt_url": f"{BASE_URL}/flows/{existing['id']}",
             "payload_hash": payload_hash,
         }
+    with engine().connect() as c:
+        click_campaign = asdict(c.execute(text("""
+            SELECT c.merchant_pubkey, c.merchant_pubkey_hex
+            FROM clicks cl JOIN campaigns c ON c.id=cl.campaign_id
+            WHERE cl.id=:click_id
+        """), {"click_id": body.bb_click_id}).fetchone())
+    if not click_campaign:
+        raise HTTPException(404, "click not found")
+    require_merchant_ownership(click_campaign, authorized_merchant_hex)
     conversion = create_conversion(
         ConversionIn(
             order_id=body.order_id,
@@ -1684,8 +2074,8 @@ def merchant_conversion_webhook(body: MerchantConversionIn, authorization: Optio
     The merchant sends back the bb_click_id captured from the referral redirect. Raw
     order/customer data is not published to Nostr; the conversion proof stores hashes.
     """
-    require_merchant_api_key(authorization)
-    return process_merchant_conversion(body)
+    authorized_merchant_hex = require_merchant_api_key(authorization)
+    return process_merchant_conversion(body, authorized_merchant_hex)
 
 
 def shopify_webhook_secret() -> str:
@@ -1823,7 +2213,8 @@ def process_shopify_delivery(order_key: str) -> None:
                 order_total=float(row["order_total"]),
                 currency=row["currency"],
                 metadata={"platform": "shopify", "shop": row["shop_domain"], "topic": row["topic"]},
-            )
+            ),
+            configured_merchant_pubkey_hex(),
         )
     except Exception as exc:
         with engine().begin() as c:
@@ -3704,16 +4095,18 @@ async function api(path, opts={}){
   return data;
 }
 function short(x){ return x ? String(x).slice(0,10)+'…'+String(x).slice(-6) : ''; }
-function status(s){ return `<span class="status ${s}">${s}</span>`; }
-function table(rows, cols){ if(!rows?.length) return '<p class="label">No rows yet.</p>'; return `<div class="table-wrap"><table><thead><tr>${cols.map(c=>`<th>${c[0]}</th>`).join('')}</tr></thead><tbody>${rows.map(r=>`<tr>${cols.map(c=>`<td>${c[2]?c[2](r[c[1]],r):r[c[1]]??''}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`; }
+function esc(value){ return String(value ?? '').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function safePath(value){ return encodeURIComponent(String(value ?? '')); }
+function status(s){ const label=String(s ?? 'unknown'); const cls=['published','failed','skipped','pending','success','error'].includes(label.toLowerCase())?label.toLowerCase():'unknown'; return `<span class="status ${cls}">${esc(label)}</span>`; }
+function table(rows, cols){ if(!rows?.length) return '<p class="label">No rows yet.</p>'; return `<div class="table-wrap"><table><thead><tr>${cols.map(c=>`<th>${esc(c[0])}</th>`).join('')}</tr></thead><tbody>${rows.map(r=>`<tr>${cols.map(c=>`<td>${c[2]?c[2](r[c[1]],r):esc(r[c[1]])}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`; }
 async function refresh(){
-  const data = await api('/dashboard/data');
+  const data = await api('/ops/data');
   $('health-pill').textContent = `${data.health.db} · Nostr publish ${data.health.nostr_publish ? 'on' : 'off'}`;
   const metrics = [['Campaigns',data.counts.campaigns],['Enrollments',data.counts.enrollments],['Clicks',data.counts.clicks],['Conversions',data.counts.conversions],['Pending sats',data.counts.pending_sats],['Published events',data.counts.published_events]];
-  $('metrics').innerHTML = metrics.map(m=>`<div class="card metric-card"><div class="label">${m[0]}</div><div class="metric">${m[1]}</div></div>`).join('');
-  $('campaigns').innerHTML = table(data.campaigns, [['ID','id',v=>`<code>${v}</code>`],['Name','name'],['bps','commission_bps'],['Event','nostr_event_id',v=>`<a href="/nostr/events/${v}">${short(v)}</a>`],['Page','id',v=>`<a href="/campaigns/${v}/page">open</a>`]]);
-  $('conversions').innerHTML = table(data.conversions, [['ID','id',v=>`<code>${v}</code>`],['Affiliate','affiliate_pubkey',v=>`<a href="/affiliates/${v}/profile">${short(v)}</a>`],['sats','commission_sats'],['Event','nostr_event_id',v=>`<a href="/nostr/events/${v}">${short(v)}</a>`],['Receipt','id',v=>`<a href="/flows/${v}/receipt">open</a>`]]);
-  $('events').innerHTML = table(data.events, [['Kind','kind'],['Entity','entity_type',(v,r)=>`${v}<br><code>${r.entity_id}</code>`],['Relay','relay_status',status],['Event','event_id',v=>`<a href="/nostr/events/${v}">${short(v)}</a>`],['Relays','relays',(v)=>v.map(r=>`${status(r.status)} ${r.relay_url.replace('wss://','')}`).join('<br>')]]);
+  $('metrics').innerHTML = metrics.map(m=>`<div class="card metric-card"><div class="label">${esc(m[0])}</div><div class="metric">${esc(m[1])}</div></div>`).join('');
+  $('campaigns').innerHTML = table(data.campaigns, [['ID','id',v=>`<code>${esc(v)}</code>`],['Name','name'],['bps','commission_bps'],['Event','nostr_event_id',v=>`<a href="/nostr/events/${safePath(v)}">${esc(short(v))}</a>`],['Page','id',v=>`<a href="/campaigns/${safePath(v)}/page">open</a>`]]);
+  $('conversions').innerHTML = table(data.conversions, [['ID','id',v=>`<code>${esc(v)}</code>`],['Affiliate','affiliate_pubkey',v=>`<a href="/affiliates/${safePath(v)}/profile">${esc(short(v))}</a>`],['sats','commission_sats'],['Event','nostr_event_id',v=>`<a href="/nostr/events/${safePath(v)}">${esc(short(v))}</a>`],['Receipt','id',v=>`<a href="/flows/${safePath(v)}/receipt">open</a>`]]);
+  $('events').innerHTML = table(data.events, [['Kind','kind'],['Entity','entity_type',(v,r)=>`${esc(v)}<br><code>${esc(r.entity_id)}</code>`],['Relay','relay_status',status],['Event','event_id',v=>`<a href="/nostr/events/${safePath(v)}">${esc(short(v))}</a>`],['Relays','relays',(v)=>(Array.isArray(v)?v:[]).map(r=>`${status(r.status)} ${esc(String(r.relay_url ?? '').replace('wss://',''))}`).join('<br>')]]);
 }
 async function createCampaign(){
   const data = await api('/campaigns',{method:'POST',body:JSON.stringify({merchant_pubkey:$('merchant').value,name:$('campaignName').value,commission_bps:+$('commission').value,attribution_window_days:+$('windowDays').value,destination_url:$('destination').value})});
@@ -3721,7 +4114,7 @@ async function createCampaign(){
 }
 async function createEnrollment(){
   const data = await api('/enrollments',{method:'POST',body:JSON.stringify({campaign_id:$('campaignId').value,affiliate_pubkey:$('affiliate').value,lightning_address:$('lightning').value})});
-  $('refCode').value=data.ref_code; $('refBox').innerHTML=`Ref URL: <a href="${data.ref_url}" target="_blank">${data.ref_url}</a>`; show(data); toast('Affiliate enrolled'); await refresh();
+  $('refCode').value=data.ref_code; $('refBox').innerHTML=`Ref URL: <a href="${esc(data.ref_url)}" target="_blank" rel="noopener">${esc(data.ref_url)}</a>`; show(data); toast('Affiliate enrolled'); await refresh();
 }
 async function simulateClick(){
   const data = await api('/clicks/simulate',{method:'POST',body:JSON.stringify({ref_code:$('refCode').value})});
@@ -3739,16 +4132,118 @@ refresh().catch(e=>toast(e.message));
 """
 
 
+@app.get("/app", response_class=HTMLResponse)
+def account_entry(request: Request, role: str | None = None) -> Response:
+    session = _session_account(request)
+    if session:
+        destination = "/ops" if session["role"] == "ops" else f"/app/{session['role']}"
+        return RedirectResponse(destination, status_code=303)
+    requested_role = role if role in {"merchant", "affiliate", "ops"} else None
+    return templates.TemplateResponse(request=request, name="login.html", context={"requested_role": requested_role})
+
+
+def _account_shell(session: dict[str, Any], role: str) -> dict[str, Any]:
+    return {
+        "npub": session["npub"],
+        "npub_short": workspace_short(session["npub"]),
+        "role": role,
+    }
+
+
+@app.get("/app/merchant", response_class=HTMLResponse)
+def merchant_account_page(request: Request) -> Response:
+    session = _session_account(request, "merchant")
+    if not session:
+        return RedirectResponse("/app?role=merchant", status_code=303)
+    configured_shopify_merchant = os.getenv("SHOPIFY_MERCHANT_PUBKEY", DEFAULT_MERCHANT_NPUB)
+    try:
+        shopify_merchant_hex = normalize_pubkey(configured_shopify_merchant, "SHOPIFY_MERCHANT_PUBKEY")["hex"]
+    except HTTPException:
+        shopify_merchant_hex = ""
+    with engine().connect() as c:
+        owns_shopify_store = session["nostr_pubkey_hex"] == shopify_merchant_hex or bool(
+            c.execute(
+                text("SELECT 1 FROM merchant_account_links WHERE account_id=:account_id AND merchant_pubkey_hex=:hex LIMIT 1"),
+                {"account_id": session["account_id"], "hex": shopify_merchant_hex},
+            ).fetchone()
+        )
+    webhook = shopify_webhook_status() if owns_shopify_store else {"secret_configured": False, "store_configured": False, "receipts": {}}
+    configured = bool(webhook.get("secret_configured") and webhook.get("store_configured"))
+    processed = int(webhook.get("receipts", {}).get("processed", 0))
+    shopify_ready = configured and processed > 0
+    if shopify_ready:
+        detail = f"{processed} webhook{'s' if processed != 1 else ''} orders/paid procesado{'s' if processed != 1 else ''}."
+    elif configured:
+        detail = "Configurado; esperando el primer webhook orders/paid válido."
+    else:
+        detail = "La integración de Shopify todavía no está configurada para este merchant."
+    with engine().connect() as c:
+        data = merchant_workspace_data(c, session, base_url=BASE_URL, shopify_ready=shopify_ready, shopify_detail=detail)
+    return templates.TemplateResponse(
+        request=request,
+        name="merchant.html",
+        context={
+            **data,
+            "account": _account_shell(session, "merchant"),
+            "role_label": "Merchant account",
+            "nav": [
+                {"label": "Resumen", "href": "/app/merchant", "active": True},
+                {"label": "Campañas", "href": "#campaigns", "active": False},
+                {"label": "Actividad", "href": "#activity", "active": False},
+                {"label": "Pagos", "href": "#payouts", "active": False},
+                {"label": "Integración", "href": "#integration", "active": False},
+            ],
+        },
+    )
+
+
+@app.get("/app/affiliate", response_class=HTMLResponse)
+def affiliate_account_page(request: Request) -> Response:
+    session = _session_account(request, "affiliate")
+    if not session:
+        return RedirectResponse("/app?role=affiliate", status_code=303)
+    with engine().connect() as c:
+        data = affiliate_workspace_data(c, session, base_url=BASE_URL)
+    return templates.TemplateResponse(
+        request=request,
+        name="affiliate.html",
+        context={
+            **data,
+            "account": _account_shell(session, "affiliate"),
+            "role_label": "Affiliate account",
+            "nav": [
+                {"label": "Resumen", "href": "/app/affiliate", "active": True},
+                {"label": "Mis links", "href": "#links", "active": False},
+                {"label": "Ganancias", "href": "#earnings", "active": False},
+                {"label": "Conversiones", "href": "#activity", "active": False},
+            ],
+        },
+    )
+
+
+@app.get("/ops/data", tags=["Operations"])
+def ops_dashboard_data(request: Request) -> dict[str, Any]:
+    require_account_session(request, "ops")
+    return dashboard_data()
+
+
+@app.get("/dashboard/data", include_in_schema=False)
+def legacy_dashboard_data(request: Request) -> Response:
+    return RedirectResponse("/ops/data", status_code=307)
+
+
+@app.get("/ops", response_class=HTMLResponse)
+def operations_dashboard(request: Request) -> Response:
+    if not _session_account(request, "ops"):
+        return RedirectResponse("/app?role=ops", status_code=303)
+    return HTMLResponse(DASHBOARD_HTML)
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
-def dashboard() -> str:
-    return DASHBOARD_HTML
+def dashboard() -> Response:
+    return RedirectResponse("/ops", status_code=303)
 
 
 @app.get("/", response_class=HTMLResponse)
-def home() -> str:
-    return """
-    <html><head><title>Nostr Affiliate POC</title><style>body{font-family:system-ui;margin:40px;max-width:900px}code,pre{background:#f4f4f4;padding:2px 5px;border-radius:4px}li{margin:8px 0}</style></head>
-    <body><h1>Nostr Affiliate POC</h1><p>Minimal demo: campaign → enrollment → redirect click → conversion → real Nostr proof → pending Lightning payout.</p>
-    <ul><li><a href='/dashboard'>Dashboard</a></li><li><a href='/docs'>API docs</a></li><li><form method='post' action='/demo'><button>Run demo flow</button></form></li><li><a href='/proofs'>View Nostr proof events</a></li><li><a href='/health'>Health</a></li></ul>
-    <p>Events are real Nostr events signed with Schnorr keys. If NOSTR_PUBLISH=true, the app publishes them to configured public relays.</p></body></html>
-    """
+def home() -> Response:
+    return RedirectResponse("/app", status_code=303)

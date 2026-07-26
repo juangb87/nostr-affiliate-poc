@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}Merchant · Meerat{% endblock %}
+{% block content %}
+<header class="page-header"><div><p class="eyebrow">Merchant account</p><h1>Tu programa, bajo control.</h1><p class="lede">Campañas, atribución y obligaciones de pago de tus comercios, sin mezclar datos de otros merchants.</p></div><div class="header-actions"><a class="button secondary" href="#integration">Ver integración</a></div></header>
+<section class="metrics" aria-label="Resumen merchant">
+  <article class="metric"><span>Campañas activas</span><strong>{{ totals.active_campaigns }}</strong><small>de {{ totals.campaigns }} campañas</small></article>
+  <article class="metric"><span>Afiliados</span><strong>{{ totals.affiliates }}</strong><small>enrollments únicos</small></article>
+  <article class="metric"><span>Conversiones</span><strong>{{ totals.conversions }}</strong><small>atribución autoritativa</small></article>
+  <article class="metric"><span>Comisiones</span><strong>{{ totals.commission_sats }}</strong><small>sats generados</small></article>
+</section>
+{% if totals.actionable_payouts %}<aside class="notice"><div><strong>{{ totals.actionable_payouts }} pago{% if totals.actionable_payouts != 1 %}s{% endif %} requiere{% if totals.actionable_payouts == 1 %}{% else %}n{% endif %} atención.</strong><p>Podés <a href="#payouts">revisar el detalle</a>; Sprint 4B habilitará el pago manual no custodial.</p></div></aside>{% endif %}
+<section class="section" id="campaigns"><div class="section-head"><div><h2>Campañas</h2><p>Actividad y condiciones del programa.</p></div></div><div class="panel record-list">
+{% for campaign in campaigns %}<article class="record"><div class="record-main"><strong>{{ campaign.name }}</strong><span>{{ campaign.commission_percent }}% · ventana {{ campaign.window_days }} días</span></div><div><span class="label-mobile">Afiliados</span><strong>{{ campaign.affiliates }}</strong><div class="record-meta">afiliados</div></div><div><span class="label-mobile">Conversiones</span><strong>{{ campaign.conversions }}</strong><div class="record-meta">conversiones</div></div><div><span class="badge {% if campaign.status == 'active' %}success{% endif %}">{{ campaign.status }}</span></div><a class="action" href="/campaigns/{{ campaign.id }}/page">Página pública</a></article>
+{% else %}<div class="empty">No hay campañas asociadas a esta cuenta merchant.</div>{% endfor %}
+</div></section>
+<section class="section" id="activity"><div class="section-head"><div><h2>Actividad reciente</h2><p>Conversiones y comisiones confirmadas.</p></div></div><div class="panel record-list">
+{% for conversion in conversions %}<article class="record"><div class="record-main"><strong>{{ conversion.campaign_name }}</strong><span>{{ conversion.created_at }}</span></div><div><span class="label-mobile">Venta</span><strong>{{ conversion.order_total }} {{ conversion.currency }}</strong></div><div><span class="label-mobile">Comisión</span><strong>{{ conversion.commission_sats }} sats</strong></div><div><span class="badge {% if conversion.status == 'approved' %}success{% endif %}">{{ conversion.status }}</span></div><a class="action" href="/flows/{{ conversion.id }}/receipt">Receipt</a></article>
+{% else %}<div class="empty">Todavía no hay conversiones atribuidas.</div>{% endfor %}
+</div></section>
+<section class="section" id="payouts"><div class="section-head"><div><h2>Obligaciones de pago</h2><p>Estado financiero; no implica que Meerat custodie fondos.</p></div></div><div class="panel record-list">
+{% for payout in payouts %}<article class="record"><div class="record-main"><strong>{{ payout.amount_sats }} sats</strong><span>{{ payout.campaign_name }}</span></div><div><span class="label-mobile">Afiliado</span><code>{{ payout.affiliate_short }}</code></div><div><span class="label-mobile">Estado</span><span class="badge {% if payout.state in ['SETTLED','PUBLISHED'] %}success{% elif payout.state in ['FAILED','UNKNOWN'] %}danger{% endif %}">{{ payout.user_state }}</span></div><div class="record-meta">{{ payout.created_at }}</div><a class="action" href="/payouts/{{ payout.id }}/receipt">Receipt</a></article>
+{% else %}<div class="empty">No hay obligaciones de pago registradas.</div>{% endfor %}
+</div></section>
+<section class="section" id="integration"><div class="section-head"><div><h2>Integración</h2><p>Señales reales del storefront y Shopify.</p></div></div><div class="integration">
+<article class="integration-card"><h3>Shopify orders/paid</h3><p>{{ integration.shopify_detail }}</p><span class="badge {% if integration.shopify_ready %}success{% endif %}">{{ 'Conectado' if integration.shopify_ready else 'Requiere atención' }}</span></article>
+<article class="integration-card"><h3>Tracking del sitio</h3><p>{{ integration.tracking_events }} eventos asociados a tus campañas.</p><span class="badge {% if integration.tracking_events > 0 %}success{% endif %}">{{ 'Recibiendo eventos' if integration.tracking_events > 0 else 'Esperando primer evento' }}</span></article>
+</div></section>
+{% endblock %}

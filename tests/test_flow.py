@@ -47,9 +47,9 @@ def test_demo_flow_creates_conversion_and_proof(tmp_path, monkeypatch):
     detail = client.get(f"/nostr/events/{data['conversion']['nostr_event_id']}")
     assert detail.status_code == 200
     assert detail.json()['event_id'] == data['conversion']['nostr_event_id']
-    dashboard = client.get('/dashboard')
-    assert dashboard.status_code == 200
-    assert 'Nostr Affiliate POC Dashboard' in dashboard.text
+    dashboard = client.get('/dashboard', follow_redirects=False)
+    assert dashboard.status_code == 303
+    assert dashboard.headers['location'] == '/ops'
     campaign_summary = client.get(f"/campaigns/{data['campaign']['campaign_id']}/summary")
     assert campaign_summary.status_code == 200
     campaign_summary_json = campaign_summary.json()
@@ -72,9 +72,9 @@ def test_demo_flow_creates_conversion_and_proof(tmp_path, monkeypatch):
     assert data['enrollment']['affiliate_pubkey'] in affiliate_profile.text
     affiliate_profile_hex = client.get(f"/affiliates/{data['enrollment']['affiliate_pubkey_hex']}/profile")
     assert affiliate_profile_hex.status_code == 200
-    dashboard_data = client.get('/dashboard/data')
-    assert dashboard_data.status_code == 200
-    assert dashboard_data.json()['counts']['conversions'] >= 1
+    dashboard_data = client.get('/dashboard/data', follow_redirects=False)
+    assert dashboard_data.status_code == 307
+    assert dashboard_data.headers['location'] == '/ops/data'
     receipt = client.get(f"/flows/{data['conversion']['conversion_id']}")
     assert receipt.status_code == 200
     receipt_json = receipt.json()
