@@ -11,6 +11,8 @@ dependencies = [
   "SQLAlchemy>=2.0",
   "psycopg[binary]>=3.2",
   "nostr-sdk>=0.44.2",
+  "bolt11==2.2.0",
+  "qrcode==8.2",
 ]
 
 [project.optional-dependencies]

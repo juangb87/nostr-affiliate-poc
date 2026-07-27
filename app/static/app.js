@@ -11,6 +11,20 @@ async function jsonFetch(url, options = {}) {
 
 let affiliateInvitationToken = null;
 
+function clearPreparedInvoice(form) {
+  const panel = form.querySelector("[data-invoice-panel]");
+  const image = panel.querySelector("[data-invoice-qr]");
+  image.removeAttribute("src");
+  panel.querySelector("[data-invoice-text]").textContent = "";
+  const copy = panel.querySelector("[data-invoice-copy]");
+  delete copy.dataset.copy;
+  delete form.dataset.preparedPaymentHash;
+  delete form.dataset.preparedExpiresAt;
+  form.querySelector("[name='evidence']").value = "";
+  form.querySelector("[name='confirmed']").checked = false;
+  panel.hidden = true;
+}
+
 async function resolveAffiliateInvitation() {
   const page = document.querySelector("[data-invite-page]");
   if (!page) return;
@@ -125,6 +139,67 @@ document.addEventListener("click", async (event) => {
       status.textContent = error.message;
       status.classList.add("error");
       invite.disabled = false;
+    }
+    return;
+  }
+  const useInvoiceHash = event.target.closest("[data-use-invoice-hash]");
+  if (useInvoiceHash) {
+    const form = useInvoiceHash.closest("[data-manual-payout]");
+    const status = form.querySelector("[data-invoice-status]");
+    const paymentHash = form.dataset.preparedPaymentHash || "";
+    const expiresAt = Date.parse(form.dataset.preparedExpiresAt || "");
+    if (!/^[0-9a-f]{64}$/.test(paymentHash) || !Number.isFinite(expiresAt)) {
+      status.textContent = "Generá nuevamente el invoice antes de registrar el pago.";
+      status.classList.add("error");
+      return;
+    }
+    if (Date.now() >= expiresAt) {
+      status.textContent = "Este invoice expiró. Generá uno nuevo antes de pagar.";
+      status.classList.add("error");
+      return;
+    }
+    form.querySelector("[name='evidence_type']").value = "payment_hash";
+    form.querySelector("[name='evidence']").value = paymentHash;
+    status.classList.remove("error");
+    status.textContent = "Hash del invoice cargado. Confirmá abajo únicamente si tu wallet mostró el pago exitoso.";
+    form.querySelector("[name='confirmed']").focus();
+    return;
+  }
+  const prepareInvoice = event.target.closest("[data-prepare-invoice]");
+  if (prepareInvoice) {
+    const form = prepareInvoice.closest("[data-manual-payout]");
+    const panel = form.querySelector("[data-invoice-panel]");
+    const status = form.querySelector("[data-invoice-status]");
+    prepareInvoice.disabled = true;
+    status.classList.remove("error");
+    status.textContent = "Resolviendo Lightning Address y generando invoice…";
+    clearPreparedInvoice(form);
+    try {
+      const result = await jsonFetch(`/app/merchant/payouts/${encodeURIComponent(form.dataset.manualPayout)}/prepare-invoice`, {
+        method: "POST", body: "{}"
+      });
+      const expiresAt = Date.parse(result.expires_at);
+      if (!/^lnbc[0-9a-z]+$/i.test(result.invoice) || !/^data:image\/svg\+xml;base64,/.test(result.qr_data_uri) || !/^[0-9a-f]{64}$/.test(result.payment_hash) || !Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+        throw new Error("El servidor devolvió un invoice inválido");
+      }
+      panel.querySelector("[data-invoice-qr]").src = result.qr_data_uri;
+      panel.querySelector("[data-invoice-amount]").textContent = String(result.amount_sats);
+      panel.querySelector("[data-invoice-destination]").textContent = result.lightning_address;
+      panel.querySelector("[data-invoice-text]").textContent = result.invoice;
+      const copyInvoice = panel.querySelector("[data-invoice-copy]");
+      copyInvoice.dataset.copy = result.invoice;
+      form.dataset.preparedPaymentHash = result.payment_hash;
+      form.dataset.preparedExpiresAt = result.expires_at;
+      panel.querySelector("[data-invoice-expiry]").textContent = `Expira: ${new Date(expiresAt).toLocaleString()}`;
+      panel.hidden = false;
+      prepareInvoice.textContent = "Regenerar invoice y QR";
+      status.textContent = `Invoice listo por ${result.amount_sats} sats. Generarlo no realiza el pago.`;
+    } catch (error) {
+      clearPreparedInvoice(form);
+      status.textContent = error.message;
+      status.classList.add("error");
+    } finally {
+      prepareInvoice.disabled = false;
     }
     return;
   }

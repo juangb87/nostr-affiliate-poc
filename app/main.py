@@ -5,6 +5,7 @@ import base64
 import hashlib
 import html as html_lib
 import hmac
+import io
 import json
 import os
 import re
@@ -33,6 +34,9 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from nostr_sdk import Client, EventBuilder, Keys, Kind, PublicKey, RelayUrl, Tag
+import qrcode
+from qrcode.image.svg import SvgPathImage
+from qrcode.exceptions import DataOverflowError
 from app.account_auth import (
     SESSION_COOKIE,
     digest as auth_digest,
@@ -43,7 +47,13 @@ from app.account_auth import (
     random_token,
     verify_auth_event,
 )
-from app.lightning import LightningPaymentError, lightning_address_url, pay_nwc_invoice, prepare_lnurl_payment
+from app.lightning import (
+    LightningPaymentError,
+    bolt11_expires_at,
+    lightning_address_url,
+    pay_nwc_invoice,
+    prepare_lnurl_payment,
+)
 from app.payment_rails import (
     NwcPaymentRail,
     PaymentRailAmbiguousError,
@@ -66,6 +76,9 @@ DEFAULT_MERCHANT_NPUB = "npub1540rxhz9x7fpc73nu5q3qydykej7lceh5j4jej6mmpc6n3saw3
 DEFAULT_AFFILIATE_NPUB = "npub16ghkhw9d4g9x6pxp6l6dtyjqaeuavwucrq8gpkt60x0kx9fzqwpszhtw0n"
 _MERCHANT_ENROLLMENT_LOCK = threading.Lock()
 _INVITATION_ACCEPT_LOCK = threading.Lock()
+_INVOICE_PREPARE_LOCK = threading.Lock()
+_INVOICE_PREPARE_LAST: dict[str, float] = {}
+_INVOICE_PREPARE_ACTIVE: set[str] = set()
 
 app = FastAPI(
     title="Nostr Affiliate POC",
@@ -4349,6 +4362,99 @@ def _owned_merchant_payout(c: Any, session: dict[str, Any], payout_id: str, *, l
     """), {"payout_id": payout_id, "owner_hex": session["nostr_pubkey_hex"], "account_id": session["account_id"]}).fetchone())
 
 
+def _require_unsettled_manual_payout(c: Any, payout: dict[str, Any]) -> None:
+    if payout.get("state") != "PAYABLE" or payout.get("status") != "pending":
+        raise HTTPException(409, f"payout state {payout.get('state')} is not manually payable")
+    if payout.get("conversion_status") == "reversed" or c.execute(
+        text("SELECT 1 FROM reversals WHERE conversion_id=:id LIMIT 1"),
+        {"id": payout["conversion_id"]},
+    ).fetchone():
+        raise HTTPException(409, "reversed conversion payout is not payable")
+    if payout.get("return_window_ends_at"):
+        try:
+            return_window = datetime.fromisoformat(str(payout["return_window_ends_at"]).replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise HTTPException(500, "payout has an invalid return window") from exc
+        if return_window > datetime.now(timezone.utc):
+            raise HTTPException(409, "payout return window has not ended")
+    if not payout.get("lightning_address"):
+        raise HTTPException(409, "affiliate has not configured a Lightning Address")
+    if payout.get("payment_provider") or payout.get("bolt11_invoice"):
+        raise HTTPException(409, "payout already belongs to a payment provider")
+    if int(payout.get("reserved_sats") or 0) < int(payout["amount_sats"]) + int(payout.get("fee_sats") or 0):
+        raise HTTPException(409, "payout has no complete campaign budget reservation")
+    if c.execute(text("SELECT 1 FROM payment_attempts WHERE payout_id=:id LIMIT 1"), {"id": payout["id"]}).fetchone():
+        raise HTTPException(409, "payout already has payment evidence or an attempt")
+
+
+def _bolt11_qr_data_uri(invoice: str) -> str:
+    qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=8, border=4)
+    qr.add_data(invoice.upper())
+    qr.make(fit=True)
+    image = qr.make_image(image_factory=SvgPathImage)
+    output = io.BytesIO()
+    image.save(output)
+    encoded = base64.b64encode(output.getvalue()).decode("ascii")
+    return f"data:image/svg+xml;base64,{encoded}"
+
+
+@app.post("/app/merchant/payouts/{payout_id}/prepare-invoice", tags=["Accounts"])
+async def merchant_prepare_payout_invoice(payout_id: str, request: Request, response: Response) -> dict[str, Any]:
+    session = require_account_session(request, "merchant")
+    _require_same_origin(request)
+    init_db()
+    with engine().connect() as c:
+        payout = _owned_merchant_payout(c, session, payout_id)
+        if not payout:
+            raise HTTPException(404, "payout not found")
+        _require_unsettled_manual_payout(c, payout)
+        lightning_address = str(payout["lightning_address"])
+        amount_sats = int(payout["amount_sats"])
+    rate_key = f"{session['account_id']}:{payout_id}"
+    started = time.monotonic()
+    with _INVOICE_PREPARE_LOCK:
+        for key, timestamp in list(_INVOICE_PREPARE_LAST.items()):
+            if started - timestamp > 60:
+                _INVOICE_PREPARE_LAST.pop(key, None)
+        if rate_key in _INVOICE_PREPARE_ACTIVE or started - _INVOICE_PREPARE_LAST.get(rate_key, 0) < 5:
+            raise HTTPException(429, "invoice preparation is already running or was requested too recently")
+        _INVOICE_PREPARE_ACTIVE.add(rate_key)
+        _INVOICE_PREPARE_LAST[rate_key] = started
+    try:
+        try:
+            invoice, payment_hash = await prepare_lnurl_payment(lightning_address, amount_sats)
+        except LightningPaymentError as exc:
+            raise HTTPException(502, str(exc)) from exc
+        with engine().connect() as c:
+            latest = _owned_merchant_payout(c, session, payout_id)
+            if not latest:
+                raise HTTPException(409, "payout changed while preparing the invoice")
+            _require_unsettled_manual_payout(c, latest)
+            if str(latest["lightning_address"]) != lightning_address or int(latest["amount_sats"]) != amount_sats:
+                raise HTTPException(409, "payout destination or amount changed while preparing the invoice")
+        expires_at = bolt11_expires_at(invoice)
+        try:
+            qr_data_uri = await asyncio.to_thread(_bolt11_qr_data_uri, invoice)
+        except (DataOverflowError, ValueError) as exc:
+            raise HTTPException(502, "BOLT11 invoice is too large to render safely") from exc
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        return {
+            "ok": True,
+            "payout_id": payout_id,
+            "amount_sats": amount_sats,
+            "lightning_address": lightning_address,
+            "invoice": invoice,
+            "payment_hash": payment_hash,
+            "expires_at": expires_at,
+            "qr_data_uri": qr_data_uri,
+        }
+    finally:
+        with _INVOICE_PREPARE_LOCK:
+            _INVOICE_PREPARE_ACTIVE.discard(rate_key)
+
+
 @app.post("/app/merchant/payouts/{payout_id}/manual-settlement", tags=["Accounts"])
 def merchant_manual_settlement(payout_id: str, request: Request, body: MerchantManualSettlementIn) -> dict[str, Any]:
     session = require_account_session(request, "merchant")
@@ -4363,25 +4469,7 @@ def merchant_manual_settlement(payout_id: str, request: Request, body: MerchantM
             if payout.get("payment_provider") != "manual" or payout.get("payment_hash") != payment_hash:
                 raise HTTPException(409, "payout was settled with different evidence")
         else:
-            if payout.get("state") != "PAYABLE" or payout.get("status") != "pending":
-                raise HTTPException(409, f"payout state {payout.get('state')} is not manually payable")
-            if payout.get("conversion_status") == "reversed" or c.execute(text("SELECT 1 FROM reversals WHERE conversion_id=:id LIMIT 1"), {"id": payout["conversion_id"]}).fetchone():
-                raise HTTPException(409, "reversed conversion payout is not payable")
-            if payout.get("return_window_ends_at"):
-                try:
-                    return_window = datetime.fromisoformat(str(payout["return_window_ends_at"]).replace("Z", "+00:00"))
-                except ValueError as exc:
-                    raise HTTPException(500, "payout has an invalid return window") from exc
-                if return_window > datetime.now(timezone.utc):
-                    raise HTTPException(409, "payout return window has not ended")
-            if not payout.get("lightning_address"):
-                raise HTTPException(409, "affiliate has not configured a Lightning Address")
-            if payout.get("payment_provider") or payout.get("bolt11_invoice"):
-                raise HTTPException(409, "payout already belongs to a payment provider")
-            if int(payout.get("reserved_sats") or 0) < int(payout["amount_sats"]) + int(payout.get("fee_sats") or 0):
-                raise HTTPException(409, "payout has no complete campaign budget reservation")
-            if c.execute(text("SELECT 1 FROM payment_attempts WHERE payout_id=:id LIMIT 1"), {"id": payout_id}).fetchone():
-                raise HTTPException(409, "payout already has payment evidence or an attempt")
+            _require_unsettled_manual_payout(c, payout)
             if c.engine.dialect.name == "postgresql":
                 c.execute(
                     text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),

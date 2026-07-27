@@ -8,7 +8,7 @@ import json
 import os
 import socket
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -108,12 +108,19 @@ def lightning_address_url(address: str) -> str:
     return f"https://{host}/.well-known/lnurlp/{name}"
 
 
-def validate_bolt11_invoice(invoice: str, expected_sats: int) -> str:
+def _decode_bolt11_invoice(invoice: str):
+    if not invoice or len(invoice) > 2048:
+        raise LightningPaymentError("LNURL returned an invalid BOLT11 invoice length")
     try:
         decoded = decode(invoice, strict=False)
         decoded.validate(strict=False)
     except (Bolt11Exception, ValueError, TypeError) as exc:
         raise LightningPaymentError("LNURL returned an invalid BOLT11 invoice") from exc
+    return decoded
+
+
+def validate_bolt11_invoice(invoice: str, expected_sats: int) -> str:
+    decoded = _decode_bolt11_invoice(invoice)
     if not decoded.is_mainnet():
         raise LightningPaymentError("BOLT11 invoice is not Bitcoin mainnet")
     expected_msats = expected_sats * 1000
@@ -121,10 +128,23 @@ def validate_bolt11_invoice(invoice: str, expected_sats: int) -> str:
         raise LightningPaymentError("BOLT11 invoice amount does not match payout")
     if decoded.has_expired():
         raise LightningPaymentError("BOLT11 invoice has expired")
+    expiry = decoded.expiry_date
+    if expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=timezone.utc)
+    if expiry <= datetime.now(timezone.utc) + timedelta(seconds=60):
+        raise LightningPaymentError("BOLT11 invoice expires too soon")
     payment_hash = decoded.payment_hash.lower()
     if len(payment_hash) != 64 or any(ch not in "0123456789abcdef" for ch in payment_hash):
         raise LightningPaymentError("BOLT11 invoice has an invalid payment hash")
     return payment_hash
+
+
+def bolt11_expires_at(invoice: str) -> str:
+    decoded = _decode_bolt11_invoice(invoice)
+    expiry = decoded.expiry_date
+    if expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=timezone.utc)
+    return expiry.astimezone(timezone.utc).isoformat()
 
 
 def request_lnurl_invoice(address: str, amount_sats: int, get_json: JsonGetter = _http_get_json) -> tuple[str, str]:

@@ -57,6 +57,13 @@ def test_validate_bolt11_requires_exact_mainnet_unexpired_invoice():
     with pytest.raises(LightningPaymentError, match="expired"):
         validate_bolt11_invoice(expired, 200)
 
+    expires_too_soon, _ = make_invoice(timestamp=int(time.time()) - 3550)
+    with pytest.raises(LightningPaymentError, match="too soon"):
+        validate_bolt11_invoice(expires_too_soon, 200)
+
+    with pytest.raises(LightningPaymentError, match="length"):
+        validate_bolt11_invoice("lnbc" + "a" * 5000, 200)
+
 
 def test_request_lnurl_invoice_enforces_limits_and_callback_amount():
     invoice, payment_hash = make_invoice()

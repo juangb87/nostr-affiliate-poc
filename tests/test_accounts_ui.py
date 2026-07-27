@@ -1,3 +1,4 @@
+import base64
 import json
 
 import pytest
@@ -18,6 +19,8 @@ def configured_client(tmp_path, monkeypatch) -> TestClient:
     monkeypatch.setattr(main, "BASE_URL", "https://testserver")
     main._ENGINE = None
     main._ENGINE_URL = None
+    main._INVOICE_PREPARE_LAST.clear()
+    main._INVOICE_PREPARE_ACTIVE.clear()
     return TestClient(main.app, base_url="https://testserver")
 
 
@@ -819,6 +822,101 @@ def test_affiliate_updates_lightning_address_and_only_safe_pending_payouts(tmp_p
     assert "juan@getalby.com" in client.get("/app/affiliate").text
 
 
+def test_merchant_prepares_owned_lnurl_invoice_and_qr_without_mutating_payout(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    merchant = Keys.generate()
+    other_merchant = Keys.generate()
+    affiliate = Keys.generate()
+    campaign = create_campaign(client, merchant, name="QR payout")
+    enrollment = create_enrollment(client, campaign["campaign_id"], affiliate)
+    payout_id = seed_payable_payout(campaign, enrollment, affiliate, amount_sats=200)
+    create_campaign(client, other_merchant, name="Other QR merchant")
+    observed = []
+
+    async def fake_prepare(address: str, amount_sats: int):
+        observed.append((address, amount_sats))
+        return "lnbc2u1testinvoice", "ab" * 32
+
+    monkeypatch.setattr(main, "prepare_lnurl_payment", fake_prepare)
+    monkeypatch.setattr(main, "bolt11_expires_at", lambda _invoice: "2026-07-28T00:00:00+00:00")
+    login(client, other_merchant, "merchant")
+    hidden = client.post(
+        f"/app/merchant/payouts/{payout_id}/prepare-invoice",
+        headers={"origin": "https://testserver"},
+    )
+    assert hidden.status_code == 404
+    assert observed == []
+
+    client.post("/auth/logout")
+    login(client, merchant, "merchant")
+    wrong_origin = client.post(
+        f"/app/merchant/payouts/{payout_id}/prepare-invoice",
+        headers={"origin": "https://evil.example"},
+    )
+    assert wrong_origin.status_code == 403
+
+    prepared = client.post(
+        f"/app/merchant/payouts/{payout_id}/prepare-invoice",
+        headers={"origin": "https://testserver"},
+    )
+    assert prepared.status_code == 200, prepared.text
+    payload = prepared.json()
+    assert payload["invoice"] == "lnbc2u1testinvoice"
+    assert payload["payment_hash"] == "ab" * 32
+    assert payload["amount_sats"] == 200
+    assert payload["lightning_address"] == "old@example.com"
+    assert payload["expires_at"] == "2026-07-28T00:00:00+00:00"
+    assert payload["qr_data_uri"].startswith("data:image/svg+xml;base64,")
+    svg = base64.b64decode(payload["qr_data_uri"].split(",", 1)[1]).decode()
+    assert "<svg" in svg and "lnbc2u1testinvoice" not in svg
+    assert prepared.headers["cache-control"] == "no-store"
+    assert observed == [("old@example.com", 200)]
+    throttled = client.post(
+        f"/app/merchant/payouts/{payout_id}/prepare-invoice",
+        headers={"origin": "https://testserver"},
+    )
+    assert throttled.status_code == 429
+    assert observed == [("old@example.com", 200)]
+
+    with main.engine().connect() as connection:
+        payout = dict(connection.execute(text(
+            "SELECT state, status, payment_provider, bolt11_invoice, payment_hash FROM payouts WHERE id=:id"
+        ), {"id": payout_id}).one()._mapping)
+        attempts = connection.execute(text(
+            "SELECT COUNT(*) FROM payment_attempts WHERE payout_id=:id"
+        ), {"id": payout_id}).scalar_one()
+    assert payout == {
+        "state": "PAYABLE", "status": "pending", "payment_provider": None,
+        "bolt11_invoice": None, "payment_hash": None,
+    }
+    assert attempts == 0
+
+
+def test_merchant_discards_invoice_when_payout_changes_during_lnurl(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    merchant = Keys.generate()
+    affiliate = Keys.generate()
+    campaign = create_campaign(client, merchant, name="QR race")
+    enrollment = create_enrollment(client, campaign["campaign_id"], affiliate)
+    payout_id = seed_payable_payout(campaign, enrollment, affiliate, amount_sats=200)
+
+    async def change_destination_during_prepare(_address: str, _amount_sats: int):
+        with main.engine().begin() as connection:
+            connection.execute(text(
+                "UPDATE payouts SET lightning_address='new@example.com' WHERE id=:id"
+            ), {"id": payout_id})
+        return "lnbc2u1staleinvoice", "cd" * 32
+
+    monkeypatch.setattr(main, "prepare_lnurl_payment", change_destination_during_prepare)
+    login(client, merchant, "merchant")
+    response = client.post(
+        f"/app/merchant/payouts/{payout_id}/prepare-invoice",
+        headers={"origin": "https://testserver"},
+    )
+    assert response.status_code == 409
+    assert "changed" in response.json()["detail"]
+
+
 def test_merchant_manual_settlement_is_owned_idempotent_and_attested(tmp_path, monkeypatch):
     client = configured_client(tmp_path, monkeypatch)
     merchant = Keys.generate()
@@ -847,6 +945,11 @@ def test_merchant_manual_settlement_is_owned_idempotent_and_attested(tmp_path, m
     assert 'class="record payout-record"' in merchant_page.text
     assert 'class="payout-actions"' in merchant_page.text
     assert 'class="form-panel payout-form"' in merchant_page.text
+    assert "Generar invoice y QR" in merchant_page.text
+    assert "data-prepare-invoice" in merchant_page.text
+    assert "data-invoice-panel hidden" in merchant_page.text
+    assert "Ya pagué · usar este hash" in merchant_page.text
+    assert "Generar el invoice no realiza ni verifica el pago" in merchant_page.text
     assert 'role="status" aria-live="polite" data-manual-status' in merchant_page.text
 
     invalid = client.post(
@@ -874,6 +977,11 @@ def test_merchant_manual_settlement_is_owned_idempotent_and_attested(tmp_path, m
     )
     assert replay.status_code == 200
     assert replay.json()["duplicate"] is True
+    prepare_after_paid = client.post(
+        f"/app/merchant/payouts/{payout_id}/prepare-invoice",
+        headers={"origin": "https://testserver"},
+    )
+    assert prepare_after_paid.status_code == 409
     with main.engine().connect() as connection:
         attempts = connection.execute(text("SELECT COUNT(*) FROM payment_attempts WHERE payout_id=:id AND rail='manual'"), {"id": payout_id}).scalar_one()
         stored_preimages = connection.execute(text("SELECT COUNT(*) FROM payment_attempts WHERE payout_id=:id AND preimage IS NOT NULL"), {"id": payout_id}).scalar_one()
