@@ -844,6 +844,10 @@ def test_merchant_manual_settlement_is_owned_idempotent_and_attested(tmp_path, m
     merchant_page = client.get("/app/merchant")
     assert "old@example.com" in merchant_page.text
     assert f'data-manual-payout="{payout_id}"' in merchant_page.text
+    assert 'class="record payout-record"' in merchant_page.text
+    assert 'class="payout-actions"' in merchant_page.text
+    assert 'class="form-panel payout-form"' in merchant_page.text
+    assert 'role="status" aria-live="polite" data-manual-status' in merchant_page.text
 
     invalid = client.post(
         f"/app/merchant/payouts/{payout_id}/manual-settlement",
