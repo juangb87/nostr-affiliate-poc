@@ -39,7 +39,7 @@ def test_demo_flow_creates_conversion_and_proof(tmp_path, monkeypatch):
     assert ['v', '2'] in data['conversion']['nostr_event']['tags']
     assert any(t[0] == 'a' and t[1].startswith(f"{CAMPAIGN_KIND}:") and t[1].endswith(data['campaign']['campaign_id']) for t in data['conversion']['nostr_event']['tags'])
     assert any(t[0] == 'a' and t[1].startswith(f"{ENROLLMENT_KIND}:") and t[1].endswith(data['enrollment']['enrollment_id']) for t in data['conversion']['nostr_event']['tags'])
-    assert ['order_fiat_amount', '100.0'] in data['conversion']['nostr_event']['tags']
+    assert ['order_fiat_amount', '100'] in data['conversion']['nostr_event']['tags']
     assert ['order_fiat_currency', 'USD'] in data['conversion']['nostr_event']['tags']
     assert not any(t[0] in {'merchant', 'merchant_npub', 'affiliate', 'affiliate_npub', 'order_currency'} for t in data['conversion']['nostr_event']['tags'])
     proof = client.get('/proofs').json()

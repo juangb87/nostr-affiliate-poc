@@ -7,12 +7,15 @@ import html as html_lib
 import hmac
 import io
 import json
+import logging
 import os
 import re
 import secrets
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Optional
 
@@ -61,20 +64,23 @@ from app.payment_rails import (
     build_payment_rail,
 )
 from app.payment_state import calculate_fee_sats, payment_idempotency_key
+from app.rates import BtcUsdQuote, RateUnavailableError, btc_usd_rates, fiat_to_sats
 from app.workspaces import affiliate_workspace_data, merchant_workspace_data, short as workspace_short
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
 
 APP_SECRET = os.getenv("APP_SECRET", "dev-secret-change-me")
+logger = logging.getLogger(__name__)
 BASE_URL = os.getenv("BASE_URL", "http://localhost:8000").rstrip("/")
 DEFAULT_DESTINATION = os.getenv("DEFAULT_DESTINATION_URL", "https://example.com/checkout")
 DEFAULT_RELAYS = "wss://nos.lol,wss://relay.damus.io,wss://relay.primal.net"
-DEFAULT_SATS_PER_USD = int(os.getenv("SATS_PER_USD", "2500"))
 DEFAULT_MERCHANT_NPUB = "npub1540rxhz9x7fpc73nu5q3qydykej7lceh5j4jej6mmpc6n3saw3cqv7s8js"
 DEFAULT_AFFILIATE_NPUB = "npub16ghkhw9d4g9x6pxp6l6dtyjqaeuavwucrq8gpkt60x0kx9fzqwpszhtw0n"
 _MERCHANT_ENROLLMENT_LOCK = threading.Lock()
+_MERCHANT_CONVERSION_LOCKS = tuple(threading.Lock() for _ in range(64))
+_INIT_DB_LOCK = threading.RLock()
 _INVITATION_ACCEPT_LOCK = threading.Lock()
 _INVOICE_PREPARE_LOCK = threading.Lock()
 _INVOICE_PREPARE_LAST: dict[str, float] = {}
@@ -237,17 +243,48 @@ def add_query_params(url: str, params: dict[str, str]) -> str:
     return urlunparse(parsed._replace(query=urlencode(query)))
 
 
-def order_total_sats(order_total: float, currency: str, sats_per_usd: int | None = None) -> int:
+def rate_quote_for_currency(currency: str) -> BtcUsdQuote | None:
     normalized = currency.upper().strip()
+    if normalized not in {"USD", "USDC"}:
+        return None
+    try:
+        return btc_usd_rates.get_quote()
+    except RateUnavailableError as exc:
+        raise HTTPException(503, "live BTC/USD rate is unavailable; retry later") from exc
+
+
+def decimal_text(value: Decimal | str | int | float) -> str:
+    rendered = format(Decimal(str(value)), "f")
+    if "." in rendered:
+        rendered = rendered.rstrip("0").rstrip(".")
+    return rendered or "0"
+
+
+def order_total_sats(order_total: Decimal | str | int | float, currency: str, quote: BtcUsdQuote | None = None) -> int:
+    normalized = currency.upper().strip()
+    try:
+        amount = Decimal(str(order_total))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise HTTPException(400, "order_total must be a positive number") from exc
+    if not amount.is_finite() or amount <= 0:
+        raise HTTPException(400, "order_total must be a positive number")
     if normalized in {"SAT", "SATS", "MSAT"}:
-        if normalized == "MSAT":
-            return round(order_total / 1000)
-        return round(order_total)
-    if normalized in {"BTC", "XBT"}:
-        return round(order_total * 100_000_000)
-    if normalized in {"USD", "USDC"}:
-        return round(order_total * (sats_per_usd or DEFAULT_SATS_PER_USD))
-    raise HTTPException(400, "unsupported currency; use USD, SATS, or BTC")
+        sats = int(
+            (amount / Decimal(1000) if normalized == "MSAT" else amount).quantize(
+                Decimal("1"), rounding=ROUND_HALF_UP
+            )
+        )
+    elif normalized in {"BTC", "XBT"}:
+        sats = int((amount * Decimal(100_000_000)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    elif normalized in {"USD", "USDC"}:
+        if quote is None:
+            raise HTTPException(503, "live BTC/USD rate is unavailable; retry later")
+        sats = fiat_to_sats(amount, quote)
+    else:
+        raise HTTPException(400, "unsupported currency; use USD, SATS, or BTC")
+    if sats <= 0:
+        raise HTTPException(422, "order total is too small to create a sat-denominated obligation")
+    return sats
 
 
 def normalize_pubkey(value: str, label: str = "pubkey") -> dict[str, str]:
@@ -385,10 +422,10 @@ def address_coordinate(kind: int, entity_id: str) -> str:
     return f"{kind}:{nostr_keys().public_key().to_hex()}:{entity_id}"
 
 
-def fiat_order_tags(order_total: float, currency: str) -> list[list[str]]:
+def fiat_order_tags(order_total: Decimal | str | int | float, currency: str) -> list[list[str]]:
     normalized = currency.upper().strip()
     if normalized in {"USD", "USDC"}:
-        return [["order_fiat_amount", str(order_total)], ["order_fiat_currency", normalized]]
+        return [["order_fiat_amount", decimal_text(order_total)], ["order_fiat_currency", normalized]]
     return []
 
 
@@ -453,7 +490,7 @@ async def _publish_event(event_json: dict[str, Any], relays: list[str]) -> list[
         return [{"relay": relay, "status": "failed", "error": "invalid relay url"} for relay in relays]
     try:
         await client.connect()
-        event = Event.from_json(json.dumps({k: v for k, v in event_json.items() if k != "relay_status"}))
+        event = Event.from_json(json.dumps({k: v for k, v in event_json.items() if k not in {"relay_status", "relay_results"}}))
         output = await asyncio.wait_for(client.send_event_to(relay_urls, event), timeout=12)
         success = {str(r) for r in output.success}
         failed = {str(k): str(v) for k, v in output.failed.items()}
@@ -487,7 +524,18 @@ def publish_event(event_json: dict[str, Any]) -> list[dict[str, str]]:
 
 def persist_nostr_event(c: Any, event: dict[str, Any], entity_type: str, entity_id: str, relay_results: list[dict[str, str]]) -> None:
     published_count = sum(1 for r in relay_results if r["status"] == "published")
-    relay_status = "published" if published_count else relay_results[0]["status"] if relay_results else "unknown"
+    retryable_failure = (
+        entity_type in {"conversion", "campaign"}
+        and not published_count
+        and any(r["status"] == "failed" for r in relay_results)
+    )
+    relay_status = (
+        "published" if published_count
+        else "pending_publication" if retryable_failure
+        else relay_results[0]["status"] if relay_results
+        else "pending_publication" if entity_type in {"conversion", "campaign"}
+        else "unknown"
+    )
     event["relay_status"] = relay_status
     event["relay_results"] = relay_results
     c.execute(
@@ -529,7 +577,55 @@ def persist_nostr_event(c: Any, event: dict[str, Any], entity_type: str, entity_
         )
 
 
-def init_db() -> None:
+def finalize_committed_nostr_event(event: dict[str, Any], entity_type: str, entity_id: str) -> list[dict[str, str]]:
+    """Publish only after the financial transaction committed; keep a durable pending outbox on failure."""
+    relay_results = publish_event(event)
+    try:
+        with engine().begin() as c:
+            persist_nostr_event(c, event, entity_type, entity_id, relay_results)
+            if entity_type == "conversion":
+                c.execute(
+                    text("UPDATE conversions SET nostr_event_json=:event_json WHERE id=:id"),
+                    {"id": entity_id, "event_json": json.dumps(event)},
+                )
+            elif entity_type == "campaign":
+                c.execute(
+                    text("UPDATE campaigns SET nostr_event_json=:event_json WHERE id=:id"),
+                    {"id": entity_id, "event_json": json.dumps(event)},
+                )
+    except Exception:
+        logger.exception("failed to finalize committed Nostr outbox event %s", event.get("id"))
+        event["relay_status"] = "pending_publication"
+        event["relay_results"] = []
+        return []
+    return relay_results
+
+
+def retry_conversion_outbox(conversion_id: str) -> None:
+    """Retry durable conversion and related campaign events on an idempotent webhook replay."""
+    with engine().connect() as c:
+        rows = [dict(row._mapping) for row in c.execute(text("""
+            SELECT event_json, entity_type, entity_id
+            FROM nostr_events
+            WHERE relay_status='pending_publication'
+              AND (
+                (entity_type='conversion' AND entity_id=:conversion_id)
+                OR (
+                    entity_type='campaign'
+                    AND entity_id=(SELECT campaign_id FROM conversions WHERE id=:conversion_id)
+                )
+              )
+            ORDER BY CASE WHEN entity_type='conversion' THEN 0 ELSE 1 END, created_at
+        """), {"conversion_id": conversion_id}).fetchall()]
+    for row in rows:
+        try:
+            pending_event = json.loads(row["event_json"])
+            finalize_committed_nostr_event(pending_event, row["entity_type"], row["entity_id"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            logger.exception("invalid pending Nostr outbox event for %s %s", row["entity_type"], row["entity_id"])
+
+
+def _init_db_unlocked() -> None:
     ddl = """
     CREATE TABLE IF NOT EXISTS campaigns (
         id TEXT PRIMARY KEY,
@@ -594,6 +690,7 @@ def init_db() -> None:
         topic TEXT NOT NULL,
         click_id TEXT NOT NULL,
         order_total REAL NOT NULL,
+        order_total_decimal TEXT,
         currency TEXT NOT NULL,
         status TEXT NOT NULL,
         conversion_id TEXT,
@@ -613,11 +710,21 @@ def init_db() -> None:
     CREATE TABLE IF NOT EXISTS conversions (
         id TEXT PRIMARY KEY,
         order_id_hash TEXT NOT NULL,
+        merchant_order_key TEXT UNIQUE,
+        idempotency_payload_hash TEXT,
         click_id TEXT NOT NULL,
         campaign_id TEXT NOT NULL,
         affiliate_pubkey TEXT NOT NULL,
         order_total REAL NOT NULL,
+        order_total_decimal TEXT,
         currency TEXT NOT NULL,
+        order_total_sats INTEGER,
+        btc_usd_rate TEXT,
+        sats_per_usd TEXT,
+        rate_source TEXT,
+        rate_observed_at TEXT,
+        rate_fetched_at TEXT,
+        rate_stale INTEGER,
         commission_sats INTEGER NOT NULL,
         status TEXT NOT NULL,
         nostr_event_id TEXT NOT NULL,
@@ -793,6 +900,17 @@ def init_db() -> None:
         if database_url().startswith("postgresql"):
             c.execute(text("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS merchant_pubkey_hex TEXT"))
             c.execute(text("ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS affiliate_pubkey_hex TEXT"))
+            c.execute(text("ALTER TABLE conversions ADD COLUMN IF NOT EXISTS merchant_order_key TEXT"))
+            c.execute(text("ALTER TABLE conversions ADD COLUMN IF NOT EXISTS idempotency_payload_hash TEXT"))
+            c.execute(text("ALTER TABLE conversions ADD COLUMN IF NOT EXISTS order_total_decimal TEXT"))
+            c.execute(text("ALTER TABLE shopify_webhook_deliveries ADD COLUMN IF NOT EXISTS order_total_decimal TEXT"))
+            c.execute(text("ALTER TABLE conversions ADD COLUMN IF NOT EXISTS order_total_sats INTEGER"))
+            c.execute(text("ALTER TABLE conversions ADD COLUMN IF NOT EXISTS btc_usd_rate TEXT"))
+            c.execute(text("ALTER TABLE conversions ADD COLUMN IF NOT EXISTS sats_per_usd TEXT"))
+            c.execute(text("ALTER TABLE conversions ADD COLUMN IF NOT EXISTS rate_source TEXT"))
+            c.execute(text("ALTER TABLE conversions ADD COLUMN IF NOT EXISTS rate_observed_at TEXT"))
+            c.execute(text("ALTER TABLE conversions ADD COLUMN IF NOT EXISTS rate_fetched_at TEXT"))
+            c.execute(text("ALTER TABLE conversions ADD COLUMN IF NOT EXISTS rate_stale INTEGER"))
             c.execute(text("ALTER TABLE payouts ADD COLUMN IF NOT EXISTS bolt11_invoice TEXT"))
             c.execute(text("ALTER TABLE payouts ADD COLUMN IF NOT EXISTS payment_provider TEXT"))
             c.execute(text("ALTER TABLE payouts ADD COLUMN IF NOT EXISTS fees_paid_msats INTEGER"))
@@ -815,6 +933,8 @@ def init_db() -> None:
         else:
             campaign_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(campaigns)")).fetchall()}
             enrollment_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(enrollments)")).fetchall()}
+            conversion_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(conversions)")).fetchall()}
+            shopify_delivery_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(shopify_webhook_deliveries)")).fetchall()}
             payout_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(payouts)")).fetchall()}
             attempt_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(payment_attempts)")).fetchall()}
             challenge_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(auth_challenges)")).fetchall()}
@@ -822,6 +942,23 @@ def init_db() -> None:
                 c.execute(text("ALTER TABLE campaigns ADD COLUMN merchant_pubkey_hex TEXT"))
             if "affiliate_pubkey_hex" not in enrollment_cols:
                 c.execute(text("ALTER TABLE enrollments ADD COLUMN affiliate_pubkey_hex TEXT"))
+            conversion_column_ddl = {
+                "merchant_order_key": "TEXT",
+                "idempotency_payload_hash": "TEXT",
+                "order_total_decimal": "TEXT",
+                "order_total_sats": "INTEGER",
+                "btc_usd_rate": "TEXT",
+                "sats_per_usd": "TEXT",
+                "rate_source": "TEXT",
+                "rate_observed_at": "TEXT",
+                "rate_fetched_at": "TEXT",
+                "rate_stale": "INTEGER",
+            }
+            for column, column_type in conversion_column_ddl.items():
+                if column not in conversion_cols:
+                    c.execute(text(f"ALTER TABLE conversions ADD COLUMN {column} {column_type}"))
+            if "order_total_decimal" not in shopify_delivery_cols:
+                c.execute(text("ALTER TABLE shopify_webhook_deliveries ADD COLUMN order_total_decimal TEXT"))
             payout_column_ddl = {
                 "bolt11_invoice": "TEXT",
                 "payment_provider": "TEXT",
@@ -851,6 +988,7 @@ def init_db() -> None:
             if "client_hash" not in challenge_cols:
                 c.execute(text("ALTER TABLE auth_challenges ADD COLUMN client_hash TEXT"))
         c.execute(text("CREATE INDEX IF NOT EXISTS idx_auth_challenges_rate ON auth_challenges(client_hash, created_at)"))
+        c.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_conversions_merchant_order_key ON conversions(merchant_order_key) WHERE merchant_order_key IS NOT NULL"))
         c.execute(text("""
             UPDATE payouts SET state=CASE
                 WHEN status='paid' AND nostr_event_id IS NOT NULL THEN 'PUBLISHED'
@@ -878,6 +1016,12 @@ def init_db() -> None:
                     AND ledger_entries.idempotency_key=payouts.id || ':reserve:debit'
               )
         """))
+
+
+def init_db() -> None:
+    """Run idempotent schema initialization once at a time within this process."""
+    with _INIT_DB_LOCK:
+        _init_db_unlocked()
 
 
 def record_ledger_transaction(
@@ -1061,11 +1205,12 @@ class EnrollmentIn(BaseModel):
 
 
 class ConversionIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     order_id: str
     click_id: str
-    order_total: float
+    order_total: Decimal = Field(..., gt=0, max_digits=20, decimal_places=8)
     currency: str = "USD"
-    sats_per_usd: int = 2500
 
 
 class SimulateClickIn(BaseModel):
@@ -1112,9 +1257,11 @@ class BrowserConversionIn(BaseModel):
 
 
 class MerchantConversionIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     order_id: str = Field(..., min_length=3)
     bb_click_id: str = Field(..., min_length=4)
-    order_total: float = Field(..., gt=0)
+    order_total: Decimal = Field(..., gt=0, max_digits=20, decimal_places=8)
     currency: str = Field("USD", description="USD, SATS, or BTC. USD is converted to sats server-side.")
     customer_hash: Optional[str] = None
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -1123,7 +1270,7 @@ class MerchantConversionIn(BaseModel):
 class DemoMerchantCheckoutIn(BaseModel):
     bb_click_id: str = Field(..., min_length=4)
     bb_ref: Optional[str] = None
-    order_total: float = Field(250000, gt=0)
+    order_total: Decimal = Field(Decimal("250000"), gt=0, max_digits=20, decimal_places=8)
     currency: str = "SATS"
 
 
@@ -1196,7 +1343,7 @@ def health() -> dict[str, Any]:
         "nostr_pubkey": nostr_keys().public_key().to_hex(),
         "nostr_publish": nostr_publish_enabled(),
         "relays": nostr_relays(),
-        "sats_per_usd": DEFAULT_SATS_PER_USD,
+        "btc_usd_rates": {"mode": "live", "providers": ["coingecko", "yadio"]},
         "nostr_schema_version": SCHEMA_VERSION,
         "nostr_kinds": {
             "campaign": CAMPAIGN_KIND,
@@ -1667,10 +1814,25 @@ def redirect_click(ref_code: str, request: Request) -> RedirectResponse:
     return resp
 
 
-@app.post("/conversions")
-def create_conversion(body: ConversionIn, bb_click_id: Optional[str] = Cookie(None)) -> dict[str, Any]:
+def _create_conversion(
+    body: ConversionIn,
+    bb_click_id: Optional[str] = None,
+    *,
+    merchant_order_key: str | None = None,
+    idempotency_payload_hash: str | None = None,
+) -> dict[str, Any]:
+    quote = rate_quote_for_currency(body.currency)
+    rate_snapshot = quote.snapshot() if quote else {
+        "btc_usd_rate": None,
+        "sats_per_usd": None,
+        "rate_source": "not_required",
+        "rate_observed_at": None,
+        "rate_fetched_at": None,
+        "rate_stale": False,
+    }
     init_db()
     click_id = body.click_id or bb_click_id
+    pause_event: dict[str, Any] | None = None
     with engine().begin() as c:
         click = asdict(c.execute(text("SELECT * FROM clicks WHERE id=:id"), {"id": click_id}).fetchone())
         if not click:
@@ -1687,8 +1849,8 @@ def create_conversion(body: ConversionIn, bb_click_id: Optional[str] = Cookie(No
             raise HTTPException(409, "campaign is not active")
         if not enr or enr.get("status") != "approved":
             raise HTTPException(409, "enrollment is not approved")
-        total_sats = order_total_sats(body.order_total, body.currency, body.sats_per_usd)
-        commission_sats = int(total_sats * int(camp["commission_bps"]) / 10000)
+        total_sats = order_total_sats(body.order_total, body.currency, quote)
+        commission_sats = total_sats * int(camp["commission_bps"]) // 10000
         conversion_id = hid("conv")
         merchant_hex = camp.get("merchant_pubkey_hex") or normalize_pubkey(camp["merchant_pubkey"], "merchant_pubkey")["hex"]
         affiliate_hex = (enr.get("affiliate_pubkey_hex") if enr else None) or normalize_pubkey(click["affiliate_pubkey"], "affiliate_pubkey")["hex"]
@@ -1707,26 +1869,49 @@ def create_conversion(body: ConversionIn, bb_click_id: Optional[str] = Cookie(No
             ["commission_bps", str(camp["commission_bps"])],
             ["status", "approved"],
         ] + fiat_order_tags(body.order_total, body.currency)
+        if quote:
+            conversion_tags.extend([
+                ["btc_usd_rate", rate_snapshot["btc_usd_rate"]],
+                ["sats_per_usd", rate_snapshot["sats_per_usd"]],
+                ["rate_source", rate_snapshot["rate_source"]],
+                ["rate_observed_at", rate_snapshot["rate_observed_at"]],
+                ["rate_fetched_at", rate_snapshot["rate_fetched_at"]],
+                ["rate_stale", "true" if rate_snapshot["rate_stale"] else "false"],
+            ])
         event = build_nostr_event(CONVERSION_KIND, conversion_tags, "")
-        relay_results = publish_event(event)
+        relay_results: list[dict[str, str]] = []
         persist_nostr_event(c, event, "conversion", conversion_id, relay_results)
         c.execute(
             text(
                 """
-                INSERT INTO conversions (id, order_id_hash, click_id, campaign_id, affiliate_pubkey,
-                order_total, currency, commission_sats, status, nostr_event_id, nostr_event_json, created_at)
-                VALUES (:id, :order_id_hash, :click_id, :campaign_id, :affiliate_pubkey,
-                :order_total, :currency, :commission_sats, :status, :nostr_event_id, :nostr_event_json, :created_at)
+                INSERT INTO conversions (id, order_id_hash, merchant_order_key, idempotency_payload_hash, click_id, campaign_id, affiliate_pubkey,
+                order_total, order_total_decimal, currency, order_total_sats, btc_usd_rate, sats_per_usd, rate_source,
+                rate_observed_at, rate_fetched_at, rate_stale, commission_sats, status,
+                nostr_event_id, nostr_event_json, created_at)
+                VALUES (:id, :order_id_hash, :merchant_order_key, :idempotency_payload_hash, :click_id, :campaign_id, :affiliate_pubkey,
+                :order_total, :order_total_decimal, :currency, :order_total_sats, :btc_usd_rate, :sats_per_usd, :rate_source,
+                :rate_observed_at, :rate_fetched_at, :rate_stale, :commission_sats, :status,
+                :nostr_event_id, :nostr_event_json, :created_at)
                 """
             ),
             {
                 "id": conversion_id,
                 "order_id_hash": sha(body.order_id),
+                "merchant_order_key": merchant_order_key,
+                "idempotency_payload_hash": idempotency_payload_hash,
                 "click_id": click_id,
                 "campaign_id": click["campaign_id"],
                 "affiliate_pubkey": click["affiliate_pubkey"],
-                "order_total": body.order_total,
+                "order_total": float(body.order_total),
+                "order_total_decimal": decimal_text(body.order_total),
                 "currency": body.currency,
+                "order_total_sats": total_sats,
+                "btc_usd_rate": rate_snapshot["btc_usd_rate"],
+                "sats_per_usd": rate_snapshot["sats_per_usd"],
+                "rate_source": rate_snapshot["rate_source"],
+                "rate_observed_at": rate_snapshot["rate_observed_at"],
+                "rate_fetched_at": rate_snapshot["rate_fetched_at"],
+                "rate_stale": 1 if rate_snapshot["rate_stale"] else 0,
                 "commission_sats": commission_sats,
                 "status": "approved",
                 "nostr_event_id": event["id"],
@@ -1773,13 +1958,33 @@ def create_conversion(body: ConversionIn, bb_click_id: Optional[str] = Cookie(No
         if not budget_reserved:
             camp["status"] = "paused"
             pause_event = build_campaign_event(camp)
-            pause_relays = publish_event(pause_event)
-            persist_nostr_event(c, pause_event, "campaign", camp["id"], pause_relays)
+            persist_nostr_event(c, pause_event, "campaign", camp["id"], [])
             c.execute(
                 text("UPDATE campaigns SET status='paused', nostr_event_id=:event_id, nostr_event_json=:event_json WHERE id=:id"),
                 {"id": camp["id"], "event_id": pause_event["id"], "event_json": json.dumps(pause_event)},
             )
-    return {"conversion_id": conversion_id, "affiliate_pubkey": click["affiliate_pubkey"], "commission_sats": commission_sats, "fee_sats": fee_sats, "status": "approved", "payout_status": payout_status, "payout_state": payout_state, "nostr_event_id": event["id"], "nostr_event": event, "relay_results": relay_results}
+    relay_results = finalize_committed_nostr_event(event, "conversion", conversion_id)
+    if pause_event is not None:
+        finalize_committed_nostr_event(pause_event, "campaign", camp["id"])
+    return {
+        "conversion_id": conversion_id,
+        "affiliate_pubkey": click["affiliate_pubkey"],
+        "order_total_sats": total_sats,
+        **rate_snapshot,
+        "commission_sats": commission_sats,
+        "fee_sats": fee_sats,
+        "status": "approved",
+        "payout_status": payout_status,
+        "payout_state": payout_state,
+        "nostr_event_id": event["id"],
+        "nostr_event": event,
+        "relay_results": relay_results,
+    }
+
+
+@app.post("/conversions")
+def create_conversion(body: ConversionIn, bb_click_id: Optional[str] = Cookie(None)) -> dict[str, Any]:
+    return _create_conversion(body, bb_click_id)
 
 
 def apply_reversal_to_payout(c: Any, conversion: dict[str, Any]) -> None:
@@ -2095,27 +2300,112 @@ def dashboard_data() -> dict[str, Any]:
     return {"health": health(), "counts": counts, "campaigns": campaigns, "enrollments": enrollments, "clicks": clicks, "conversions": conversions, "events": events}
 
 
+@contextmanager
+def merchant_conversion_lock(order_key: str):
+    """Serialize one merchant order locally and across PostgreSQL workers."""
+    lock_digest = order_key.rsplit(":", 1)[-1]
+    lock = _MERCHANT_CONVERSION_LOCKS[int(lock_digest[:8], 16) % len(_MERCHANT_CONVERSION_LOCKS)]
+    with lock:
+        if not database_url().startswith("postgresql"):
+            yield
+            return
+        with engine().connect().execution_options(isolation_level="AUTOCOMMIT") as c:
+            c.execute(text("SELECT pg_advisory_lock(hashtextextended(:key, 0))"), {"key": order_key})
+            try:
+                yield
+            finally:
+                c.execute(text("SELECT pg_advisory_unlock(hashtextextended(:key, 0))"), {"key": order_key})
+
+
 def process_merchant_conversion(body: MerchantConversionIn, authorized_merchant_hex: str) -> dict[str, Any]:
+    merchant_order_key = sha(f"{authorized_merchant_hex}:{body.order_id}")
+    with merchant_conversion_lock(merchant_order_key):
+        return _process_merchant_conversion_locked(body, authorized_merchant_hex, merchant_order_key)
+
+
+def _process_merchant_conversion_locked(
+    body: MerchantConversionIn,
+    authorized_merchant_hex: str,
+    merchant_order_key: str,
+) -> dict[str, Any]:
     """Create an idempotent, payout-grade conversion from a trusted merchant signal."""
     init_db()
     order_id_hash = sha(body.order_id)
-    payload_hash = sha(json.dumps(body.model_dump(), sort_keys=True, default=str))
+    payload_material = {
+        "click_id": body.bb_click_id,
+        "order_total": decimal_text(body.order_total),
+        "currency": body.currency.upper().strip(),
+    }
+    payload_hash = sha(json.dumps(payload_material, sort_keys=True, separators=(",", ":")))
+    select_existing = """
+        SELECT v.id, v.merchant_order_key, v.idempotency_payload_hash, v.click_id,
+               v.order_total, v.order_total_decimal, v.currency, v.nostr_event_id,
+               v.nostr_event_json, v.order_total_sats, v.commission_sats,
+               v.btc_usd_rate, v.sats_per_usd, v.rate_source, v.rate_observed_at,
+               v.rate_fetched_at, v.rate_stale, c.merchant_pubkey, c.merchant_pubkey_hex,
+               ne.relay_status
+        FROM conversions v JOIN campaigns c ON c.id=v.campaign_id
+        LEFT JOIN nostr_events ne ON ne.event_id=v.nostr_event_id
+    """
     with engine().connect() as c:
-        existing = asdict(c.execute(text("""
-            SELECT v.id, v.nostr_event_id, c.merchant_pubkey, c.merchant_pubkey_hex
-            FROM conversions v JOIN campaigns c ON c.id=v.campaign_id
-            WHERE v.order_id_hash=:h
-        """), {"h": order_id_hash}).fetchone())
+        existing = asdict(c.execute(
+            text(select_existing + " WHERE v.merchant_order_key=:key LIMIT 1"),
+            {"key": merchant_order_key},
+        ).fetchone())
+        if not existing:
+            legacy_candidates = [dict(row._mapping) for row in c.execute(
+                text(select_existing + " WHERE v.merchant_order_key IS NULL AND v.order_id_hash=:h"),
+                {"h": order_id_hash},
+            ).fetchall()]
+            for candidate in legacy_candidates:
+                try:
+                    require_merchant_ownership(candidate, authorized_merchant_hex)
+                except HTTPException:
+                    continue
+                existing = candidate
+                break
     if existing:
         require_merchant_ownership(existing, authorized_merchant_hex)
+        stored_payload_hash = existing.get("idempotency_payload_hash")
+        if not stored_payload_hash:
+            stored_material = {
+                "click_id": existing["click_id"],
+                "order_total": decimal_text(existing.get("order_total_decimal") or existing["order_total"]),
+                "currency": str(existing["currency"]).upper().strip(),
+            }
+            stored_payload_hash = sha(json.dumps(stored_material, sort_keys=True, separators=(",", ":")))
+        if not hmac.compare_digest(stored_payload_hash, payload_hash):
+            raise HTTPException(409, "idempotency key reused with different conversion payload")
+        rate_source = existing.get("rate_source") or "legacy_unknown"
+        if not existing.get("merchant_order_key") or not existing.get("idempotency_payload_hash"):
+            with engine().begin() as c:
+                c.execute(
+                    text("""
+                        UPDATE conversions
+                        SET merchant_order_key=COALESCE(merchant_order_key, :key),
+                            idempotency_payload_hash=COALESCE(idempotency_payload_hash, :payload_hash)
+                        WHERE id=:id
+                    """),
+                    {"key": merchant_order_key, "payload_hash": stored_payload_hash, "id": existing["id"]},
+                )
+        retry_conversion_outbox(existing["id"])
         return {
             "ok": True,
             "duplicate": True,
             "conversion_id": existing["id"],
             "nostr_event_id": existing["nostr_event_id"],
+            "order_total_sats": existing.get("order_total_sats"),
+            "commission_sats": existing.get("commission_sats"),
+            "sats_per_usd_source": "server" if rate_source not in {"not_required", "legacy_unknown"} else rate_source,
+            "btc_usd_rate": existing.get("btc_usd_rate"),
+            "sats_per_usd": existing.get("sats_per_usd"),
+            "rate_source": rate_source,
+            "rate_observed_at": existing.get("rate_observed_at"),
+            "rate_fetched_at": existing.get("rate_fetched_at"),
+            "rate_stale": bool(existing.get("rate_stale")),
             "receipt_url": f"{BASE_URL}/flows/{existing['id']}/receipt",
             "json_receipt_url": f"{BASE_URL}/flows/{existing['id']}",
-            "payload_hash": payload_hash,
+            "payload_hash": stored_payload_hash,
         }
     with engine().connect() as c:
         click_campaign = asdict(c.execute(text("""
@@ -2126,24 +2416,29 @@ def process_merchant_conversion(body: MerchantConversionIn, authorized_merchant_
     if not click_campaign:
         raise HTTPException(404, "click not found")
     require_merchant_ownership(click_campaign, authorized_merchant_hex)
-    conversion = create_conversion(
+    conversion = _create_conversion(
         ConversionIn(
             order_id=body.order_id,
             click_id=body.bb_click_id,
             order_total=body.order_total,
             currency=body.currency,
-            sats_per_usd=DEFAULT_SATS_PER_USD,
-        )
+        ),
+        merchant_order_key=merchant_order_key,
+        idempotency_payload_hash=payload_hash,
     )
-    total_sats = order_total_sats(body.order_total, body.currency, DEFAULT_SATS_PER_USD)
     return {
         "ok": True,
         "duplicate": False,
         "conversion_id": conversion["conversion_id"],
         "nostr_event_id": conversion["nostr_event_id"],
-        "order_total_sats": total_sats,
+        "order_total_sats": conversion["order_total_sats"],
         "sats_per_usd_source": "server" if body.currency.upper() in {"USD", "USDC"} else "not_required",
-        "sats_per_usd": DEFAULT_SATS_PER_USD if body.currency.upper() in {"USD", "USDC"} else None,
+        "btc_usd_rate": conversion["btc_usd_rate"],
+        "sats_per_usd": conversion["sats_per_usd"],
+        "rate_source": conversion["rate_source"],
+        "rate_observed_at": conversion["rate_observed_at"],
+        "rate_fetched_at": conversion["rate_fetched_at"],
+        "rate_stale": conversion["rate_stale"],
         "commission_sats": conversion["commission_sats"],
         "payout_status": conversion["payout_status"],
         "receipt_url": f"{BASE_URL}/flows/{conversion['conversion_id']}/receipt",
@@ -2225,7 +2520,7 @@ def record_shopify_webhook_receipt(
 
 
 def enqueue_shopify_paid_order(
-    *, webhook_id: str, order_key: str, shop: str, topic: str, click_id: str, order_total: float, currency: str
+    *, webhook_id: str, order_key: str, shop: str, topic: str, click_id: str, order_total: Decimal, currency: str
 ) -> tuple[dict[str, Any], bool, bool]:
     """Persist a minimal webhook inbox row and atomically claim a new Shopify order."""
     init_db()
@@ -2235,9 +2530,9 @@ def enqueue_shopify_paid_order(
             text(
                 """
                 INSERT INTO shopify_webhook_deliveries
-                (webhook_id, order_key, shop_domain, topic, click_id, order_total, currency,
+                (webhook_id, order_key, shop_domain, topic, click_id, order_total, order_total_decimal, currency,
                  status, conversion_id, error, created_at, processed_at)
-                VALUES (:webhook_id, :order_key, :shop_domain, :topic, :click_id, :order_total,
+                VALUES (:webhook_id, :order_key, :shop_domain, :topic, :click_id, :order_total, :order_total_decimal,
                         :currency, 'pending', NULL, NULL, :created_at, NULL)
                 ON CONFLICT(order_key) DO NOTHING
                 """
@@ -2248,7 +2543,8 @@ def enqueue_shopify_paid_order(
                 "shop_domain": shop,
                 "topic": topic,
                 "click_id": click_id,
-                "order_total": order_total,
+                "order_total": float(order_total),
+                "order_total_decimal": decimal_text(order_total),
                 "currency": currency,
                 "created_at": created_at,
             },
@@ -2258,7 +2554,7 @@ def enqueue_shopify_paid_order(
             row
             and (
                 row["click_id"] != click_id
-                or float(row["order_total"]) != order_total
+                or Decimal(row.get("order_total_decimal") or str(row["order_total"])) != order_total
                 or row["currency"] != currency
                 or row["shop_domain"] != shop
             )
@@ -2296,7 +2592,7 @@ def process_shopify_delivery(order_key: str) -> None:
             MerchantConversionIn(
                 order_id=order_key,
                 bb_click_id=row["click_id"],
-                order_total=float(row["order_total"]),
+                order_total=Decimal(row.get("order_total_decimal") or str(row["order_total"])),
                 currency=row["currency"],
                 metadata={"platform": "shopify", "shop": row["shop_domain"], "topic": row["topic"]},
             ),
@@ -2385,10 +2681,10 @@ async def shopify_orders_paid_webhook(request: Request, background_tasks: Backgr
     order_id = safe_text(payload.get("id"), 300)
     currency = safe_text(payload.get("currency"), 20).upper()
     try:
-        order_total = float(payload.get("total_price"))
-    except (TypeError, ValueError):
+        order_total = Decimal(str(payload.get("total_price")))
+    except (InvalidOperation, TypeError, ValueError):
         raise HTTPException(422, "invalid Shopify order total")
-    if not order_id or not currency or order_total <= 0:
+    if not order_id or not currency or not order_total.is_finite() or order_total <= 0:
         raise HTTPException(422, "incomplete Shopify paid order")
 
     order_key = sha(f"shopify:{shop}:{order_id}")
@@ -4054,16 +4350,19 @@ def demo_merchant_checkout(body: DemoMerchantCheckoutIn) -> dict[str, Any]:
             click_id=body.bb_click_id,
             order_total=body.order_total,
             currency=body.currency,
-            sats_per_usd=DEFAULT_SATS_PER_USD,
         )
     )
-    total_sats = order_total_sats(body.order_total, body.currency, DEFAULT_SATS_PER_USD)
     return {
         "ok": True,
         "demo": True,
         "bb_click_id": body.bb_click_id,
         "bb_ref": body.bb_ref,
-        "order_total_sats": total_sats,
+        "order_total_sats": conversion["order_total_sats"],
+        "btc_usd_rate": conversion["btc_usd_rate"],
+        "sats_per_usd": conversion["sats_per_usd"],
+        "rate_source": conversion["rate_source"],
+        "rate_observed_at": conversion["rate_observed_at"],
+        "rate_stale": conversion["rate_stale"],
         "conversion_id": conversion["conversion_id"],
         "nostr_event_id": conversion["nostr_event_id"],
         "commission_sats": conversion["commission_sats"],
@@ -4168,7 +4467,8 @@ DASHBOARD_HTML = """
       <input id="refCode" placeholder="ref_code from enrollment">
       <p><button class="secondary" onclick="simulateClick()">Simulate click</button></p>
       <input id="clickId" placeholder="click_id">
-      <div class="row"><input id="orderTotal" type="number" value="100"><input id="satsUsd" type="number" value="2500"></div>
+      <input id="orderTotal" type="number" min="0.01" step="0.01" value="100" aria-label="Order total in USD">
+      <p class="label">BTC/USD is resolved server-side from live providers.</p>
       <p><button onclick="createConversion()">Create conversion proof</button></p>
     </div>
   </section>
@@ -4219,7 +4519,7 @@ async function simulateClick(){
   $('clickId').value=data.click_id; show(data); toast('Click simulated'); await refresh();
 }
 async function createConversion(){
-  const data = await api('/conversions',{method:'POST',body:JSON.stringify({order_id:'ord_'+crypto.randomUUID(),click_id:$('clickId').value,order_total:+$('orderTotal').value,currency:'USD',sats_per_usd:+$('satsUsd').value})});
+  const data = await api('/conversions',{method:'POST',body:JSON.stringify({order_id:'ord_'+crypto.randomUUID(),click_id:$('clickId').value,order_total:$('orderTotal').value,currency:'USD'})});
   show(data); toast('Conversion proof published'); await refresh();
 }
 async function runDemo(){ const data = await api('/demo',{method:'POST'}); $('campaignId').value=data.campaign.campaign_id; $('refCode').value=data.enrollment.ref_code; $('clickId').value=data.click_id; show(data); toast('Full demo complete'); await refresh(); }

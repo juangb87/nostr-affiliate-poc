@@ -53,7 +53,7 @@ def test_budget_reservation_on_hold_and_balanced_ledger(tmp_path, monkeypatch):
     click_id = client.post("/clicks/simulate", json={"ref_code": ref_code}).json()["click_id"]
     conversion = client.post(
         "/conversions",
-        json={"order_id": "budget-overflow", "click_id": click_id, "order_total": 100, "currency": "USD", "sats_per_usd": 2500},
+        json={"order_id": "budget-overflow", "click_id": click_id, "order_total": 100, "currency": "USD"},
     )
     assert conversion.status_code == 200, conversion.text
     overflow_flow = client.get(f"/flows/{conversion.json()['conversion_id']}").json()
