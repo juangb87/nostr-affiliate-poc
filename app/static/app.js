@@ -84,3 +84,46 @@ document.addEventListener("click", async (event) => {
     }
   }
 });
+
+document.addEventListener("submit", async (event) => {
+  const form = event.target.closest("[data-merchant-enrollment]");
+  if (!form) return;
+  event.preventDefault();
+  const status = form.querySelector("[data-enrollment-status]");
+  const link = form.querySelector("[data-enrollment-link]");
+  const button = form.querySelector("button[type='submit']");
+  const fields = new FormData(form);
+  const payload = {
+    campaign_id: String(fields.get("campaign_id") || "").trim(),
+    affiliate_pubkey: String(fields.get("affiliate_pubkey") || "").trim(),
+    lightning_address: String(fields.get("lightning_address") || "").trim() || null
+  };
+  button.disabled = true;
+  status.classList.remove("error");
+  status.textContent = "Creando enrollment y publicando la prueba Nostr…";
+  link.hidden = true;
+  try {
+    const result = await jsonFetch("/app/merchant/enrollments", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    });
+    const safeUrl = new URL(result.ref_url, window.location.origin);
+    if (safeUrl.origin !== window.location.origin) throw new Error("El servidor devolvió un enlace inválido");
+    if (result.duplicate) {
+      status.textContent = "Esta identidad ya estaba inscripta y continúa aprobada.";
+    } else if (result.nostr_status === "published") {
+      status.textContent = "Afiliado aprobado y prueba Nostr publicada. Ya puede iniciar sesión como Affiliate.";
+    } else {
+      status.textContent = "Afiliado aprobado. La prueba Nostr quedó pendiente de publicación; el login Affiliate ya está habilitado.";
+    }
+    link.href = safeUrl.href;
+    link.textContent = safeUrl.href;
+    link.hidden = false;
+    if (!result.duplicate) form.reset();
+  } catch (error) {
+    status.textContent = error.message;
+    status.classList.add("error");
+  } finally {
+    button.disabled = false;
+  }
+});

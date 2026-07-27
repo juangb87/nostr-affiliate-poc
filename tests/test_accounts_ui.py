@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 from nostr_sdk import EventBuilder, Keys, Kind, Tag
 from sqlalchemy import text
 
+
 from app import main
 from app.workspaces import affiliate_workspace_data, merchant_workspace_data
 
@@ -208,7 +209,7 @@ def test_human_owner_can_be_bound_to_merchant_identity(tmp_path, monkeypatch):
     client = configured_client(tmp_path, monkeypatch)
     merchant_identity = Keys.generate()
     human_owner = Keys.generate()
-    create_campaign(client, merchant_identity, name="Bound merchant campaign")
+    campaign = create_campaign(client, merchant_identity, name="Bound merchant campaign")
     monkeypatch.setenv(
         "MERCHANT_ACCOUNT_BINDINGS",
         f"{human_owner.public_key().to_bech32()}:{merchant_identity.public_key().to_bech32()}",
@@ -218,6 +219,124 @@ def test_human_owner_can_be_bound_to_merchant_identity(tmp_path, monkeypatch):
     page = client.get("/app/merchant")
     assert page.status_code == 200
     assert "Bound merchant campaign" in page.text
+    assert 'data-merchant-enrollment' in page.text
+    assert 'name="affiliate_pubkey"' in page.text
+    assert 'value="' + campaign["campaign_id"] + '"' in page.text
+
+
+def test_merchant_session_can_enroll_affiliate_idempotently(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    merchant_identity = Keys.generate()
+    human_owner = Keys.generate()
+    affiliate = Keys.generate()
+    campaign = create_campaign(client, merchant_identity, name="Session-managed campaign")
+    monkeypatch.setenv(
+        "MERCHANT_ACCOUNT_BINDINGS",
+        f"{human_owner.public_key().to_bech32()}:{merchant_identity.public_key().to_bech32()}",
+    )
+    login(client, human_owner, "merchant")
+
+    payload = {
+        "campaign_id": campaign["campaign_id"],
+        "affiliate_pubkey": affiliate.public_key().to_bech32(),
+    }
+    first = client.post(
+        "/app/merchant/enrollments",
+        headers={"origin": "https://testserver"},
+        json=payload,
+    )
+    assert first.status_code == 200, first.text
+    assert first.json()["duplicate"] is False
+    assert first.json()["ref_url"].startswith("https://testserver/r/")
+    assert first.json()["nostr_status"] == "pending"
+
+    # Simulate a historical row created before affiliate_pubkey_hex was backfilled.
+    with main.engine().begin() as connection:
+        connection.execute(
+            text("UPDATE enrollments SET affiliate_pubkey_hex=NULL WHERE id=:id"),
+            {"id": first.json()["enrollment_id"]},
+        )
+
+    duplicate = client.post(
+        "/app/merchant/enrollments",
+        headers={"origin": "https://testserver"},
+        json=payload,
+    )
+    assert duplicate.status_code == 200, duplicate.text
+    assert duplicate.json()["duplicate"] is True
+    assert duplicate.json()["enrollment_id"] == first.json()["enrollment_id"]
+
+    with main.engine().connect() as connection:
+        count = connection.execute(
+            text(
+                """
+                SELECT COUNT(*) FROM enrollments
+                WHERE campaign_id=:campaign_id AND (affiliate_pubkey_hex=:hex OR affiliate_pubkey=:npub)
+                """
+            ),
+            {
+                "campaign_id": campaign["campaign_id"],
+                "hex": affiliate.public_key().to_hex(),
+                "npub": affiliate.public_key().to_bech32(),
+            },
+        ).scalar_one()
+    assert count == 1
+
+
+    affiliate_client = TestClient(main.app, base_url="https://testserver")
+    assert login(affiliate_client, affiliate, "affiliate").status_code == 200
+
+
+def test_inactive_enrollment_does_not_grant_affiliate_login(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    merchant = Keys.generate()
+    affiliate = Keys.generate()
+    campaign = create_campaign(client, merchant)
+    enrollment = create_enrollment(client, campaign["campaign_id"], affiliate)
+    with main.engine().begin() as connection:
+        connection.execute(
+            text("UPDATE enrollments SET status='suspended' WHERE id=:id"),
+            {"id": enrollment["enrollment_id"]},
+        )
+
+    challenge = client.post("/auth/nostr/challenge", json={"role": "affiliate"}).json()
+    denied = client.post(
+        "/auth/nostr/verify",
+        json={"event": signed_login_event(affiliate, challenge)},
+    )
+    assert denied.status_code == 403
+
+
+def test_merchant_enrollment_requires_session_origin_and_campaign_ownership(tmp_path, monkeypatch):
+    owner_client = configured_client(tmp_path, monkeypatch)
+    owner_identity = Keys.generate()
+    other_identity = Keys.generate()
+    affiliate = Keys.generate()
+    owned = create_campaign(owner_client, owner_identity, name="Owned campaign")
+    foreign = create_campaign(owner_client, other_identity, name="Foreign campaign")
+    login(owner_client, owner_identity, "merchant")
+    payload = {
+        "campaign_id": owned["campaign_id"],
+        "affiliate_pubkey": affiliate.public_key().to_bech32(),
+    }
+
+    no_origin = owner_client.post("/app/merchant/enrollments", json=payload)
+    assert no_origin.status_code == 403
+
+    anonymous = TestClient(main.app, base_url="https://testserver").post(
+        "/app/merchant/enrollments",
+        headers={"origin": "https://testserver"},
+        json=payload,
+    )
+    assert anonymous.status_code == 401
+
+    foreign_payload = {**payload, "campaign_id": foreign["campaign_id"]}
+    forbidden = owner_client.post(
+        "/app/merchant/enrollments",
+        headers={"origin": "https://testserver"},
+        json=foreign_payload,
+    )
+    assert forbidden.status_code == 404
 
 
 def test_legacy_demo_mutations_are_fail_closed_by_default(tmp_path, monkeypatch):
