@@ -60,6 +60,20 @@ def test_real_payout_requires_admin_and_records_nwc_result(tmp_path, monkeypatch
     assert persisted["status"] == "paid"
     assert persisted["payment_provider"] == "nwc"
     assert persisted["fees_paid_msats"] == 123
+    receipt = client.get(f"/payouts/{payout_id}/receipt")
+    assert receipt.status_code == 200
+    assert 'Non-sandbox payout receipt' in receipt.text
+    assert 'data-proof-sandbox="non-sandbox"' in receipt.text
+    assert 'data-event-verified="true"' in receipt.text
+    assert 'provider_reported_payment' in receipt.text
+    assert 'Provider-reported payment evidence is not an independently trustless proof.' in receipt.text
+    assert 'No payment preimage is disclosed by this receipt.' in receipt.text
+    assert 'Payment provider' in receipt.text
+    assert '>nwc<' in receipt.text
+    assert body["nostr_event"]["id"] in receipt.text
+    assert body["nostr_event"]["sig"] in receipt.text
+    assert 'Sandbox payout receipt' not in receipt.text
+    assert 'Sandbox Lightning payout proof' not in receipt.text
     attempts = client.get(
         f"/admin/payouts/{payout_id}/attempts",
         headers={"Authorization": "Bearer admin-test-key"},

@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ receipt.title }} · {{ payout.id }}</title>
+  <style>
+    :root {
+      --black:#151615; --orange:#FC6A42; --gray:#E3E3D7; --blue:#6082DB;
+      --yellow:#F9C441; --muted:#a8aa9e; --ok:#75d68a; --bad:#ff8585;
+      --panel:rgba(255,255,255,.055); --line:rgba(227,227,215,.14);
+    }
+    * { box-sizing:border-box; }
+    html { color-scheme:dark; }
+    body {
+      margin:0; min-width:320px; color:#fff; background:
+        radial-gradient(circle at 8% 0,rgba(252,106,66,.20),transparent 29rem),
+        radial-gradient(circle at 92% 12%,rgba(96,130,219,.16),transparent 25rem),
+        var(--black);
+      font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    }
+    a { color:var(--yellow); text-underline-offset:3px; }
+    a:hover { color:#fff; }
+    button,a.action {
+      min-height:44px; border:1px solid var(--line); border-radius:12px; padding:10px 13px;
+      color:#fff; background:rgba(255,255,255,.07); font:inherit; cursor:pointer;
+      display:inline-flex; align-items:center; justify-content:center; text-decoration:none;
+    }
+    button:hover,a.action:hover { border-color:var(--orange); background:rgba(252,106,66,.13); }
+    code { font-family:ui-monospace,SFMono-Regular,Consolas,monospace; overflow-wrap:anywhere; word-break:break-all; }
+    .shell { width:min(1120px,100%); margin:0 auto; padding:clamp(18px,4vw,48px); }
+    header { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:24px; align-items:start; padding:18px 0 30px; border-bottom:1px solid var(--line); }
+    .eyebrow { margin:0 0 12px; color:var(--orange); font-weight:800; letter-spacing:.12em; text-transform:uppercase; font-size:12px; }
+    h1,h2,h3 { margin:0; font-family:Unbounded,Inter,system-ui,sans-serif; letter-spacing:-.035em; }
+    h1 { max-width:850px; font-size:clamp(34px,6vw,68px); line-height:.98; }
+    h2 { font-size:clamp(20px,3vw,28px); }
+    h3 { font-size:16px; }
+    p { color:var(--muted); line-height:1.6; }
+    .lede { max-width:760px; margin:14px 0 0; font-size:17px; }
+    .badge { display:inline-flex; width:max-content; max-width:100%; align-items:center; gap:7px; border:1px solid var(--line); border-radius:999px; padding:8px 11px; font-size:13px; line-height:1.2; overflow-wrap:anywhere; }
+    .badge.success { color:var(--ok); background:rgba(117,214,138,.13); }
+    .badge.pending { color:var(--yellow); background:rgba(249,196,65,.13); }
+    .badge.danger { color:var(--bad); background:rgba(255,133,133,.13); }
+    .badge.neutral { color:var(--gray); background:rgba(227,227,215,.07); }
+    .grid { display:grid; grid-template-columns:repeat(12,minmax(0,1fr)); gap:18px; margin:24px 0; }
+    .card { grid-column:span 6; min-width:0; overflow:hidden; border:1px solid var(--line); border-radius:24px; padding:clamp(18px,3vw,26px); background:linear-gradient(180deg,rgba(255,255,255,.075),var(--panel)); box-shadow:0 18px 50px rgba(0,0,0,.12); }
+    .span-12 { grid-column:1/-1; }
+    .card-head { display:flex; align-items:flex-start; justify-content:space-between; gap:14px; margin-bottom:20px; }
+    dl { display:grid; grid-template-columns:155px minmax(0,1fr); gap:12px 16px; margin:0; }
+    dt { color:var(--muted); }
+    dd { margin:0; min-width:0; overflow-wrap:anywhere; }
+    .evidence { border-left:4px solid var(--yellow); }
+    .evidence.sandbox { border-left-color:var(--orange); }
+    .evidence strong { color:#fff; }
+    .notice { margin:14px 0 0; padding:14px; border-radius:14px; color:var(--gray); background:rgba(0,0,0,.18); }
+    .copy-row { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:10px; align-items:center; }
+    .copy-row code { display:block; min-width:0; padding:12px; border:1px solid var(--line); border-radius:12px; background:rgba(0,0,0,.22); }
+    .actions { display:flex; flex-wrap:wrap; gap:10px; margin-top:14px; }
+    .relay-list { display:grid; gap:10px; padding:0; margin:0; list-style:none; }
+    .relay { display:grid; grid-template-columns:auto minmax(0,1fr); gap:10px 14px; align-items:start; padding:14px; border:1px solid var(--line); border-radius:14px; background:rgba(0,0,0,.14); }
+    .relay code { align-self:center; }
+    .relay-error { grid-column:1/-1; margin:0; overflow-wrap:anywhere; }
+    .relay-error.danger { color:var(--bad); }
+    .relay-error.pending { color:var(--yellow); }
+    .relay-error.neutral { color:var(--muted); }
+    .verification { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+    footer { padding:10px 0 30px; color:var(--muted); font-size:13px; }
+    [role="status"] { min-height:20px; }
+    @media (max-width:900px) {
+      header { grid-template-columns:1fr; }
+      .card { grid-column:1/-1; }
+      dl { grid-template-columns:1fr; gap:5px; }
+      dd { margin-bottom:10px; }
+    }
+    @media (max-width:520px) {
+      .shell { padding:16px; }
+      .copy-row { grid-template-columns:1fr; }
+      .copy-row button { width:100%; }
+      .actions { display:grid; }
+      .relay { grid-template-columns:1fr; }
+      .relay-error { grid-column:auto; }
+    }
+  </style>
+</head>
+<body data-proof-sandbox="{{ receipt.sandbox_state }}" data-event-verified="{{ 'true' if proof.verified else 'false' }}">
+  <div class="shell">
+    <header>
+      <div>
+        <p class="eyebrow">Meerat · Verifiable evidence</p>
+        <h1>{{ receipt.headline }}</h1>
+        <p class="lede">{{ receipt.title }} for an attributed Nostr affiliate conversion.</p>
+      </div>
+      <span class="badge {{ receipt.status.class }}">{{ receipt.status.label }}</span>
+    </header>
+
+    <main class="grid">
+      <section class="card evidence{% if receipt.is_sandbox %} sandbox{% endif %}">
+        <div class="card-head"><h2>Evidence</h2><span class="badge neutral">{{ receipt.evidence_type }}</span></div>
+        <p><strong>{{ receipt.evidence_explanation }}</strong></p>
+        <p class="notice">{{ receipt.preimage_disclaimer }} A payment hash alone is not independent proof of Lightning settlement.</p>
+        <dl>
+          <dt>Evidence type</dt><dd><code>{{ receipt.evidence_type }}</code></dd>
+          <dt>Claim source</dt><dd>{{ receipt.claim_source }}</dd>
+          <dt>Payment provider</dt><dd><code>{{ receipt.provider }}</code></dd>
+          <dt>Payment mode</dt><dd>{{ receipt.sandbox_state }}</dd>
+        </dl>
+      </section>
+
+      <section class="card">
+        <div class="card-head"><h2>Payout</h2><span class="badge {{ receipt.status.class }}">{{ receipt.status.label }}</span></div>
+        <dl>
+          <dt>Payout ID</dt><dd><code>{{ payout.id }}</code></dd>
+          <dt>Amount</dt><dd><strong>{{ payout.amount_sats }} sats</strong></dd>
+          <dt>Payment hash</dt><dd><code>{{ payout.payment_hash or 'not recorded' }}</code></dd>
+          <dt>Paid at</dt><dd>{{ receipt.paid_at }}</dd>
+        </dl>
+      </section>
+
+      <section class="card span-12">
+        <div class="card-head">
+          <h2>Signed Nostr event</h2>
+          <div class="verification">
+            {% if proof.verified %}<span class="badge success">ID + signature + payout binding verified</span>{% else %}<span class="badge danger">Verification failed or unavailable</span>{% endif %}
+            <span class="badge {{ proof.relay_status.class }}">{{ proof.relay_status.label }}</span>
+          </div>
+        </div>
+        {% if proof.event %}
+        <dl>
+          <dt>Kind</dt><dd><code>{{ proof.event.kind }}</code></dd>
+          <dt>Event ID</dt><dd><code>{{ proof.event.id }}</code></dd>
+          <dt>Signing pubkey</dt><dd><code>{{ proof.event.pubkey }}</code></dd>
+          <dt>Signature</dt><dd><code>{{ proof.event.sig }}</code></dd>
+        </dl>
+        {% if proof.note %}
+        <h3 style="margin:22px 0 10px">NIP-19 identifier</h3>
+        <div class="copy-row">
+          <code>{{ proof.note }}</code>
+          <button type="button" data-copy="{{ proof.note }}">Copy note</button>
+        </div>
+        {% endif %}
+        <div class="actions">
+          {% if proof.internal_url %}<a class="action" href="{{ proof.internal_url }}">Open complete signed event</a>{% endif %}
+          {% if proof.njump_url %}<a class="action" href="{{ proof.njump_url }}" target="_blank" rel="noopener noreferrer">Verify independently on njump</a>{% endif %}
+        </div>
+        {% else %}<p>No signed payout event is available yet.</p>{% endif %}
+      </section>
+
+      <section class="card">
+        <h2 style="margin-bottom:20px">Attribution</h2>
+        <dl>
+          <dt>Campaign</dt><dd><a href="/campaigns/{{ conversion.campaign_id }}/page">{{ campaign.name }}</a></dd>
+          <dt>Conversion</dt><dd><a href="/flows/{{ payout.conversion_id }}/receipt"><code>{{ payout.conversion_id }}</code></a></dd>
+          <dt>Affiliate</dt><dd><a href="/affiliates/{{ payout.affiliate_pubkey }}/profile"><code>{{ payout.affiliate_pubkey }}</code></a></dd>
+        </dl>
+      </section>
+
+      <section class="card">
+        <div class="card-head"><h2>Relay receipts</h2><span class="badge {{ proof.relay_status.class }}">{{ proof.relay_status.label }}</span></div>
+        {% if proof.relays %}
+        <ul class="relay-list">
+          {% for relay in proof.relays %}
+          <li class="relay">
+            <span class="badge {{ relay.display_status.class }}">{{ relay.display_status.label }}</span>
+            <code>{{ relay.relay_url }}</code>
+            {% if relay.error %}<p class="relay-error {{ relay.display_status.class }}">{{ relay.error }}</p>{% endif %}
+          </li>
+          {% endfor %}
+        </ul>
+        {% else %}<p>No relay acknowledgements recorded.</p>{% endif %}
+      </section>
+    </main>
+
+    <footer>
+      {% if proof.verified %}This receipt verified the integrity and signature of the Nostr event locally.{% else %}This receipt could not verify a matching signed Nostr event locally.{% endif %}
+      Its payment-evidence claim is limited to the evidence type and claim source shown above.
+      <p role="status" aria-live="polite" data-copy-status></p>
+    </footer>
+  </div>
+  <script>
+    document.addEventListener('click', async (event) => {
+      const button = event.target.closest('[data-copy]');
+      if (!button) return;
+      const status = document.querySelector('[data-copy-status]');
+      try {
+        await navigator.clipboard.writeText(button.dataset.copy);
+        status.textContent = 'Copied.';
+      } catch (_) {
+        status.textContent = 'Copy unavailable. Select the identifier manually.';
+      }
+    });
+  </script>
+</body>
+</html>

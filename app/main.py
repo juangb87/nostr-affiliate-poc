@@ -36,7 +36,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
-from nostr_sdk import Client, EventBuilder, Keys, Kind, PublicKey, RelayUrl, Tag
+from nostr_sdk import Client, Event, EventBuilder, Keys, Kind, PublicKey, RelayUrl, Tag
 import qrcode
 from qrcode.image.svg import SvgPathImage
 from qrcode.exceptions import DataOverflowError
@@ -3809,27 +3809,169 @@ def execute_payout(
     return finalized
 
 
-@app.get("/payouts/{payout_id}/receipt", response_class=HTMLResponse)
-def payout_receipt_page(payout_id: str) -> str:
-    data = payout_data(payout_id)
-    p = data["payout"]
-    c = data["conversion"] or {}
-    campaign = data["campaign"] or {}
-    event = data["event"]
-    relay_rows = ""
-    if event:
-        relay_rows = "".join(f"<li>{_status_badge(r['status'])} <code>{_esc(r['relay_url'])}</code></li>" for r in event.get("relays", []))
+def _signed_tag(event_json: dict[str, Any], name: str) -> str | None:
+    for tag in event_json.get("tags", []):
+        if isinstance(tag, list) and len(tag) >= 2 and tag[0] == name and isinstance(tag[1], str):
+            return tag[1]
+    return None
+
+
+def _signed_role_pubkey(event_json: dict[str, Any], role: str) -> str | None:
+    for tag in event_json.get("tags", []):
+        if isinstance(tag, list) and len(tag) >= 4 and tag[0] == "p" and tag[3] == role and isinstance(tag[1], str):
+            return tag[1]
+    return None
+
+
+def _payout_event_matches(data: dict[str, Any], event_json: dict[str, Any]) -> bool:
+    payout = data["payout"]
+    conversion = data.get("conversion") or {}
+    campaign = data.get("campaign") or {}
+    event_record = data.get("event") or {}
+    try:
+        expected_affiliate = normalize_pubkey(payout["affiliate_pubkey"], "affiliate_pubkey")["hex"]
+        expected_merchant = campaign.get("merchant_pubkey_hex") or normalize_pubkey(campaign["merchant_pubkey"], "merchant_pubkey")["hex"]
+    except (HTTPException, KeyError, TypeError, ValueError):
+        return False
+    return all((
+        event_json.get("kind") == PAYOUT_KIND,
+        event_json.get("pubkey") == nostr_keys().public_key().to_hex(),
+        event_record.get("entity_type") == "payout",
+        event_record.get("entity_id") == payout.get("id"),
+        _signed_tag(event_json, "type") == "affiliate_payout",
+        _signed_tag(event_json, "status") == "paid",
+        _signed_tag(event_json, "amount_sats") == str(payout.get("amount_sats")),
+        _signed_tag(event_json, "payment_hash") == payout.get("payment_hash"),
+        _signed_tag(event_json, "campaign") == conversion.get("campaign_id"),
+        _signed_tag(event_json, "e") == conversion.get("nostr_event_id"),
+        _signed_role_pubkey(event_json, "affiliate") == expected_affiliate,
+        _signed_role_pubkey(event_json, "merchant") == expected_merchant,
+    ))
+
+
+def _receipt_status(status_value: Any) -> dict[str, str]:
+    raw = str(status_value or "unknown").lower()
+    classes = {
+        "paid": "success", "settled": "success", "published": "success",
+        "pending": "pending", "paying": "pending", "sandbox_processing": "pending",
+        "pending_publication": "pending", "retrying": "pending",
+        "failed": "danger", "payment_unknown": "danger", "unknown": "danger",
+        "skipped": "neutral",
+    }
+    labels = {"pending_publication": "retrying / pending publication"}
+    return {"value": raw, "label": labels.get(raw, raw.replace("_", " ")), "class": classes.get(raw, "neutral")}
+
+
+def _receipt_timestamp(value: Any) -> str:
+    if not value:
+        return "not recorded"
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(timezone.utc)
+        return parsed.strftime("%Y-%m-%d %H:%M UTC")
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def payout_receipt_context(data: dict[str, Any]) -> dict[str, Any]:
+    payout = data["payout"]
+    event_record = data.get("event") or {}
+    stored_event = event_record.get("event_json") if isinstance(event_record.get("event_json"), dict) else {}
+    allowed_fields = {key: stored_event.get(key) for key in ("id", "pubkey", "created_at", "kind", "tags", "content", "sig")}
+    event_verified = False
+    event_note: str | None = None
+    canonical_event: dict[str, Any] = {}
+    if all(allowed_fields.get(key) is not None for key in allowed_fields):
+        try:
+            parsed_event = Event.from_json(json.dumps(allowed_fields, ensure_ascii=False, separators=(",", ":")))
+            crypto_verified = bool(parsed_event.verify())
+            canonical_event = json.loads(parsed_event.as_json())
+            event_verified = all((
+                crypto_verified,
+                parsed_event.id().to_hex() == event_record.get("event_id") == payout.get("nostr_event_id"),
+                _payout_event_matches(data, canonical_event),
+            ))
+            if event_verified:
+                event_note = parsed_event.id().to_bech32()
+        except Exception:
+            event_verified = False
+            canonical_event = allowed_fields
+
+    verified_claims = canonical_event if event_verified else {}
+    signed_provider = _signed_tag(verified_claims, "payment_provider") or _signed_tag(verified_claims, "rail")
+    local_provider = payout.get("payment_provider")
+    provider = signed_provider or local_provider or "not specified"
+    sandbox_tag = _signed_tag(verified_claims, "sandbox")
+    if sandbox_tag in {"true", "false"}:
+        sandbox_state = "sandbox" if sandbox_tag == "true" else "non-sandbox"
+    elif local_provider in {"sandbox", "fake"}:
+        sandbox_state = "sandbox"
+    elif local_provider in {"nwc", "manual"}:
+        sandbox_state = "non-sandbox"
     else:
-        relay_rows = "<li>No payout proof event yet.</li>"
-    event_link = f"<a href='/nostr/events/{_esc(p.get('nostr_event_id'))}'>{_esc(_short(p.get('nostr_event_id')))}</a>" if p.get("nostr_event_id") else "pending"
-    return f"""
-<!doctype html><html lang='en'><head><meta charset='utf-8'/><meta name='viewport' content='width=device-width, initial-scale=1'/><title>Payout receipt · {_esc(payout_id)}</title>
-<style>:root{{--black:#151615;--orange:#FC6A42;--gray:#E3E3D7;--blue:#6082DB;--yellow:#F9C441;--muted:#a8aa9e;--ok:#75d68a;--bad:#ff8585}}*{{box-sizing:border-box}}body{{margin:0;font-family:Inter,system-ui,sans-serif;background:radial-gradient(circle at top left,rgba(249,196,65,.2),transparent 30rem),var(--black);color:#fff}}header,main{{width:min(1040px,100%);margin:0 auto;padding:30px clamp(16px,4vw,52px)}}header{{border-bottom:1px solid rgba(227,227,215,.12);display:flex;justify-content:space-between;align-items:flex-start;gap:22px}}h1,h2{{margin:0;letter-spacing:-.045em}}h1{{font-size:clamp(36px,6vw,70px);line-height:.9}}p{{color:var(--muted);line-height:1.6}}a{{color:var(--yellow)}}code{{background:rgba(227,227,215,.09);border-radius:7px;padding:2px 6px;word-break:break-all}}.pill,.status{{display:inline-flex;align-items:center;width:max-content;max-width:100%;height:auto;align-self:flex-start;padding:7px 10px;border-radius:999px;border:1px solid rgba(227,227,215,.15);background:rgba(227,227,215,.06);color:var(--gray);font-size:13px;line-height:1.2;white-space:nowrap}}.published{{background:rgba(117,214,138,.18);color:var(--ok)}}.failed{{background:rgba(255,133,133,.18);color:var(--bad)}}.skipped{{background:rgba(249,196,65,.18);color:var(--yellow)}}.grid{{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:18px;margin:22px 0}}.card{{grid-column:span 6 / span 6;min-width:0;border:1px solid rgba(227,227,215,.12);background:linear-gradient(180deg,rgba(255,255,255,.07),rgba(255,255,255,.035));border-radius:24px;padding:22px;overflow:hidden}}.span-12{{grid-column:1/-1}}dl{{display:grid;grid-template-columns:150px minmax(0,1fr);gap:10px 14px}}dt{{color:var(--muted)}}dd{{margin:0;overflow-wrap:anywhere}}@media(max-width:800px){{header{{display:block}}.card{{grid-column:1/-1}}dl{{grid-template-columns:1fr}}}}</style></head>
-<body><header><div><span class='pill'>Payout receipt</span><h1>{_esc(p['amount_sats'])} sats paid.</h1><p>Sandbox Lightning payout proof for an attributed Nostr affiliate conversion.</p></div><div class='pill'>{_esc(p['status'])}</div></header><main><section class='grid'>
-<div class='card'><h2>Payout</h2><dl><dt>Payout ID</dt><dd><code>{_esc(p['id'])}</code></dd><dt>Status</dt><dd>{_status_badge(p['status'])}</dd><dt>Amount</dt><dd>{_esc(p['amount_sats'])} sats</dd><dt>Payment hash</dt><dd><code>{_esc(p.get('payment_hash'))}</code></dd></dl></div>
-<div class='card'><h2>Attribution</h2><dl><dt>Campaign</dt><dd><a href='/campaigns/{_esc(c.get('campaign_id'))}/page'>{_esc(campaign.get('name'))}</a></dd><dt>Conversion</dt><dd><a href='/flows/{_esc(p['conversion_id'])}/receipt'>{_esc(p['conversion_id'])}</a></dd><dt>Affiliate</dt><dd><a href='/affiliates/{_esc(p['affiliate_pubkey'])}/profile'>{_esc(_short(p['affiliate_pubkey']))}</a></dd><dt>Nostr event</dt><dd>{event_link}</dd></dl></div>
-<section class='card span-12'><h2>Relay receipts</h2><ul>{relay_rows}</ul></section></section></main></body></html>
-"""
+        sandbox_state = "unknown"
+    signed_evidence = _signed_tag(verified_claims, "evidence_type") or _signed_tag(verified_claims, "evidence")
+    if signed_evidence == "merchant_attestation" or provider == "manual":
+        evidence_type = "merchant_attestation"
+        evidence_explanation = "Merchant attestation is not trustless settlement evidence."
+    elif sandbox_state == "sandbox":
+        evidence_type = "sandbox_test"
+        evidence_explanation = "This is test evidence and does not prove that real sats moved."
+    elif provider != "not specified":
+        evidence_type = "provider_reported_payment"
+        evidence_explanation = "Provider-reported payment evidence is not an independently trustless proof."
+    else:
+        evidence_type = "legacy_unspecified"
+        evidence_explanation = "This legacy receipt does not specify an independently verifiable payment evidence type."
+
+    status = _receipt_status(payout.get("status"))
+    relays = []
+    for relay in event_record.get("relays", []):
+        relays.append({**relay, "display_status": _receipt_status(relay.get("status"))})
+    aggregate_relay_status = _receipt_status(event_record.get("relay_status") or "unknown")
+    amount = payout.get("amount_sats")
+    headline = f"{amount} sats recorded paid." if status["value"] == "paid" else f"{amount} sats · {status['label']}."
+    titles = {
+        "sandbox": "Sandbox payout receipt",
+        "non-sandbox": "Non-sandbox payout receipt",
+        "unknown": "Payment mode not established",
+    }
+    if event_verified and signed_provider and sandbox_tag in {"true", "false"}:
+        claim_source = "verified signed Nostr event"
+    elif event_verified:
+        claim_source = "mixed: verified signed Nostr event + local payout record"
+    else:
+        claim_source = "local payout record; signed-event verification unavailable"
+    return {
+        **data,
+        "receipt": {
+            "title": titles[sandbox_state],
+            "headline": headline,
+            "sandbox_state": sandbox_state,
+            "is_sandbox": sandbox_state == "sandbox",
+            "provider": provider,
+            "claim_source": claim_source,
+            "evidence_type": evidence_type,
+            "evidence_explanation": evidence_explanation,
+            "preimage_disclaimer": "No payment preimage is disclosed by this receipt.",
+            "paid_at": _receipt_timestamp(payout.get("paid_at") or payout.get("settled_at")),
+            "status": status,
+        },
+        "proof": {
+            "event": canonical_event,
+            "verified": event_verified,
+            "note": event_note,
+            "njump_url": f"https://njump.me/{event_note}" if event_note else None,
+            "internal_url": f"/nostr/events/{event_record.get('event_id')}" if event_verified and event_record.get("event_id") else None,
+            "relay_status": aggregate_relay_status,
+            "relays": relays,
+        },
+    }
+
+
+@app.get("/payouts/{payout_id}/receipt", response_class=HTMLResponse)
+def payout_receipt_page(request: Request, payout_id: str) -> Response:
+    context = payout_receipt_context(payout_data(payout_id))
+    return templates.TemplateResponse(request=request, name="payout_receipt.html", context=context)
 
 
 @app.get("/proofs")

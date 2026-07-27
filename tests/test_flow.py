@@ -1,6 +1,13 @@
+import copy
+import json
+
 from fastapi.testclient import TestClient
-from app.main import app
+from nostr_sdk import EventId
+
+import app.main as main
 from app.nostr_kinds import CAMPAIGN_KIND, CONVERSION_KIND, ENROLLMENT_KIND, PAYOUT_KIND, REVERSAL_KIND
+
+app = main.app
 
 
 def test_demo_flow_creates_conversion_and_proof(tmp_path, monkeypatch):
@@ -86,6 +93,12 @@ def test_demo_flow_creates_conversion_and_proof(tmp_path, monkeypatch):
     payout_detail = client.get(f"/payouts/{payout_id}")
     assert payout_detail.status_code == 200
     assert payout_detail.json()['payout']['status'] == 'pending'
+    pending_receipt = client.get(f"/payouts/{payout_id}/receipt")
+    assert pending_receipt.status_code == 200
+    assert '20000 sats · pending.' in pending_receipt.text
+    assert 'Payment mode not established' in pending_receipt.text
+    assert 'data-proof-sandbox="unknown"' in pending_receipt.text
+    assert '20000 sats recorded paid.' not in pending_receipt.text
     paid = client.post(
         f"/payouts/{payout_id}/mark-paid",
         headers={'Authorization': 'Bearer test-payout-admin-key'},
@@ -109,7 +122,94 @@ def test_demo_flow_creates_conversion_and_proof(tmp_path, monkeypatch):
     assert duplicate_paid.json()['duplicate'] is True
     paid_receipt = client.get(f"/payouts/{payout_id}/receipt")
     assert paid_receipt.status_code == 200
-    assert 'Payout receipt' in paid_receipt.text
+    payout_event = paid_json['nostr_event']
+    payout_note = EventId.parse(payout_event['id']).to_bech32()
+    assert 'Sandbox payout receipt' in paid_receipt.text
+    assert 'data-proof-sandbox="sandbox"' in paid_receipt.text
+    assert 'data-event-verified="true"' in paid_receipt.text
+    assert 'sandbox_test' in paid_receipt.text
+    assert 'This is test evidence and does not prove that real sats moved.' in paid_receipt.text
+    assert 'No payment preimage is disclosed by this receipt.' in paid_receipt.text
+    assert f"/nostr/events/{payout_event['id']}" in paid_receipt.text
+    assert f"https://njump.me/{payout_note}" in paid_receipt.text
+    assert payout_note in paid_receipt.text
+    assert str(PAYOUT_KIND) in paid_receipt.text
+    assert payout_event['pubkey'] in paid_receipt.text
+    assert payout_event['sig'] in paid_receipt.text
+    assert 'name="viewport"' in paid_receipt.text
+    assert 'Sandbox Lightning payout proof' not in paid_receipt.text
+
+    receipt_data = main.payout_data(payout_id)
+    wrong_kind_event = main.build_nostr_event(1, payout_event['tags'], payout_event['content'])
+    wrong_kind_data = copy.deepcopy(receipt_data)
+    wrong_kind_data['payout']['nostr_event_id'] = wrong_kind_event['id']
+    wrong_kind_data['event']['event_id'] = wrong_kind_event['id']
+    wrong_kind_data['event']['event_json'] = wrong_kind_event
+    wrong_kind_context = main.payout_receipt_context(wrong_kind_data)
+    assert wrong_kind_context['proof']['verified'] is False
+    assert wrong_kind_context['proof']['note'] is None
+    assert wrong_kind_context['proof']['internal_url'] is None
+    assert wrong_kind_context['proof']['njump_url'] is None
+
+    missing_claim_tags = [
+        tag for tag in payout_event['tags']
+        if tag[0] not in {'sandbox', 'payment_provider', 'rail', 'evidence', 'evidence_type'}
+    ]
+    missing_claim_event = main.build_nostr_event(PAYOUT_KIND, missing_claim_tags, payout_event['content'])
+    missing_claim_data = copy.deepcopy(receipt_data)
+    missing_claim_data['payout']['nostr_event_id'] = missing_claim_event['id']
+    missing_claim_data['event']['event_id'] = missing_claim_event['id']
+    missing_claim_data['event']['event_json'] = missing_claim_event
+    missing_claim_context = main.payout_receipt_context(missing_claim_data)
+    assert missing_claim_context['proof']['verified'] is True
+    assert missing_claim_context['receipt']['sandbox_state'] == 'sandbox'
+    assert missing_claim_context['receipt']['provider'] == 'sandbox'
+    assert missing_claim_context['receipt']['claim_source'] == 'mixed: verified signed Nostr event + local payout record'
+
+    with main.engine().begin() as connection:
+        connection.execute(main.text("""
+            UPDATE nostr_event_relays SET error=:error
+            WHERE event_id=:event_id
+        """), {"event_id": payout_event['id'], "error": "<script>alert('relay')</script>"})
+    escaped_receipt = client.get(f"/payouts/{payout_id}/receipt")
+    assert "&lt;script&gt;alert(&#39;relay&#39;)&lt;/script&gt;" in escaped_receipt.text
+    assert "<script>alert('relay')</script>" not in escaped_receipt.text
+
+    with main.engine().begin() as connection:
+        connection.execute(main.text("UPDATE nostr_events SET relay_status='pending_publication' WHERE event_id=:id"), {"id": payout_event['id']})
+        connection.execute(main.text("UPDATE nostr_event_relays SET status='failed', error='relay timeout' WHERE event_id=:id"), {"id": payout_event['id']})
+    retrying_receipt = client.get(f"/payouts/{payout_id}/receipt")
+    assert 'retrying / pending publication' in retrying_receipt.text
+    assert 'class="badge danger">failed</span>' in retrying_receipt.text
+    assert 'relay timeout' in retrying_receipt.text
+
+    with main.engine().begin() as connection:
+        connection.execute(main.text("DELETE FROM nostr_event_relays WHERE event_id=:id"), {"id": payout_event['id']})
+    empty_relays = client.get(f"/payouts/{payout_id}/receipt")
+    assert 'No relay acknowledgements recorded.' in empty_relays.text
+
+    tampered = dict(payout_event)
+    tampered['content'] = json.dumps({'sandbox': False})
+    tampered['tags'] = [
+        tag for tag in payout_event['tags']
+        if tag[0] not in {'sandbox', 'payment_provider', 'rail', 'evidence', 'evidence_type'}
+    ] + [
+        ['sandbox', 'false'], ['payment_provider', 'manual'], ['evidence', 'merchant_attestation'],
+    ]
+    with main.engine().begin() as connection:
+        connection.execute(main.text("UPDATE nostr_events SET event_json=:event WHERE event_id=:id"), {
+            "id": payout_event['id'], "event": json.dumps(tampered),
+        })
+    tampered_receipt = client.get(f"/payouts/{payout_id}/receipt")
+    assert 'data-event-verified="false"' in tampered_receipt.text
+    assert 'data-proof-sandbox="sandbox"' in tampered_receipt.text
+    assert 'Verification failed or unavailable' in tampered_receipt.text
+    assert 'local payout record; signed-event verification unavailable' in tampered_receipt.text
+    assert 'sandbox_test' in tampered_receipt.text
+    assert 'merchant_attestation' not in tampered_receipt.text
+    assert 'This receipt could not verify a matching signed Nostr event locally.' in tampered_receipt.text
+    assert f"https://njump.me/{payout_note}" not in tampered_receipt.text
+    assert f"/nostr/events/{payout_event['id']}" not in tampered_receipt.text
     flow_after_payout = client.get(f"/flows/{data['conversion']['conversion_id']}").json()
     assert flow_after_payout['payout']['status'] == 'paid'
     assert len(flow_after_payout['events']) >= 4

@@ -969,6 +969,15 @@ def test_merchant_manual_settlement_is_owned_idempotent_and_attested(tmp_path, m
     assert ["settlement_mode", "manual"] in tags
     assert ["evidence", "merchant_attestation"] in tags
     assert not any(tag[0] == "preimage" for tag in tags)
+    receipt = client.get(f"/payouts/{payout_id}/receipt")
+    assert receipt.status_code == 200
+    assert 'Non-sandbox payout receipt' in receipt.text
+    assert 'data-proof-sandbox="non-sandbox"' in receipt.text
+    assert 'merchant_attestation' in receipt.text
+    assert 'Merchant attestation is not trustless settlement evidence.' in receipt.text
+    assert 'No payment preimage is disclosed by this receipt.' in receipt.text
+    assert 'merchant_account:' not in receipt.text
+    assert 'data-event-verified="true"' in receipt.text
 
     replay = client.post(
         f"/app/merchant/payouts/{payout_id}/manual-settlement",
