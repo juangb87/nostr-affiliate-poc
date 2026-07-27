@@ -98,6 +98,34 @@ def test_nostr_login_issues_http_only_session_and_logout(tmp_path, monkeypatch):
     assert client.get("/auth/me").status_code == 401
 
 
+def test_direct_merchant_owner_ignores_malformed_optional_bindings(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    merchant = Keys.generate()
+    create_campaign(client, merchant)
+    monkeypatch.setenv("MERCHANT_ACCOUNT_BINDINGS", "malformed-binding")
+
+    result = login(client, merchant, "merchant")
+
+    assert result.json()["account"]["npub"] == merchant.public_key().to_bech32()
+    assert client.get("/app/merchant").status_code == 200
+
+
+def test_malformed_bindings_do_not_authorize_unrelated_identity(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    stranger = Keys.generate()
+    monkeypatch.setenv("MERCHANT_ACCOUNT_BINDINGS", "malformed-binding")
+    challenge = client.post("/auth/nostr/challenge", json={"role": "merchant"}).json()
+
+    response = client.post(
+        "/auth/nostr/verify",
+        json={"event": signed_login_event(stranger, challenge)},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "merchant account binding configuration is invalid"
+    assert client.get("/auth/me").status_code == 401
+
+
 def test_challenge_is_one_use_and_role_origin_are_bound(tmp_path, monkeypatch):
     client = configured_client(tmp_path, monkeypatch)
     merchant = Keys.generate()

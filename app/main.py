@@ -1189,26 +1189,29 @@ def _grant_role_if_authorized(c: Any, account_id: str, pubkey_hex: str, role: st
         try:
             bindings = parse_merchant_bindings(os.getenv("MERCHANT_ACCOUNT_BINDINGS", ""))
         except ValueError as exc:
-            raise HTTPException(503, "merchant account binding configuration is invalid") from exc
-        c.execute(
-            text("DELETE FROM merchant_account_links WHERE account_id=:account_id AND source='environment_binding'"),
-            {"account_id": account_id},
-        )
-        for owner_hex, merchant_hex in bindings:
-            if owner_hex != pubkey_hex:
-                continue
-            exists = c.execute(text("SELECT 1 FROM campaigns WHERE merchant_pubkey_hex=:hex OR merchant_pubkey=:hex LIMIT 1"), {"hex": merchant_hex}).fetchone()
-            if not exists:
-                continue
-            authorized = True
+            if not authorized:
+                raise HTTPException(503, "merchant account binding configuration is invalid") from exc
+            bindings = None
+        if bindings is not None:
             c.execute(
-                text("""
-                    INSERT INTO merchant_account_links (account_id, merchant_pubkey_hex, source, created_at)
-                    VALUES (:account_id, :merchant_hex, 'environment_binding', :created_at)
-                    ON CONFLICT (account_id, merchant_pubkey_hex) DO NOTHING
-                """),
-                {"account_id": account_id, "merchant_hex": merchant_hex, "created_at": now()},
+                text("DELETE FROM merchant_account_links WHERE account_id=:account_id AND source='environment_binding'"),
+                {"account_id": account_id},
             )
+            for owner_hex, merchant_hex in bindings:
+                if owner_hex != pubkey_hex:
+                    continue
+                exists = c.execute(text("SELECT 1 FROM campaigns WHERE merchant_pubkey_hex=:hex OR merchant_pubkey=:hex LIMIT 1"), {"hex": merchant_hex}).fetchone()
+                if not exists:
+                    continue
+                authorized = True
+                c.execute(
+                    text("""
+                        INSERT INTO merchant_account_links (account_id, merchant_pubkey_hex, source, created_at)
+                        VALUES (:account_id, :merchant_hex, 'environment_binding', :created_at)
+                        ON CONFLICT (account_id, merchant_pubkey_hex) DO NOTHING
+                    """),
+                    {"account_id": account_id, "merchant_hex": merchant_hex, "created_at": now()},
+                )
     elif role == "ops":
         try:
             authorized = pubkey_hex in parse_pubkey_set(os.getenv("OPS_NOSTR_PUBKEYS", ""))
