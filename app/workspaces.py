@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import bindparam, text
@@ -55,8 +56,9 @@ def merchant_workspace_data(connection: Any, session: dict[str, Any], *, base_ur
         conversions = _rows(connection, conversions_stmt, {"campaign_ids": campaign_ids})
         payouts_stmt = text(
             """
-            SELECT p.id, p.affiliate_pubkey, p.amount_sats, p.status, p.state,
-                   p.payment_hash, p.created_at, c.name AS campaign_name
+            SELECT p.id, p.affiliate_pubkey, p.amount_sats, p.lightning_address,
+                   p.status, p.state, p.payment_hash, p.payment_provider,
+                   p.return_window_ends_at, p.created_at, c.name AS campaign_name
             FROM payouts p
             JOIN conversions v ON v.id=p.conversion_id
             JOIN campaigns c ON c.id=v.campaign_id
@@ -90,6 +92,19 @@ def merchant_workspace_data(connection: Any, session: dict[str, Any], *, base_ur
     for payout in payouts:
         payout["affiliate_short"] = short(payout.get("affiliate_pubkey"))
         payout["user_state"] = payout_user_state(payout.get("state"))
+        return_window_pending = False
+        if payout.get("return_window_ends_at"):
+            try:
+                window_end = datetime.fromisoformat(str(payout["return_window_ends_at"]).replace("Z", "+00:00"))
+                return_window_pending = window_end > datetime.now(timezone.utc)
+            except ValueError:
+                return_window_pending = True
+        payout["return_window_pending"] = return_window_pending
+        payout["manual_payable"] = bool(
+            payout.get("state") == "PAYABLE" and payout.get("status") == "pending"
+            and payout.get("lightning_address") and not payout.get("payment_provider")
+            and not return_window_pending
+        )
 
     return {
         "campaigns": campaigns,
@@ -133,7 +148,7 @@ def affiliate_workspace_data(connection: Any, session: dict[str, Any], *, base_u
         connection,
         text(
             """
-            SELECT e.id, e.ref_code, e.status, e.created_at, c.id AS campaign_id,
+            SELECT e.id, e.ref_code, e.status, e.lightning_address, e.created_at, c.id AS campaign_id,
                    c.name AS campaign_name, c.commission_bps, c.window_days, c.destination_url
             FROM enrollments e JOIN campaigns c ON c.id=e.campaign_id
             WHERE e.affiliate_pubkey=:npub OR e.affiliate_pubkey_hex=:hex OR e.affiliate_pubkey=:hex
@@ -177,6 +192,7 @@ def affiliate_workspace_data(connection: Any, session: dict[str, Any], *, base_u
     for payout in payouts:
         payout["user_state"] = payout_user_state(payout.get("state"))
         payout["payment_hash_short"] = short(payout.get("payment_hash"), 8, 6) if payout.get("payment_hash") else None
+    lightning_address = next((row.get("lightning_address") for row in links if row.get("lightning_address")), "")
     affiliate_totals = dict(
         connection.execute(
             text(
@@ -194,6 +210,7 @@ def affiliate_workspace_data(connection: Any, session: dict[str, Any], *, base_u
     )
     return {
         "links": links,
+        "lightning_address": lightning_address,
         "conversions": conversions,
         "payouts": payouts,
         "totals": {

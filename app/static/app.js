@@ -158,6 +158,52 @@ document.addEventListener("click", async (event) => {
 });
 
 document.addEventListener("submit", async (event) => {
+  const lightningForm = event.target.closest("[data-affiliate-lightning-address]");
+  if (lightningForm) {
+    event.preventDefault();
+    const status = lightningForm.querySelector("[data-lightning-status]");
+    const button = lightningForm.querySelector("button[type='submit']");
+    button.disabled = true;
+    status.classList.remove("error");
+    status.textContent = "Guardando destino…";
+    try {
+      const result = await jsonFetch("/app/affiliate/lightning-address", {
+        method: "PUT", body: JSON.stringify({lightning_address: String(new FormData(lightningForm).get("lightning_address") || "").trim()})
+      });
+      status.textContent = `Destino guardado. ${result.updated_payouts} pago(s) pendiente(s) actualizado(s).`;
+    } catch (error) {
+      status.textContent = error.message; status.classList.add("error");
+    } finally { button.disabled = false; }
+    return;
+  }
+
+  const payoutForm = event.target.closest("[data-manual-payout]");
+  if (payoutForm) {
+    event.preventDefault();
+    const status = payoutForm.querySelector("[data-manual-status]");
+    const button = payoutForm.querySelector("button[type='submit']");
+    const fields = new FormData(payoutForm);
+    let evidence = String(fields.get("evidence") || "").trim().toLowerCase();
+    button.disabled = true; status.classList.remove("error");
+    try {
+      if (!/^[0-9a-f]{64}$/.test(evidence)) throw new Error("Ingresá exactamente 64 caracteres hexadecimales.");
+      if (fields.get("evidence_type") === "preimage") {
+        const bytes = new Uint8Array(evidence.match(/.{2}/g).map(byte => parseInt(byte, 16)));
+        const digest = await crypto.subtle.digest("SHA-256", bytes);
+        evidence = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0")).join("");
+      }
+      payoutForm.querySelector("[name='evidence']").value = "";
+      status.textContent = "Registrando atestación y publicando prueba…";
+      await jsonFetch(`/app/merchant/payouts/${encodeURIComponent(payoutForm.dataset.manualPayout)}/manual-settlement`, {
+        method: "POST", body: JSON.stringify({payment_hash: evidence})
+      });
+      status.textContent = "Pago registrado."; window.location.reload();
+    } catch (error) {
+      status.textContent = error.message; status.classList.add("error"); button.disabled = false;
+    }
+    return;
+  }
+
   const form = event.target.closest("[data-merchant-invitation]");
   if (!form) return;
   event.preventDefault();

@@ -8,6 +8,13 @@
   <article class="metric"><span>Conversiones</span><strong>{{ totals.conversions }}</strong><small>ventas confirmadas</small></article>
   <article class="metric"><span>Comisión bruta</span><strong>{{ totals.gross_sats }}</strong><small>{{ totals.paid_sats }} sats pagados</small></article>
 </section>
+<section class="section" id="payment-destination"><div class="section-head"><div><h2>Destino Lightning</h2><p>La dirección que usarán los Merchants para pagarte directamente.</p></div></div>
+  <form class="panel form-panel" data-affiliate-lightning-address>
+    <label><span>Lightning Address</span><input name="lightning_address" type="email" value="{{ lightning_address }}" placeholder="vos@getalby.com" autocomplete="off" required maxlength="320"></label>
+    <button class="button" type="submit">Guardar destino</button>
+    <p class="form-status" role="status" aria-live="polite" data-lightning-status>Meerat no recibe ni custodia estos fondos.</p>
+  </form>
+</section>
 <section class="section" id="links"><div class="section-head"><div><h2>Mis links</h2><p>Compartí el enlace de cada campaña.</p></div></div><div class="panel record-list">
 {% for link in links %}<article class="record"><div class="record-main"><strong>{{ link.campaign_name }}</strong><span>{{ link.commission_percent }}% · ventana {{ link.window_days }} días</span></div><div><span class="label-mobile">Estado</span><span class="badge {% if link.status == 'approved' %}success{% endif %}">{{ link.status }}</span></div><div class="record-span"><span class="label-mobile">Link</span><div class="copy-row"><code class="copy-value" title="{{ link.ref_url }}">{{ link.ref_url }}</code><button class="copy-button" type="button" data-copy="{{ link.ref_url }}">Copiar</button></div></div><a class="action" href="{{ link.ref_url }}" target="_blank" rel="noopener">Abrir</a></article>
 {% else %}<div class="empty">Esta identidad todavía no está asociada a una campaña.</div>{% endfor %}

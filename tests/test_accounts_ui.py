@@ -70,6 +70,44 @@ def login(client: TestClient, keys: Keys, role: str):
     return verify
 
 
+def seed_payable_payout(campaign: dict, enrollment: dict, affiliate: Keys, *, amount_sats: int = 210) -> str:
+    payout_id = f"pay_manual_{main.hid('test')}"
+    conversion_id = f"conv_manual_{main.hid('test')}"
+    click_id = f"clk_manual_{main.hid('test')}"
+    timestamp = main.now()
+    with main.engine().begin() as connection:
+        connection.execute(
+            text("INSERT INTO clicks (id, ref_code, campaign_id, affiliate_pubkey, created_at) VALUES (:id, :ref, :campaign, :affiliate, :created_at)"),
+            {"id": click_id, "ref": enrollment["ref_code"], "campaign": campaign["campaign_id"], "affiliate": affiliate.public_key().to_bech32(), "created_at": timestamp},
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO conversions
+                  (id, order_id_hash, click_id, campaign_id, affiliate_pubkey, order_total,
+                   currency, commission_sats, status, nostr_event_id, nostr_event_json, created_at)
+                VALUES (:id, :order_hash, :click_id, :campaign_id, :affiliate, 1, 'USD',
+                        :amount, 'approved', :event_id, '{}', :created_at)
+                """
+            ),
+            {"id": conversion_id, "order_hash": f"order_{conversion_id}", "click_id": click_id, "campaign_id": campaign["campaign_id"], "affiliate": affiliate.public_key().to_bech32(), "amount": amount_sats, "event_id": f"event_{conversion_id}", "created_at": timestamp},
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO payouts
+                  (id, conversion_id, affiliate_pubkey, amount_sats, lightning_address, status,
+                   state, fee_sats, fee_state, reserved_sats, return_window_ends_at, created_at)
+                VALUES (:id, :conversion_id, :affiliate, :amount, :address, 'pending',
+                        'PAYABLE', 0, 'FEE_PENDING', :amount, :return_window, :created_at)
+                """
+            ),
+            {"id": payout_id, "conversion_id": conversion_id, "affiliate": affiliate.public_key().to_bech32(), "amount": amount_sats, "address": "old@example.com", "return_window": "2020-01-01T00:00:00+00:00", "created_at": timestamp},
+        )
+        assert main.reserve_campaign_budget(connection, campaign["campaign_id"], payout_id, amount_sats)
+    return payout_id
+
+
 def test_nostr_login_issues_http_only_session_and_logout(tmp_path, monkeypatch):
     client = configured_client(tmp_path, monkeypatch)
     merchant = Keys.generate()
@@ -748,3 +786,146 @@ def test_workspace_kpis_exclude_reversed_conversions(tmp_path, monkeypatch):
         )
     assert affiliate_data["totals"]["conversions"] == 1
     assert affiliate_data["totals"]["gross_sats"] == 100
+
+
+def test_affiliate_updates_lightning_address_and_only_safe_pending_payouts(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    merchant = Keys.generate()
+    affiliate = Keys.generate()
+    campaign = create_campaign(client, merchant, name="Lightning destination campaign")
+    enrollment = create_enrollment(client, campaign["campaign_id"], affiliate)
+    payout_id = seed_payable_payout(campaign, enrollment, affiliate)
+    login(client, affiliate, "affiliate")
+
+    wrong_origin = client.put(
+        "/app/affiliate/lightning-address",
+        headers={"origin": "https://evil.example"},
+        json={"lightning_address": "juan@getalby.com"},
+    )
+    assert wrong_origin.status_code == 403
+    saved = client.put(
+        "/app/affiliate/lightning-address",
+        headers={"origin": "https://testserver"},
+        json={"lightning_address": "juan@getalby.com"},
+    )
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["updated_payouts"] == 1
+
+    with main.engine().connect() as connection:
+        address = connection.execute(text("SELECT lightning_address FROM enrollments WHERE id=:id"), {"id": enrollment["enrollment_id"]}).scalar_one()
+        payout_address = connection.execute(text("SELECT lightning_address FROM payouts WHERE id=:id"), {"id": payout_id}).scalar_one()
+    assert address == "juan@getalby.com"
+    assert payout_address == "juan@getalby.com"
+    assert "juan@getalby.com" in client.get("/app/affiliate").text
+
+
+def test_merchant_manual_settlement_is_owned_idempotent_and_attested(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    merchant = Keys.generate()
+    other_merchant = Keys.generate()
+    affiliate = Keys.generate()
+    campaign = create_campaign(client, merchant, name="LightningKoffee")
+    enrollment = create_enrollment(client, campaign["campaign_id"], affiliate)
+    payout_id = seed_payable_payout(campaign, enrollment, affiliate)
+    payment_hash = "ab" * 32
+
+    other_campaign = create_campaign(client, other_merchant, name="Other merchant bootstrap")
+    assert other_campaign["campaign_id"]
+    login(client, other_merchant, "merchant")
+    hidden = client.post(
+        f"/app/merchant/payouts/{payout_id}/manual-settlement",
+        headers={"origin": "https://testserver"},
+        json={"payment_hash": payment_hash},
+    )
+    assert hidden.status_code == 404
+
+    client.post("/auth/logout")
+    login(client, merchant, "merchant")
+    merchant_page = client.get("/app/merchant")
+    assert "old@example.com" in merchant_page.text
+    assert f'data-manual-payout="{payout_id}"' in merchant_page.text
+
+    invalid = client.post(
+        f"/app/merchant/payouts/{payout_id}/manual-settlement",
+        headers={"origin": "https://testserver"},
+        json={"payment_hash": "not-a-hash"},
+    )
+    assert invalid.status_code == 422
+    paid = client.post(
+        f"/app/merchant/payouts/{payout_id}/manual-settlement",
+        headers={"origin": "https://testserver"},
+        json={"payment_hash": payment_hash},
+    )
+    assert paid.status_code == 200, paid.text
+    assert paid.json()["payout_state"] == "PUBLISHED"
+    tags = paid.json()["nostr_event"]["tags"]
+    assert ["settlement_mode", "manual"] in tags
+    assert ["evidence", "merchant_attestation"] in tags
+    assert not any(tag[0] == "preimage" for tag in tags)
+
+    replay = client.post(
+        f"/app/merchant/payouts/{payout_id}/manual-settlement",
+        headers={"origin": "https://testserver"},
+        json={"payment_hash": payment_hash.upper()},
+    )
+    assert replay.status_code == 200
+    assert replay.json()["duplicate"] is True
+    with main.engine().connect() as connection:
+        attempts = connection.execute(text("SELECT COUNT(*) FROM payment_attempts WHERE payout_id=:id AND rail='manual'"), {"id": payout_id}).scalar_one()
+        stored_preimages = connection.execute(text("SELECT COUNT(*) FROM payment_attempts WHERE payout_id=:id AND preimage IS NOT NULL"), {"id": payout_id}).scalar_one()
+    assert attempts == 1
+    assert stored_preimages == 0
+
+
+def test_manual_settlement_persists_outbox_before_publish_and_retries_same_event(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    merchant = Keys.generate()
+    affiliate = Keys.generate()
+    campaign = create_campaign(client, merchant, name="Outbox payout")
+    enrollment = create_enrollment(client, campaign["campaign_id"], affiliate)
+    payout_id = seed_payable_payout(campaign, enrollment, affiliate)
+    payment_hash = "cd" * 32
+    login(client, merchant, "merchant")
+
+    def relay_crash(_event):
+        raise RuntimeError("simulated relay outage")
+
+    monkeypatch.setattr(main, "publish_event", relay_crash)
+    with pytest.raises(RuntimeError, match="simulated relay outage"):
+        client.post(
+            f"/app/merchant/payouts/{payout_id}/manual-settlement",
+            headers={"origin": "https://testserver"},
+            json={"payment_hash": payment_hash},
+        )
+
+    with main.engine().connect() as connection:
+        durable = dict(connection.execute(text(
+            "SELECT state, status, payment_hash, nostr_event_id, nostr_event_json, reserved_sats FROM payouts WHERE id=:id"
+        ), {"id": payout_id}).one()._mapping)
+        outbox = connection.execute(text(
+            "SELECT event_json, relay_status FROM nostr_events WHERE event_id=:id"
+        ), {"id": durable["nostr_event_id"]}).one()
+    first_event_id = durable["nostr_event_id"]
+    assert durable["state"] == "SETTLED"
+    assert durable["status"] == "paid"
+    assert durable["reserved_sats"] == 0
+    assert outbox.relay_status == "unknown"
+
+    monkeypatch.setattr(main, "publish_event", lambda _event: [
+        {"relay": "wss://relay.test", "status": "published", "error": None}
+    ])
+    retried = client.post(
+        f"/app/merchant/payouts/{payout_id}/manual-settlement",
+        headers={"origin": "https://testserver"},
+        json={"payment_hash": payment_hash},
+    )
+    assert retried.status_code == 200, retried.text
+    assert retried.json()["duplicate"] is True
+    assert retried.json()["payout_state"] == "PUBLISHED"
+    assert retried.json()["nostr_event_id"] == first_event_id
+    with main.engine().connect() as connection:
+        final = connection.execute(text(
+            "SELECT state, reserved_sats FROM payouts WHERE id=:id"
+        ), {"id": payout_id}).one()
+    assert final.state == "PUBLISHED"
+    assert final.reserved_sats == 0
