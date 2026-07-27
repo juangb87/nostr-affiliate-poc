@@ -9,14 +9,16 @@
   <article class="metric"><span>Comisiones</span><strong>{{ totals.commission_sats }}</strong><small>sats generados</small></article>
 </section>
 {% if totals.actionable_payouts %}<aside class="notice"><div><strong>{{ totals.actionable_payouts }} pago{% if totals.actionable_payouts != 1 %}s{% endif %} requiere{% if totals.actionable_payouts == 1 %}{% else %}n{% endif %} atención.</strong><p>Podés <a href="#payouts">revisar el detalle</a>; Sprint 4B habilitará el pago manual no custodial.</p></div></aside>{% endif %}
-<section class="section" id="affiliates"><div class="section-head"><div><h2>Agregar afiliado</h2><p>Inscribí una identidad Nostr en una campaña activa y generá su link único.</p></div></div>
-  <form class="panel form-panel" data-merchant-enrollment>
+<section class="section" id="affiliates"><div class="section-head"><div><h2>Invitar Affiliate</h2><p>Generá un enlace privado. La identidad queda asociada recién cuando el Affiliate acepta y firma.</p></div></div>
+  <form class="panel form-panel" data-merchant-invitation>
     <label><span>Campaña</span><select name="campaign_id" required>{% for campaign in campaigns if campaign.status == 'active' %}<option value="{{ campaign.id }}">{{ campaign.name }}</option>{% else %}<option value="" disabled>No hay campañas activas</option>{% endfor %}</select></label>
-    <label><span>npub del afiliado</span><input name="affiliate_pubkey" type="text" inputmode="text" autocomplete="off" spellcheck="false" placeholder="npub1…" required></label>
-    <label><span>Lightning address <small>(opcional)</small></span><input name="lightning_address" type="email" autocomplete="email" placeholder="nombre@dominio.com"></label>
-    <button class="button" type="submit" {% if not totals.active_campaigns %}disabled{% endif %}>Crear enrollment</button>
-    <p class="form-status" role="status" aria-live="polite" data-enrollment-status>El afiliado podrá entrar después con la misma clave que inscribas acá.</p>
-    <a class="action" data-enrollment-link hidden></a>
+    <label><span>Validez del enlace</span><select name="expires_days"><option value="7" selected>7 días</option><option value="3">3 días</option><option value="14">14 días</option><option value="30">30 días</option></select></label>
+    <button class="button" type="submit" {% if not totals.active_campaigns %}disabled{% endif %}>Generar invitación</button>
+    <p class="form-status" role="status" aria-live="polite" data-invitation-status>Compartí el enlace únicamente con la persona que querés invitar. No hace falta pedirle su npub.</p>
+    <div data-invitation-result hidden>
+      <a class="action" data-invitation-link target="_blank" rel="noopener noreferrer"></a>
+      <button class="button secondary" type="button" data-copy="">Copiar invitación</button>
+    </div>
   </form>
 </section>
 <section class="section" id="campaigns"><div class="section-head"><div><h2>Campañas</h2><p>Actividad y condiciones del programa.</p></div></div><div class="panel record-list">

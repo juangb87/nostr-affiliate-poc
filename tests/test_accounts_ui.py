@@ -14,6 +14,7 @@ def configured_client(tmp_path, monkeypatch) -> TestClient:
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path}/accounts.db")
     monkeypatch.setenv("NOSTR_PUBLISH", "false")
     monkeypatch.setenv("APP_SECRET", "test-app-secret-with-enough-entropy")
+    monkeypatch.setenv("PAYOUT_ADMIN_KEY", "test-admin-key")
     monkeypatch.setattr(main, "BASE_URL", "https://testserver")
     main._ENGINE = None
     main._ENGINE_URL = None
@@ -51,16 +52,13 @@ def create_campaign(client: TestClient, merchant: Keys, *, name: str = "Merchant
 
 
 def create_enrollment(client: TestClient, campaign_id: str, affiliate: Keys) -> dict:
-    response = client.post(
-        "/enrollments",
-        json={
-            "campaign_id": campaign_id,
-            "affiliate_pubkey": affiliate.public_key().to_bech32(),
-            "lightning_address": "affiliate@example.com",
-        },
+    return main._create_enrollment_record(
+        main.EnrollmentIn(
+            campaign_id=campaign_id,
+            affiliate_pubkey=affiliate.public_key().to_bech32(),
+            lightning_address="affiliate@example.com",
+        )
     )
-    assert response.status_code == 200, response.text
-    return response.json()
 
 
 def login(client: TestClient, keys: Keys, role: str):
@@ -233,6 +231,184 @@ def test_ops_is_allowlisted_and_dashboard_redirects(tmp_path, monkeypatch):
     assert "counts" in ops_data.json()
 
 
+def create_invitation(client: TestClient, campaign_id: str) -> dict:
+    response = client.post(
+        "/app/merchant/invitations",
+        headers={"origin": "https://testserver"},
+        json={"campaign_id": campaign_id},
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def invitation_acceptance_event(keys: Keys, token: str) -> dict:
+    return signed_login_event(
+        keys,
+        {"challenge": token, "relay": "https://testserver", "role": "affiliate_invite"},
+    )
+
+
+def test_merchant_creates_hashed_single_use_invitation_for_owned_campaign(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    merchant = Keys.generate()
+    campaign = create_campaign(client, merchant, name="Invite-only campaign")
+    login(client, merchant, "merchant")
+
+    invitation = create_invitation(client, campaign["campaign_id"])
+
+    assert invitation["invite_url"].startswith("https://testserver/invite#token=")
+    assert invitation["status"] == "pending"
+    token = invitation["invite_url"].split("#token=", 1)[1]
+    assert token not in invitation["invitation_id"]
+    with main.engine().connect() as connection:
+        row = connection.execute(
+            text("SELECT * FROM affiliate_invitations WHERE id=:id"),
+            {"id": invitation["invitation_id"]},
+        ).one()._mapping
+    assert row["token_hash"] == main.auth_digest(token)
+    assert token not in row["token_hash"]
+    assert row["campaign_id"] == campaign["campaign_id"]
+
+
+def test_affiliate_accepts_invitation_with_nip07_and_gets_session(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    merchant = Keys.generate()
+    affiliate = Keys.generate()
+    campaign = create_campaign(client, merchant, name="Signed invitation campaign")
+    login(client, merchant, "merchant")
+    invitation = create_invitation(client, campaign["campaign_id"])
+    token = invitation["invite_url"].split("#token=", 1)[1]
+    client.post("/auth/logout")
+
+    page = client.get("/invite")
+    assert page.status_code == 200
+    assert token not in page.text
+    assert page.headers["cache-control"] == "no-store"
+    assert page.headers["referrer-policy"] == "no-referrer"
+    resolved = client.post(
+        "/invite/resolve",
+        headers={"origin": "https://testserver"},
+        json={"token": token},
+    )
+    assert resolved.status_code == 200
+    assert resolved.json()["campaign_name"] == "Signed invitation campaign"
+    accepted = client.post(
+        "/invite/accept",
+        headers={"origin": "https://testserver"},
+        json={"token": token, "event": invitation_acceptance_event(affiliate, token)},
+    )
+
+    assert accepted.status_code == 200, accepted.text
+    payload = accepted.json()
+    assert payload["affiliate_pubkey"] == affiliate.public_key().to_bech32()
+    assert payload["redirect"] == "/app/affiliate"
+    assert payload["ref_url"].startswith("https://testserver/r/")
+    assert main.SESSION_COOKIE.lower() in accepted.headers["set-cookie"].lower()
+    workspace = client.get("/app/affiliate")
+    assert workspace.status_code == 200
+    assert "Signed invitation campaign" in workspace.text
+
+    replay = client.post(
+        "/invite/accept",
+        headers={"origin": "https://testserver"},
+        json={"token": token, "event": invitation_acceptance_event(affiliate, token)},
+    )
+    assert replay.status_code == 200
+    assert replay.json()["recovered"] is True
+    assert replay.json()["enrollment_id"] == payload["enrollment_id"]
+
+    other_affiliate = Keys.generate()
+    stolen_replay = client.post(
+        "/invite/accept",
+        headers={"origin": "https://testserver"},
+        json={"token": token, "event": invitation_acceptance_event(other_affiliate, token)},
+    )
+    assert stolen_replay.status_code == 409
+
+
+def test_inactive_account_cannot_consume_invitation(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    merchant = Keys.generate()
+    affiliate = Keys.generate()
+    campaign = create_campaign(client, merchant)
+    login(client, merchant, "merchant")
+    invitation = create_invitation(client, campaign["campaign_id"])
+    token = invitation["invite_url"].split("#token=", 1)[1]
+    client.post("/auth/logout")
+    timestamp = main.now()
+    with main.engine().begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO accounts (id, nostr_pubkey_hex, npub, status, created_at, updated_at, last_login_at)
+                VALUES (:id, :hex, :npub, 'suspended', :now, :now, :now)
+                """
+            ),
+            {
+                "id": "acct_suspended_test",
+                "hex": affiliate.public_key().to_hex(),
+                "npub": affiliate.public_key().to_bech32(),
+                "now": timestamp,
+            },
+        )
+
+    denied = client.post(
+        "/invite/accept",
+        headers={"origin": "https://testserver"},
+        json={"token": token, "event": invitation_acceptance_event(affiliate, token)},
+    )
+    assert denied.status_code == 403
+    with main.engine().connect() as connection:
+        invite_status = connection.execute(
+            text("SELECT status FROM affiliate_invitations WHERE id=:id"),
+            {"id": invitation["invitation_id"]},
+        ).scalar_one()
+        enrollments = connection.execute(
+            text("SELECT COUNT(*) FROM enrollments WHERE campaign_id=:campaign_id"),
+            {"campaign_id": campaign["campaign_id"]},
+        ).scalar_one()
+    assert invite_status == "pending"
+    assert enrollments == 0
+
+
+def test_invitation_rejects_wrong_origin_expiry_and_cross_tenant_campaign(tmp_path, monkeypatch):
+    merchant_client = configured_client(tmp_path, monkeypatch)
+    merchant = Keys.generate()
+    other_merchant = Keys.generate()
+    affiliate = Keys.generate()
+    campaign = create_campaign(merchant_client, merchant)
+    other_campaign = create_campaign(merchant_client, other_merchant)
+    login(merchant_client, merchant, "merchant")
+
+    cross_tenant = merchant_client.post(
+        "/app/merchant/invitations",
+        headers={"origin": "https://testserver"},
+        json={"campaign_id": other_campaign["campaign_id"]},
+    )
+    assert cross_tenant.status_code == 404
+    invitation = create_invitation(merchant_client, campaign["campaign_id"])
+    token = invitation["invite_url"].split("#token=", 1)[1]
+    merchant_client.post("/auth/logout")
+
+    wrong_origin = merchant_client.post(
+        "/invite/accept",
+        headers={"origin": "https://evil.example"},
+        json={"token": token, "event": invitation_acceptance_event(affiliate, token)},
+    )
+    assert wrong_origin.status_code == 403
+    with main.engine().begin() as connection:
+        connection.execute(
+            text("UPDATE affiliate_invitations SET expires_at=:expired WHERE token_hash=:token_hash"),
+            {"expired": "2020-01-01T00:00:00+00:00", "token_hash": main.auth_digest(token)},
+        )
+    expired = merchant_client.post(
+        "/invite/accept",
+        headers={"origin": "https://testserver"},
+        json={"token": token, "event": invitation_acceptance_event(affiliate, token)},
+    )
+    assert expired.status_code == 410
+
+
 def test_human_owner_can_be_bound_to_merchant_identity(tmp_path, monkeypatch):
     client = configured_client(tmp_path, monkeypatch)
     merchant_identity = Keys.generate()
@@ -247,12 +423,21 @@ def test_human_owner_can_be_bound_to_merchant_identity(tmp_path, monkeypatch):
     page = client.get("/app/merchant")
     assert page.status_code == 200
     assert "Bound merchant campaign" in page.text
-    assert 'data-merchant-enrollment' in page.text
-    assert 'name="affiliate_pubkey"' in page.text
+    assert 'data-merchant-invitation' in page.text
+    assert 'name="affiliate_pubkey"' not in page.text
     assert 'value="' + campaign["campaign_id"] + '"' in page.text
 
 
-def test_merchant_session_can_enroll_affiliate_idempotently(tmp_path, monkeypatch):
+def test_legacy_enrollment_hook_is_removed(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    denied = client.post(
+        "/enrollments",
+        json={"campaign_id": "camp_unused", "affiliate_pubkey": Keys.generate().public_key().to_bech32()},
+    )
+    assert denied.status_code == 404
+
+
+def test_direct_merchant_enrollment_endpoint_is_retired(tmp_path, monkeypatch):
     client = configured_client(tmp_path, monkeypatch)
     merchant_identity = Keys.generate()
     human_owner = Keys.generate()
@@ -273,46 +458,7 @@ def test_merchant_session_can_enroll_affiliate_idempotently(tmp_path, monkeypatc
         headers={"origin": "https://testserver"},
         json=payload,
     )
-    assert first.status_code == 200, first.text
-    assert first.json()["duplicate"] is False
-    assert first.json()["ref_url"].startswith("https://testserver/r/")
-    assert first.json()["nostr_status"] == "pending"
-
-    # Simulate a historical row created before affiliate_pubkey_hex was backfilled.
-    with main.engine().begin() as connection:
-        connection.execute(
-            text("UPDATE enrollments SET affiliate_pubkey_hex=NULL WHERE id=:id"),
-            {"id": first.json()["enrollment_id"]},
-        )
-
-    duplicate = client.post(
-        "/app/merchant/enrollments",
-        headers={"origin": "https://testserver"},
-        json=payload,
-    )
-    assert duplicate.status_code == 200, duplicate.text
-    assert duplicate.json()["duplicate"] is True
-    assert duplicate.json()["enrollment_id"] == first.json()["enrollment_id"]
-
-    with main.engine().connect() as connection:
-        count = connection.execute(
-            text(
-                """
-                SELECT COUNT(*) FROM enrollments
-                WHERE campaign_id=:campaign_id AND (affiliate_pubkey_hex=:hex OR affiliate_pubkey=:npub)
-                """
-            ),
-            {
-                "campaign_id": campaign["campaign_id"],
-                "hex": affiliate.public_key().to_hex(),
-                "npub": affiliate.public_key().to_bech32(),
-            },
-        ).scalar_one()
-    assert count == 1
-
-
-    affiliate_client = TestClient(main.app, base_url="https://testserver")
-    assert login(affiliate_client, affiliate, "affiliate").status_code == 200
+    assert first.status_code == 404, first.text
 
 
 def test_inactive_enrollment_does_not_grant_affiliate_login(tmp_path, monkeypatch):
@@ -335,7 +481,7 @@ def test_inactive_enrollment_does_not_grant_affiliate_login(tmp_path, monkeypatc
     assert denied.status_code == 403
 
 
-def test_merchant_enrollment_requires_session_origin_and_campaign_ownership(tmp_path, monkeypatch):
+def test_retired_direct_enrollment_cannot_be_used_without_origin(tmp_path, monkeypatch):
     owner_client = configured_client(tmp_path, monkeypatch)
     owner_identity = Keys.generate()
     other_identity = Keys.generate()
@@ -349,22 +495,7 @@ def test_merchant_enrollment_requires_session_origin_and_campaign_ownership(tmp_
     }
 
     no_origin = owner_client.post("/app/merchant/enrollments", json=payload)
-    assert no_origin.status_code == 403
-
-    anonymous = TestClient(main.app, base_url="https://testserver").post(
-        "/app/merchant/enrollments",
-        headers={"origin": "https://testserver"},
-        json=payload,
-    )
-    assert anonymous.status_code == 401
-
-    foreign_payload = {**payload, "campaign_id": foreign["campaign_id"]}
-    forbidden = owner_client.post(
-        "/app/merchant/enrollments",
-        headers={"origin": "https://testserver"},
-        json=foreign_payload,
-    )
-    assert forbidden.status_code == 404
+    assert no_origin.status_code == 404
 
 
 def test_legacy_demo_mutations_are_fail_closed_by_default(tmp_path, monkeypatch):
