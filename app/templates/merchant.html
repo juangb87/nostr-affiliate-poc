@@ -47,7 +47,7 @@
 {% for campaign in campaigns %}<form class="integration-card form-panel" data-merchant-profile>
   <input type="hidden" name="merchant_pubkey" value="{{ campaign.merchant_pubkey }}">
   <h3>{{ campaign.name }}</h3>
-  {% if campaign.logo_url %}<img class="merchant-logo-preview" src="{{ campaign.logo_url }}" alt="Logo de {{ campaign.name }}" referrerpolicy="no-referrer">{% endif %}
+  {% if campaign.logo_url %}<img class="merchant-logo-preview" src="{{ campaign.logo_url }}" alt="Logo de {{ campaign.name }}" referrerpolicy="no-referrer">{% else %}<span class="merchant-logo-placeholder" aria-hidden="true">{{ campaign.name[:1] }}</span>{% endif %}
   <label><span>Logo (URL HTTPS)</span><input name="logo_url" type="url" maxlength="2048" value="{{ campaign.logo_url or '' }}" placeholder="https://cdn.example.com/logo.png"><small>Dejalo vacío y guardá para eliminarlo.</small></label>
   <button class="button secondary" type="submit">Guardar logo</button>
   <p class="form-status" role="status" aria-live="polite" data-profile-status>PNG, JPG o WebP público.</p>

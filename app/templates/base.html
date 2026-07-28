@@ -3,12 +3,12 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta name="theme-color" content="#151615">
+  <meta name="theme-color" content="#f5f7fb">
   <title>{% block title %}Meerat{% endblock %}</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&family=Unbounded:wght@600;700;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/app.css?v=20260728-merchant-form1">
+  <link rel="stylesheet" href="/static/app.css?v=20260728-salvia1">
   <script src="/static/app.js?v=20260728-merchant-form1" defer></script>
 </head>
 <body>
@@ -16,24 +16,28 @@
 <div class="mobile-bar">
   <div class="mobile-top">
     <a class="brand" href="/app">Meerat<span class="brand-dot">.</span></a>
-    <div class="mobile-account"><code title="{{ account.npub }}">{{ account.npub_short }}</code><button class="link-button" type="button" data-logout>Cerrar sesión</button></div>
+    <div class="mobile-account"><span class="account-avatar" aria-hidden="true">{{ role_label[:1] }}</span><code title="{{ account.npub }}">{{ account.npub_short }}</code><button class="link-button" type="button" data-logout>Cerrar sesión</button></div>
   </div>
   <nav aria-label="Navegación móvil">
-    {% for item in nav %}<a href="{{ item.href }}" {% if item.active %}aria-current="page"{% endif %}>{{ item.label }}</a>{% endfor %}
+    {% for item in nav %}<a href="{{ item.href }}" {% if item.active %}aria-current="page"{% endif %}><span class="nav-icon" aria-hidden="true">{{ item.label[:1] }}</span><span>{{ item.label }}</span></a>{% endfor %}
   </nav>
 </div>
 <div class="app-shell">
   <aside class="sidebar">
     <a class="brand" href="/app">Meerat<span class="brand-dot">.</span></a>
     <div class="account-chip">
-      <small>{{ role_label }}</small>
-      <code title="{{ account.npub }}">{{ account.npub_short }}</code>
+      <span class="account-avatar" aria-hidden="true">{{ role_label[:1] }}</span>
+      <div><small>{{ role_label }}</small><code title="{{ account.npub }}">{{ account.npub_short }}</code></div>
     </div>
     <nav class="nav" aria-label="Navegación principal">
-      {% for item in nav %}<a href="{{ item.href }}" {% if item.active %}aria-current="page"{% endif %}>{{ item.label }}</a>{% endfor %}
+      {% for item in nav %}<a href="{{ item.href }}" {% if item.active %}aria-current="page"{% endif %}><span class="nav-icon" aria-hidden="true">{{ item.label[:1] }}</span><span>{{ item.label }}</span></a>{% endfor %}
     </nav>
     <div class="sidebar-footer"><button class="link-button" type="button" data-logout>Cerrar sesión</button></div>
   </aside>
+  <header class="topbar">
+    <div class="topbar-context"><span>Workspace</span><strong>{{ role_label }}</strong></div>
+    <div class="topbar-actions"><span class="live-status"><i aria-hidden="true"></i>Operativo</span><code title="{{ account.npub }}">{{ account.npub_short }}</code><span class="account-avatar" aria-hidden="true">{{ role_label[:1] }}</span></div>
+  </header>
   <main class="main" id="main"><div class="content">{% block content %}{% endblock %}</div></main>
 </div>
 <div class="sr-only" role="status" aria-live="polite" data-global-status></div>
