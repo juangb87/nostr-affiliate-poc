@@ -121,7 +121,7 @@ def test_login_frontend_preserves_role_card_markup_and_formats_structured_signer
     login_page = client.get("/app?role=merchant")
 
     assert script.status_code == 200
-    assert '/static/app.js?v=20260728-safari-signer1' in login_page.text
+    assert '/static/app.js?v=20260728-merchant-form1' in login_page.text
     assert "function readableError(error" in script.text
     assert 'value === "[object Object]"' in script.text
     assert "new Error(readableError(data.detail" in script.text
@@ -143,7 +143,7 @@ def test_login_frontend_rejects_empty_or_invalid_signer_responses_before_verify(
     assert "NostrKey no devolvió un evento firmado" in script.text
     assert "requireSignedNostrEvent(await window.nostr.signEvent(unsignedEvent))" in script.text
     assert 'JSON.stringify({event})' in script.text
-    assert '/static/app.js?v=20260728-safari-signer1' in login_page.text
+    assert '/static/app.js?v=20260728-merchant-form1' in login_page.text
 
 
 def test_nostr_login_issues_http_only_session_and_logout(tmp_path, monkeypatch):
@@ -600,7 +600,7 @@ def test_bound_owner_can_sign_in_before_tenant_has_a_campaign(tmp_path, monkeypa
     assert 'data-merchant-bootstrap' in page.text
     assert f'value="{merchant_identity.public_key().to_bech32()}"' in page.text
     assert "Crear programa activo" in page.text
-    assert "El programa comienza activo" in page.text
+    assert "una vez publicado, el evento Nostr deja prueba" in page.text
     assert "Shopify conectado" not in page.text
 
 
@@ -619,11 +619,20 @@ def test_merchant_bootstrap_browser_contract_is_same_origin_json(tmp_path, monke
 
     assert page.status_code == 200
     assert 'name="merchant_pubkey"' in page.text
+    assert 'name="program_name"' in page.text
+    assert 'name="commission_percent"' in page.text
+    assert 'name="attribution_window_days"' in page.text
+    assert 'name="destination_url"' in page.text
+    assert 'name="terms_url"' in page.text
+    assert 'name="logo_url"' in page.text
     assert 'data-bootstrap-status' in page.text
     assert script.status_code == 200
     assert 'event.target.closest("[data-merchant-bootstrap]")' in script.text
     assert 'jsonFetch("/app/merchant/bootstrap"' in script.text
     assert 'merchant_pubkey: String(fields.get("merchant_pubkey")' in script.text
+    assert 'program_name: String(fields.get("program_name")' in script.text
+    assert 'commission_percent: String(fields.get("commission_percent")' in script.text
+    assert 'logo_url: String(fields.get("logo_url")' in script.text
 
 
 def test_self_binding_does_not_bootstrap_campaignless_merchant(tmp_path, monkeypatch):
@@ -685,7 +694,7 @@ def test_merchant_bootstrap_requires_session_origin_and_bound_tenant(tmp_path, m
     assert extra_field.status_code == 422
 
 
-def test_merchant_bootstrap_creates_one_active_default_program_idempotently(tmp_path, monkeypatch):
+def test_merchant_bootstrap_creates_configurable_active_program_and_reusable_logo_idempotently(tmp_path, monkeypatch):
     client = configured_client(tmp_path, monkeypatch)
     human_owner = Keys.generate()
     merchant_identity = Keys.generate()
@@ -694,11 +703,7 @@ def test_merchant_bootstrap_creates_one_active_default_program_idempotently(tmp_
         "MERCHANT_ACCOUNT_BINDINGS",
         f"{human_owner.public_key().to_bech32()}:{merchant_npub}",
     )
-    monkeypatch.setenv("MERCHANT_DEFAULT_PROGRAM_NAME", "Shapersfit Affiliate Program")
-    monkeypatch.setenv("MERCHANT_DEFAULT_COMMISSION_BPS", "800")
-    monkeypatch.setenv("MERCHANT_DEFAULT_WINDOW_DAYS", "30")
-    monkeypatch.setenv("MERCHANT_DEFAULT_DESTINATION_URL", "https://shapersfit.myshopify.com/")
-    monkeypatch.setenv("MERCHANT_DEFAULT_TERMS_URL", "https://shapersfit.com/affiliate-terms")
+
     publish_calls = []
 
     def fake_publish(event):
@@ -707,7 +712,15 @@ def test_merchant_bootstrap_creates_one_active_default_program_idempotently(tmp_
 
     monkeypatch.setattr(main, "publish_event", fake_publish)
     login(client, human_owner, "merchant")
-    payload = {"merchant_pubkey": merchant_npub}
+    payload = {
+        "merchant_pubkey": merchant_npub,
+        "program_name": "Shapersfit Affiliate Program",
+        "commission_percent": "7.25",
+        "attribution_window_days": 45,
+        "destination_url": "https://shapersfit.myshopify.com/collections/new",
+        "terms_url": "https://shapersfit.com/affiliate-terms",
+        "logo_url": "https://cdn.example.com/merchant/shapersfit.webp",
+    }
     headers = {"origin": "https://testserver"}
 
     first = client.post("/app/merchant/bootstrap", headers=headers, json=payload)
@@ -721,8 +734,26 @@ def test_merchant_bootstrap_creates_one_active_default_program_idempotently(tmp_
     assert first.json()["status"] == second.json()["status"] == "active"
     assert first.json()["merchant_pubkey"] == merchant_npub
     assert len(publish_calls) == 1
+    conflict = client.post(
+        "/app/merchant/bootstrap",
+        headers=headers,
+        json={**payload, "commission_percent": "9"},
+    )
+    assert conflict.status_code == 409
+    workspace = client.get("/app/merchant")
+    assert 'data-merchant-profile' in workspace.text
+    assert f'value="{payload["logo_url"]}"' in workspace.text
+    updated_logo = "https://images.example.com/brands/shapersfit.png"
+    updated_profile = client.put(
+        "/app/merchant/profile",
+        headers=headers,
+        json={"merchant_pubkey": merchant_npub, "logo_url": updated_logo},
+    )
+    assert updated_profile.status_code == 200, updated_profile.text
+    assert updated_profile.json()["logo_url"] == updated_logo
     with main.engine().connect() as connection:
         campaigns = [dict(row._mapping) for row in connection.execute(text("SELECT * FROM campaigns")).fetchall()]
+        merchant_profile = dict(connection.execute(text("SELECT * FROM merchant_profiles")).one()._mapping)
         budgets = connection.execute(text("SELECT COUNT(*) FROM campaign_budgets")).scalar_one()
         events = connection.execute(
             text("SELECT COUNT(*) FROM nostr_events WHERE entity_type='campaign' AND entity_id=:id"),
@@ -732,14 +763,65 @@ def test_merchant_bootstrap_creates_one_active_default_program_idempotently(tmp_
     assert campaigns[0]["merchant_pubkey"] == merchant_npub
     assert campaigns[0]["merchant_pubkey_hex"] == merchant_identity.public_key().to_hex()
     assert campaigns[0]["name"] == "Shapersfit Affiliate Program"
-    assert campaigns[0]["commission_bps"] == 800
-    assert campaigns[0]["window_days"] == 30
-    assert campaigns[0]["destination_url"] == "https://shapersfit.myshopify.com/"
+    assert campaigns[0]["commission_bps"] == 725
+    assert campaigns[0]["window_days"] == 45
+    assert campaigns[0]["destination_url"] == "https://shapersfit.myshopify.com/collections/new"
+    assert campaigns[0]["terms_url"] == "https://shapersfit.com/affiliate-terms"
     assert campaigns[0]["terms_hash"] == main.sha("https://shapersfit.com/affiliate-terms")
     assert campaigns[0]["status"] == "active"
     assert ["status", "active"] in json.loads(campaigns[0]["nostr_event_json"])["tags"]
     assert budgets == 1
     assert events == 1
+    assert merchant_profile["merchant_pubkey_hex"] == merchant_identity.public_key().to_hex()
+    assert merchant_profile["logo_url"] == updated_logo
+
+    summary = client.get(f"/campaigns/{first.json()['campaign_id']}/summary")
+    public_page = client.get(f"/campaigns/{first.json()['campaign_id']}/page")
+    assert summary.json()["merchant_profile"]["logo_url"] == updated_logo
+    assert f'src="{updated_logo}"' in public_page.text
+    assert 'referrerpolicy="no-referrer"' in public_page.text
+
+
+def test_merchant_bootstrap_rejects_unsafe_or_invalid_configurable_fields(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    human_owner = Keys.generate()
+    merchant_identity = Keys.generate()
+    merchant_npub = merchant_identity.public_key().to_bech32()
+    monkeypatch.setenv(
+        "MERCHANT_ACCOUNT_BINDINGS",
+        f"{human_owner.public_key().to_bech32()}:{merchant_npub}",
+    )
+    login(client, human_owner, "merchant")
+    headers = {"origin": "https://testserver"}
+    valid = {
+        "merchant_pubkey": merchant_npub,
+        "program_name": "Safe program",
+        "commission_percent": "8",
+        "attribution_window_days": 30,
+        "destination_url": "https://merchant.example/shop",
+        "terms_url": "https://merchant.example/terms",
+        "logo_url": "https://cdn.example.com/logo.png",
+    }
+
+    invalid_overrides = [
+        {"commission_percent": "0"},
+        {"commission_percent": "100.001"},
+        {"attribution_window_days": 0},
+        {"destination_url": "javascript:alert(1)"},
+        {"terms_url": "file:///tmp/terms"},
+        {"logo_url": "http://cdn.example.com/logo.png"},
+        {"logo_url": "https://127.0.0.1/logo.png"},
+        {"logo_url": "https://images.example:444/logo.png"},
+        {"logo_url": "https://[::1/logo.png"},
+        {"logo_url": "https://images.example/logo.svg"},
+    ]
+    for override in invalid_overrides:
+        response = client.post("/app/merchant/bootstrap", headers=headers, json={**valid, **override})
+        assert response.status_code == 422, (override, response.text)
+
+    with main.engine().connect() as connection:
+        assert connection.execute(text("SELECT COUNT(*) FROM campaigns")).scalar_one() == 0
+        assert connection.execute(text("SELECT COUNT(*) FROM merchant_profiles")).scalar_one() == 0
 
 
 def test_removing_merchant_binding_revokes_session_after_bootstrap(tmp_path, monkeypatch):

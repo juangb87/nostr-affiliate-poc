@@ -28,10 +28,11 @@ def merchant_workspace_data(connection: Any, session: dict[str, Any], *, base_ur
     identity_list = sorted(identities)
     campaign_stmt = text(
         """
-        SELECT c.*,
+        SELECT c.*, mp.logo_url,
           (SELECT COUNT(*) FROM enrollments e WHERE e.campaign_id=c.id) AS affiliates,
           (SELECT COUNT(*) FROM conversions v WHERE v.campaign_id=c.id) AS conversions
         FROM campaigns c
+        LEFT JOIN merchant_profiles mp ON mp.merchant_pubkey_hex=c.merchant_pubkey_hex
         WHERE c.merchant_pubkey_hex IN :identities OR c.merchant_pubkey IN :identities
         ORDER BY c.created_at DESC
         """

@@ -4,7 +4,7 @@
 <header class="page-header"><div><p class="eyebrow">Merchant account</p><h1>Tu programa, bajo control.</h1><p class="lede">Campañas, atribución y obligaciones de pago de tus comercios, sin mezclar datos de otros merchants.</p></div><div class="header-actions"><a class="button secondary" href="#integration">Ver integración</a></div></header>
 {% if not totals.campaigns and bootstrap_tenants %}
 <section class="section" id="onboarding" data-merchant-onboarding>
-  <div class="section-head"><div><p class="eyebrow">Primer paso</p><h2>Crear tu Programa de Afiliados</h2><p>Tu identidad owner ya está vinculada a un Merchant autorizado. Creá el programa inicial con las condiciones configuradas y empezá a invitar Affiliates.</p></div></div>
+  <div class="section-head"><div><p class="eyebrow">Primer paso</p><h2>Crear tu Programa de Afiliados</h2><p>Definí las condiciones públicas del programa. La campaña queda activa y lista para invitar Affiliates.</p></div></div>
   <form class="panel form-panel" data-merchant-bootstrap>
     {% if bootstrap_tenants|length == 1 %}
       <input type="hidden" name="merchant_pubkey" value="{{ bootstrap_tenants[0].merchant_pubkey }}">
@@ -12,8 +12,14 @@
     {% else %}
       <label><span>Identidad Merchant</span><select name="merchant_pubkey" required>{% for tenant in bootstrap_tenants %}<option value="{{ tenant.merchant_pubkey }}">{{ tenant.merchant_short }}</option>{% endfor %}</select></label>
     {% endif %}
+    <label><span>Nombre del programa</span><input name="program_name" maxlength="160" value="{{ program_defaults.name }}" required autocomplete="organization"></label>
+    <label><span>Comisión por venta (%)</span><input name="commission_percent" type="number" min="0.01" max="100" step="0.01" value="{{ program_defaults.commission_bps / 100 }}" required inputmode="decimal"><small>Ejemplo: 8 equivale al 8%.</small></label>
+    <label><span>Ventana de atribución (días)</span><input name="attribution_window_days" type="number" min="1" max="365" step="1" value="{{ program_defaults.window_days }}" required inputmode="numeric"></label>
+    <label><span>URL de destino</span><input name="destination_url" type="url" maxlength="3000" value="{{ program_defaults.destination_url }}" required placeholder="https://tienda.example/"></label>
+    <label><span>URL de términos</span><input name="terms_url" type="url" maxlength="3000" value="{{ program_defaults.terms_url }}" required placeholder="https://tienda.example/terminos-afiliados"></label>
+    <label><span>Logo del Merchant (URL HTTPS)</span><input name="logo_url" type="url" maxlength="2048" placeholder="https://cdn.example.com/logo.png"><small>PNG, JPG o WebP público. Se reutiliza en la página pública.</small></label>
     <button class="button" type="submit">Crear programa activo</button>
-    <p class="form-status" role="status" aria-live="polite" data-bootstrap-status>El programa comienza activo y queda listo para invitar Affiliates.</p>
+    <p class="form-status" role="status" aria-live="polite" data-bootstrap-status>Revisá los datos: una vez publicado, el evento Nostr deja prueba de estas condiciones.</p>
   </form>
 </section>
 {% endif %}
@@ -36,6 +42,18 @@
     </div>
   </form>
 </section>
+{% if campaigns %}
+<section class="section" id="merchant-profile"><div class="section-head"><div><h2>Perfil público del Merchant</h2><p>El logo se comparte entre las campañas de esta identidad Merchant.</p></div></div><div class="integration">
+{% for campaign in campaigns %}<form class="integration-card form-panel" data-merchant-profile>
+  <input type="hidden" name="merchant_pubkey" value="{{ campaign.merchant_pubkey }}">
+  <h3>{{ campaign.name }}</h3>
+  {% if campaign.logo_url %}<img class="merchant-logo-preview" src="{{ campaign.logo_url }}" alt="Logo de {{ campaign.name }}" referrerpolicy="no-referrer">{% endif %}
+  <label><span>Logo (URL HTTPS)</span><input name="logo_url" type="url" maxlength="2048" value="{{ campaign.logo_url or '' }}" placeholder="https://cdn.example.com/logo.png"><small>Dejalo vacío y guardá para eliminarlo.</small></label>
+  <button class="button secondary" type="submit">Guardar logo</button>
+  <p class="form-status" role="status" aria-live="polite" data-profile-status>PNG, JPG o WebP público.</p>
+</form>{% endfor %}
+</div></section>
+{% endif %}
 <section class="section" id="campaigns"><div class="section-head"><div><h2>Campañas</h2><p>Actividad y condiciones del programa.</p></div></div><div class="panel record-list">
 {% for campaign in campaigns %}<article class="record"><div class="record-main"><strong>{{ campaign.name }}</strong><span>{{ campaign.commission_percent }}% · ventana {{ campaign.window_days }} días</span></div><div><span class="label-mobile">Afiliados</span><strong>{{ campaign.affiliates }}</strong><div class="record-meta">afiliados</div></div><div><span class="label-mobile">Conversiones</span><strong>{{ campaign.conversions }}</strong><div class="record-meta">conversiones</div></div><div><span class="badge {% if campaign.status == 'active' %}success{% endif %}">{{ campaign.status }}</span></div><a class="action" href="/campaigns/{{ campaign.id }}/page">Página pública</a></article>
 {% else %}<div class="empty">No hay campañas asociadas a esta cuenta merchant.</div>{% endfor %}

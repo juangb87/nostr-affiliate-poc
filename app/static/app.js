@@ -280,7 +280,13 @@ document.addEventListener("submit", async (event) => {
     const button = bootstrapForm.querySelector("button[type='submit']");
     const fields = new FormData(bootstrapForm);
     const payload = {
-      merchant_pubkey: String(fields.get("merchant_pubkey") || "").trim()
+      merchant_pubkey: String(fields.get("merchant_pubkey") || "").trim(),
+      program_name: String(fields.get("program_name") || "").trim(),
+      commission_percent: String(fields.get("commission_percent") || "").trim(),
+      attribution_window_days: Number(fields.get("attribution_window_days") || 0),
+      destination_url: String(fields.get("destination_url") || "").trim(),
+      terms_url: String(fields.get("terms_url") || "").trim(),
+      logo_url: String(fields.get("logo_url") || "").trim() || null
     };
     button.disabled = true;
     status.classList.remove("error");
@@ -290,6 +296,33 @@ document.addEventListener("submit", async (event) => {
         method: "POST", body: JSON.stringify(payload)
       });
       status.textContent = "Programa creado. Cargando condiciones…";
+      window.location.reload();
+    } catch (error) {
+      status.textContent = readableError(error);
+      status.classList.add("error");
+      button.disabled = false;
+    }
+    return;
+  }
+
+  const profileForm = event.target.closest("[data-merchant-profile]");
+  if (profileForm) {
+    event.preventDefault();
+    const status = profileForm.querySelector("[data-profile-status]");
+    const button = profileForm.querySelector("button[type='submit']");
+    const fields = new FormData(profileForm);
+    button.disabled = true;
+    status.classList.remove("error");
+    status.textContent = "Guardando logo…";
+    try {
+      await jsonFetch("/app/merchant/profile", {
+        method: "PUT",
+        body: JSON.stringify({
+          merchant_pubkey: String(fields.get("merchant_pubkey") || "").trim(),
+          logo_url: String(fields.get("logo_url") || "").trim()
+        })
+      });
+      status.textContent = "Logo guardado. Actualizando el perfil público…";
       window.location.reload();
     } catch (error) {
       status.textContent = readableError(error);

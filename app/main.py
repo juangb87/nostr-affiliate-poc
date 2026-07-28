@@ -7,6 +7,7 @@ import hashlib
 import html as html_lib
 import hmac
 import io
+import ipaddress
 import json
 import logging
 import os
@@ -36,7 +37,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, unquote, urlencode, urlparse, urlunparse
 from nostr_sdk import Client, Event, EventBuilder, Keys, Kind, PublicKey, RelayUrl, Tag
 import qrcode
 from qrcode.image.svg import SvgPathImage
@@ -764,6 +765,7 @@ def _init_db_unlocked() -> None:
         commission_bps INTEGER NOT NULL,
         window_days INTEGER NOT NULL,
         destination_url TEXT NOT NULL,
+        terms_url TEXT,
         terms_hash TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'active',
         nostr_event_id TEXT NOT NULL,
@@ -1003,6 +1005,13 @@ def _init_db_unlocked() -> None:
         created_at TEXT NOT NULL,
         PRIMARY KEY (account_id, merchant_pubkey_hex)
     );
+    CREATE TABLE IF NOT EXISTS merchant_profiles (
+        merchant_pubkey_hex TEXT PRIMARY KEY,
+        merchant_pubkey TEXT NOT NULL,
+        logo_url TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS affiliate_invitations (
         id TEXT PRIMARY KEY,
         token_hash TEXT UNIQUE NOT NULL,
@@ -1028,6 +1037,7 @@ def _init_db_unlocked() -> None:
             c.execute(text(stmt))
         if database_url().startswith("postgresql"):
             c.execute(text("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS merchant_pubkey_hex TEXT"))
+            c.execute(text("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS terms_url TEXT"))
             c.execute(text("ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS affiliate_pubkey_hex TEXT"))
             c.execute(text("ALTER TABLE conversions ADD COLUMN IF NOT EXISTS merchant_order_key TEXT"))
             c.execute(text("ALTER TABLE conversions ADD COLUMN IF NOT EXISTS idempotency_payload_hash TEXT"))
@@ -1069,6 +1079,8 @@ def _init_db_unlocked() -> None:
             challenge_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(auth_challenges)")).fetchall()}
             if "merchant_pubkey_hex" not in campaign_cols:
                 c.execute(text("ALTER TABLE campaigns ADD COLUMN merchant_pubkey_hex TEXT"))
+            if "terms_url" not in campaign_cols:
+                c.execute(text("ALTER TABLE campaigns ADD COLUMN terms_url TEXT"))
             if "affiliate_pubkey_hex" not in enrollment_cols:
                 c.execute(text("ALTER TABLE enrollments ADD COLUMN affiliate_pubkey_hex TEXT"))
             conversion_column_ddl = {
@@ -1116,6 +1128,39 @@ def _init_db_unlocked() -> None:
                 c.execute(text("ALTER TABLE enrollments ADD COLUMN status TEXT NOT NULL DEFAULT 'approved'"))
             if "client_hash" not in challenge_cols:
                 c.execute(text("ALTER TABLE auth_challenges ADD COLUMN client_hash TEXT"))
+        legacy_campaigns = c.execute(
+            text(
+                """
+                SELECT id, merchant_pubkey, merchant_pubkey_hex, terms_url, nostr_event_json
+                FROM campaigns
+                WHERE merchant_pubkey_hex IS NULL OR terms_url IS NULL
+                """
+            )
+        ).fetchall()
+        for legacy_row in legacy_campaigns:
+            legacy = legacy_row._mapping
+            updates: dict[str, Any] = {"id": legacy["id"]}
+            if not legacy.get("merchant_pubkey_hex"):
+                try:
+                    updates["merchant_pubkey_hex"] = normalize_pubkey(legacy["merchant_pubkey"], "merchant_pubkey")["hex"]
+                except HTTPException:
+                    pass
+            if not legacy.get("terms_url"):
+                try:
+                    event_payload = json.loads(legacy["nostr_event_json"])
+                    content = json.loads(event_payload.get("content") or "{}")
+                    terms_url = safe_text(content.get("terms_url"), 3000)
+                    parsed_terms = urlparse(terms_url)
+                    if parsed_terms.scheme in {"http", "https"} and parsed_terms.netloc:
+                        updates["terms_url"] = terms_url
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    pass
+            assignments = [key for key in ("merchant_pubkey_hex", "terms_url") if key in updates]
+            if assignments:
+                c.execute(
+                    text("UPDATE campaigns SET " + ", ".join(f"{key}=:{key}" for key in assignments) + " WHERE id=:id"),
+                    updates,
+                )
         c.execute(text("CREATE INDEX IF NOT EXISTS idx_auth_challenges_rate ON auth_challenges(client_hash, created_at)"))
         c.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_conversions_merchant_order_key ON conversions(merchant_order_key) WHERE merchant_order_key IS NOT NULL"))
         c.execute(text("""
@@ -1326,6 +1371,21 @@ class MerchantBootstrapIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     merchant_pubkey: str = Field(..., min_length=32, max_length=128)
+    program_name: str | None = Field(default=None, max_length=160)
+    commission_percent: Decimal | None = Field(
+        default=None, gt=0, le=100, max_digits=5, decimal_places=2
+    )
+    attribution_window_days: int | None = Field(default=None, ge=1, le=365)
+    destination_url: str | None = Field(default=None, max_length=3000)
+    terms_url: str | None = Field(default=None, max_length=3000)
+    logo_url: str | None = Field(default=None, max_length=2048)
+
+
+class MerchantProfileIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    merchant_pubkey: str = Field(..., min_length=32, max_length=128)
+    logo_url: str | None = Field(default=None, max_length=2048)
 
 
 class EnrollmentIn(BaseModel):
@@ -1765,9 +1825,9 @@ def create_campaign(body: CampaignIn) -> dict[str, Any]:
             text(
                 """
                 INSERT INTO campaigns (id, merchant_pubkey, merchant_pubkey_hex, name, commission_bps, window_days,
-                destination_url, terms_hash, status, nostr_event_id, nostr_event_json, created_at)
+                destination_url, terms_url, terms_hash, status, nostr_event_id, nostr_event_json, created_at)
                 VALUES (:id, :merchant_pubkey, :merchant_pubkey_hex, :name, :commission_bps, :window_days,
-                :destination_url, :terms_hash, :status, :nostr_event_id, :nostr_event_json, :created_at)
+                :destination_url, :terms_url, :terms_hash, :status, :nostr_event_id, :nostr_event_json, :created_at)
                 """
             ),
             {
@@ -1778,6 +1838,7 @@ def create_campaign(body: CampaignIn) -> dict[str, Any]:
                 "commission_bps": body.commission_bps,
                 "window_days": body.attribution_window_days,
                 "destination_url": body.destination_url,
+                "terms_url": body.terms_url,
                 "terms_hash": terms_hash,
                 "status": "active",
                 "nostr_event_id": event["id"],
@@ -4139,6 +4200,16 @@ def campaign_public_data(campaign_id: str) -> dict[str, Any]:
         campaign = asdict(c.execute(text("SELECT * FROM campaigns WHERE id=:id"), {"id": campaign_id}).fetchone())
         if not campaign:
             raise HTTPException(404, "campaign not found")
+        merchant_profile = asdict(
+            c.execute(
+                text("SELECT merchant_pubkey, merchant_pubkey_hex, logo_url FROM merchant_profiles WHERE merchant_pubkey_hex=:hex"),
+                {"hex": campaign.get("merchant_pubkey_hex")},
+            ).fetchone()
+        ) or {
+            "merchant_pubkey": campaign["merchant_pubkey"],
+            "merchant_pubkey_hex": campaign.get("merchant_pubkey_hex"),
+            "logo_url": None,
+        }
         enrollments = [dict(r._mapping) for r in c.execute(text("SELECT * FROM enrollments WHERE campaign_id=:id ORDER BY created_at DESC"), {"id": campaign_id}).fetchall()]
         clicks = [dict(r._mapping) for r in c.execute(text("SELECT * FROM clicks WHERE campaign_id=:id ORDER BY created_at DESC"), {"id": campaign_id}).fetchall()]
         conversions = [dict(r._mapping) for r in c.execute(text("SELECT * FROM conversions WHERE campaign_id=:id ORDER BY created_at DESC"), {"id": campaign_id}).fetchall()]
@@ -4170,6 +4241,7 @@ def campaign_public_data(campaign_id: str) -> dict[str, Any]:
     return {
         "campaign_id": campaign_id,
         "campaign": campaign,
+        "merchant_profile": merchant_profile,
         "totals": totals,
         "enrollments": enrollments,
         "clicks": clicks,
@@ -4277,6 +4349,12 @@ def campaign_public_page(campaign_id: str) -> str:
         for ev in data["events"][:24]
     ) or "<p class='label'>No proof events yet.</p>"
     ref_url = f"{BASE_URL}/r/{data['enrollments'][0]['ref_code']}" if data["enrollments"] else ""
+    logo_url = data["merchant_profile"].get("logo_url")
+    logo_html = (
+        f'<img class="merchant-logo" src="{_esc(logo_url)}" alt="Logo de {_esc(c["name"])}" '
+        'referrerpolicy="no-referrer" decoding="async">'
+        if logo_url else ""
+    )
     return f"""
 <!doctype html>
 <html lang='en'>
@@ -4289,6 +4367,7 @@ def campaign_public_page(campaign_id: str) -> str:
     * {{ box-sizing:border-box; }} body {{ margin:0; font-family:Inter, ui-sans-serif, system-ui, sans-serif; color:#fff; background:radial-gradient(circle at top left, rgba(252,106,66,.23), transparent 32rem), var(--black); }}
     header, main {{ width:min(1240px,100%); margin:0 auto; padding:30px clamp(16px,4vw,52px); }} header {{ border-bottom:1px solid rgba(227,227,215,.12); display:flex; justify-content:space-between; align-items:flex-start; gap:22px; }}
     h1,h2,h3 {{ margin:0; letter-spacing:-.045em; }} h1 {{ font-size:clamp(38px,6vw,76px); line-height:.9; max-width:820px; }} p {{ color:var(--muted); line-height:1.6; }} a {{ color:var(--yellow); }}
+    .merchant-logo {{ display:block; width:96px; height:96px; object-fit:contain; border-radius:22px; margin-bottom:18px; background:#fff; border:1px solid rgba(227,227,215,.18); }}
     code {{ background:rgba(227,227,215,.09); border-radius:7px; padding:2px 6px; word-break:break-all; }} .pill,.status {{ display:inline-flex; align-items:center; width:max-content; max-width:100%; height:auto; align-self:flex-start; padding:7px 10px; border-radius:999px; border:1px solid rgba(227,227,215,.15); background:rgba(227,227,215,.06); color:var(--gray); font-size:13px; line-height:1.2; white-space:nowrap; }}
     .published {{ background:rgba(117,214,138,.18); color:var(--ok); }} .failed {{ background:rgba(255,133,133,.18); color:var(--bad); }} .skipped {{ background:rgba(249,196,65,.18); color:var(--yellow); }}
     .grid {{ display:grid; grid-template-columns:repeat(12,minmax(0,1fr)); gap:18px; margin:22px 0; }} .card {{ min-width:0; overflow:hidden; border:1px solid rgba(227,227,215,.12); background:linear-gradient(180deg,rgba(255,255,255,.07),rgba(255,255,255,.035)); border-radius:24px; padding:22px; box-shadow:0 20px 60px rgba(0,0,0,.22); }}
@@ -4301,7 +4380,7 @@ def campaign_public_page(campaign_id: str) -> str:
 </head>
 <body>
 <header>
-  <div><span class='pill'>Public campaign</span><h1>{_esc(c['name'])}</h1><p>Merchant campaign proof, enrollments, attribution activity and Nostr relay receipts.</p></div>
+  <div>{logo_html}<span class='pill'>Public campaign</span><h1>{_esc(c['name'])}</h1><p>Merchant campaign proof, enrollments, attribution activity and Nostr relay receipts.</p></div>
   <div class='pill'>{_esc(c['commission_bps'])} bps · {_esc(c['window_days'])}d window</div>
 </header>
 <main>
@@ -4318,6 +4397,7 @@ def campaign_public_page(campaign_id: str) -> str:
       <dt>Merchant hex</dt><dd><code>{_esc(c.get('merchant_pubkey_hex'))}</code></dd>
       <dt>Reward bps</dt><dd>{_esc(c['commission_bps'])} bps</dd>
       <dt>Destination</dt><dd><a href='{_esc(c['destination_url'])}'>{_esc(c['destination_url'])}</a></dd>
+      <dt>Terms</dt><dd>{f"<a href='{_esc(c['terms_url'])}'>{_esc(c['terms_url'])}</a>" if c.get('terms_url') else f"<code>{_esc(c['terms_hash'])}</code>"}</dd>
       <dt>Campaign event</dt><dd><a href='/nostr/events/{_esc(c['nostr_event_id'])}'>{_esc(_short(c['nostr_event_id']))}</a></dd>
     </dl></div>
     <div class='card span-6'><h2>Demo links</h2><p>Use a referral link to test redirect tracking, or open the JSON summary for integrations.</p><div class='actions'>
@@ -4874,6 +4954,7 @@ def merchant_account_page(request: Request) -> Response:
         context={
             **data,
             "bootstrap_tenants": bootstrap_tenants,
+            "program_defaults": _merchant_default_program(),
             "account": _account_shell(session, "merchant"),
             "role_label": "Merchant account",
             "nav": [
@@ -4892,6 +4973,82 @@ def _require_same_origin(request: Request) -> None:
     supplied = urlparse(request.headers.get("origin", ""))
     if supplied.scheme != expected.scheme or supplied.netloc != expected.netloc:
         raise HTTPException(403, "same-origin request required")
+
+
+def _normalized_merchant_url(value: str, field_name: str, *, logo: bool = False) -> str:
+    normalized = safe_text(value, 3000 if not logo else 2048)
+    try:
+        parsed = urlparse(normalized)
+        hostname = parsed.hostname
+        port = parsed.port
+    except (UnicodeError, ValueError) as exc:
+        raise HTTPException(422, f"{field_name} must be a valid URL") from exc
+    allowed_schemes = {"https"} if logo else {"http", "https"}
+    if parsed.scheme.lower() not in allowed_schemes or not parsed.netloc or not hostname:
+        raise HTTPException(422, f"{field_name} must be a valid {'HTTPS' if logo else 'HTTP(S)'} URL")
+    if parsed.username or parsed.password:
+        raise HTTPException(422, f"{field_name} must not contain credentials")
+    try:
+        hostname = hostname.encode("idna").decode("ascii").lower().rstrip(".")
+    except UnicodeError as exc:
+        raise HTTPException(422, f"{field_name} has an invalid host") from exc
+    if len(hostname) > 253 or any(
+        not label or len(label) > 63 or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label)
+        for label in hostname.split(".")
+    ):
+        try:
+            ipaddress.ip_address(hostname)
+        except ValueError as exc:
+            raise HTTPException(422, f"{field_name} has an invalid host") from exc
+    if logo:
+        if port not in {None, 443}:
+            raise HTTPException(422, "logo_url must use the standard HTTPS port")
+        if hostname == "localhost" or hostname.endswith((".localhost", ".local")):
+            raise HTTPException(422, "logo_url must use a public host")
+        try:
+            address = ipaddress.ip_address(hostname)
+        except ValueError:
+            if re.fullmatch(r"(?:0x[0-9a-f]+|[0-9.]+)", hostname):
+                raise HTTPException(422, "logo_url must use a public host")
+        else:
+            if not address.is_global:
+                raise HTTPException(422, "logo_url must use a public host")
+        if unquote(parsed.path).lower().endswith(".svg"):
+            raise HTTPException(422, "logo_url SVG images are not supported")
+    return urlunparse(parsed._replace(fragment=""))
+
+
+def _merchant_requested_program(body: MerchantBootstrapIn) -> dict[str, Any]:
+    defaults = _merchant_default_program()
+    name = safe_text(body.program_name if body.program_name is not None else defaults["name"], 160)
+    if not name:
+        raise HTTPException(422, "program_name is required")
+    commission_percent = (
+        body.commission_percent
+        if body.commission_percent is not None
+        else Decimal(defaults["commission_bps"]) / Decimal(100)
+    )
+    commission_bps = int(commission_percent * Decimal(100))
+    window_days = body.attribution_window_days or defaults["window_days"]
+    destination_url = _normalized_merchant_url(
+        body.destination_url if body.destination_url is not None else defaults["destination_url"],
+        "destination_url",
+    )
+    terms_url = _normalized_merchant_url(
+        body.terms_url if body.terms_url is not None else defaults["terms_url"],
+        "terms_url",
+    )
+    logo_url = None
+    if body.logo_url is not None and safe_text(body.logo_url, 2048):
+        logo_url = _normalized_merchant_url(body.logo_url, "logo_url", logo=True)
+    return {
+        "name": name,
+        "commission_bps": commission_bps,
+        "window_days": window_days,
+        "destination_url": destination_url,
+        "terms_url": terms_url,
+        "logo_url": logo_url,
+    }
 
 
 def _merchant_default_program() -> dict[str, Any]:
@@ -4932,12 +5089,72 @@ def _merchant_campaign_publication_needed(event: dict[str, Any]) -> bool:
     return True
 
 
+def _merchant_profile_target(c: Any, session: dict[str, Any], merchant_hex: str) -> bool:
+    return bool(
+        c.execute(
+            text(
+                """
+                SELECT 1 FROM campaigns campaign
+                WHERE campaign.merchant_pubkey_hex=:merchant_hex
+                  AND (
+                    campaign.merchant_pubkey_hex=:owner_hex
+                    OR EXISTS (
+                      SELECT 1 FROM merchant_account_links link
+                      WHERE link.account_id=:account_id
+                        AND link.merchant_pubkey_hex=campaign.merchant_pubkey_hex
+                    )
+                  )
+                LIMIT 1
+                """
+            ),
+            {
+                "merchant_hex": merchant_hex,
+                "owner_hex": session["nostr_pubkey_hex"],
+                "account_id": session["account_id"],
+            },
+        ).fetchone()
+    )
+
+
+@app.put("/app/merchant/profile", tags=["Accounts"])
+def merchant_update_profile(body: MerchantProfileIn, request: Request) -> dict[str, Any]:
+    session = require_account_session(request, "merchant")
+    _require_same_origin(request)
+    merchant = normalize_pubkey(body.merchant_pubkey, "merchant_pubkey")
+    raw_logo_url = safe_text(body.logo_url, 2048)
+    logo_url = _normalized_merchant_url(raw_logo_url, "logo_url", logo=True) if raw_logo_url else None
+    init_db()
+    timestamp = now()
+    with engine().begin() as c:
+        if not _merchant_profile_target(c, session, merchant["hex"]):
+            raise HTTPException(404, "merchant profile target not found")
+        c.execute(
+            text(
+                """
+                INSERT INTO merchant_profiles
+                  (merchant_pubkey_hex, merchant_pubkey, logo_url, created_at, updated_at)
+                VALUES (:hex, :npub, :logo_url, :created_at, :updated_at)
+                ON CONFLICT(merchant_pubkey_hex) DO UPDATE SET
+                  merchant_pubkey=:npub, logo_url=:logo_url, updated_at=:updated_at
+                """
+            ),
+            {
+                "hex": merchant["hex"],
+                "npub": merchant["npub"],
+                "logo_url": logo_url,
+                "created_at": timestamp,
+                "updated_at": timestamp,
+            },
+        )
+    return {"ok": True, "merchant_pubkey": merchant["npub"], "logo_url": logo_url}
+
+
 @app.post("/app/merchant/bootstrap", tags=["Accounts"])
 def merchant_bootstrap(body: MerchantBootstrapIn, request: Request) -> dict[str, Any]:
     session = require_account_session(request, "merchant")
     _require_same_origin(request)
     merchant = normalize_pubkey(body.merchant_pubkey, "merchant_pubkey")
-    defaults = _merchant_default_program()
+    program = _merchant_requested_program(body)
     campaign_id = f"camp_default_{merchant['hex']}"
     event: dict[str, Any] | None = None
     duplicate = False
@@ -4972,34 +5189,51 @@ def merchant_bootstrap(body: MerchantBootstrapIn, request: Request) -> dict[str,
             if existing:
                 if existing.get("merchant_pubkey_hex") != merchant["hex"]:
                     raise HTTPException(409, "default program identity conflict")
+                requested_fields = {
+                    "name": body.program_name,
+                    "commission_bps": body.commission_percent,
+                    "window_days": body.attribution_window_days,
+                    "destination_url": body.destination_url,
+                    "terms_url": body.terms_url,
+                }
+                conflicts = (
+                    (requested_fields["name"] is not None and existing["name"] != program["name"])
+                    or (requested_fields["commission_bps"] is not None and int(existing["commission_bps"]) != program["commission_bps"])
+                    or (requested_fields["window_days"] is not None and int(existing["window_days"]) != program["window_days"])
+                    or (requested_fields["destination_url"] is not None and existing["destination_url"] != program["destination_url"])
+                    or (requested_fields["terms_url"] is not None and existing.get("terms_url") != program["terms_url"])
+                )
+                if conflicts:
+                    raise HTTPException(409, "program already exists with different settings")
                 event = json.loads(existing["nostr_event_json"])
                 duplicate = True
                 status = existing["status"]
                 relay_results = event.get("relay_results", [])
                 publish_needed = _merchant_campaign_publication_needed(event)
             else:
-                terms_hash = sha(defaults["terms_url"])
+                terms_hash = sha(program["terms_url"])
                 campaign = {
                     "id": campaign_id,
                     "merchant_pubkey": merchant["npub"],
                     "merchant_pubkey_hex": merchant["hex"],
-                    "name": defaults["name"],
-                    "commission_bps": defaults["commission_bps"],
-                    "window_days": defaults["window_days"],
-                    "destination_url": defaults["destination_url"],
+                    "name": program["name"],
+                    "commission_bps": program["commission_bps"],
+                    "window_days": program["window_days"],
+                    "destination_url": program["destination_url"],
+                    "terms_url": program["terms_url"],
                     "terms_hash": terms_hash,
                     "status": "active",
                 }
-                event = build_campaign_event(campaign, defaults["terms_url"])
+                event = build_campaign_event(campaign, program["terms_url"])
                 inserted = c.execute(
                     text(
                         """
                         INSERT INTO campaigns
                           (id, merchant_pubkey, merchant_pubkey_hex, name, commission_bps, window_days,
-                           destination_url, terms_hash, status, nostr_event_id, nostr_event_json, created_at)
+                           destination_url, terms_url, terms_hash, status, nostr_event_id, nostr_event_json, created_at)
                         VALUES
                           (:id, :merchant_pubkey, :merchant_pubkey_hex, :name, :commission_bps, :window_days,
-                           :destination_url, :terms_hash, :status, :nostr_event_id, :nostr_event_json, :created_at)
+                           :destination_url, :terms_url, :terms_hash, :status, :nostr_event_id, :nostr_event_json, :created_at)
                         ON CONFLICT(id) DO NOTHING
                         """
                     ),
@@ -5022,6 +5256,22 @@ def merchant_bootstrap(body: MerchantBootstrapIn, request: Request) -> dict[str,
                     status = existing["status"]
                     relay_results = event.get("relay_results", [])
                     publish_needed = _merchant_campaign_publication_needed(event)
+
+            profile = c.execute(
+                text("SELECT 1 FROM merchant_profiles WHERE merchant_pubkey_hex=:hex"),
+                {"hex": merchant["hex"]},
+            ).fetchone()
+            if not profile:
+                c.execute(
+                    text(
+                        """
+                        INSERT INTO merchant_profiles
+                          (merchant_pubkey_hex, merchant_pubkey, logo_url, created_at, updated_at)
+                        VALUES (:hex, :npub, :logo_url, :created_at, :updated_at)
+                        """
+                    ),
+                    {"hex": merchant["hex"], "npub": merchant["npub"], "logo_url": program["logo_url"] if not duplicate else None, "created_at": now(), "updated_at": now()},
+                )
 
     assert event is not None
     if publish_needed:
