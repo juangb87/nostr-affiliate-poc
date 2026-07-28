@@ -1,3 +1,24 @@
+    @font-face {
+      font-family:"Space Grotesk";
+      font-style:normal;
+      font-weight:400 700;
+      font-display:swap;
+      src:url("/static/fonts/space-grotesk-latin.woff2") format("woff2");
+    }
+    @font-face {
+      font-family:"DM Mono";
+      font-style:normal;
+      font-weight:400;
+      font-display:swap;
+      src:url("/static/fonts/dm-mono-regular-latin.woff2") format("woff2");
+    }
+    @font-face {
+      font-family:"DM Mono";
+      font-style:normal;
+      font-weight:500;
+      font-display:swap;
+      src:url("/static/fonts/dm-mono-medium-latin.woff2") format("woff2");
+    }
     :root {
       --night: #141914;
       --night-soft: #1a211a;
@@ -37,6 +58,7 @@
       background:var(--night);
       color:var(--ink);
       font-family:"Space Grotesk",system-ui,sans-serif;
+      font-synthesis:none;
       transition:background .25s,color .25s;
     }
     html[data-theme="arena"] body { background:var(--arena); }
@@ -103,7 +125,7 @@
       text-transform:uppercase;
     }
     .eyebrow::before { content:""; width:40px; height:5px; background:currentColor; }
-    h1 { margin:0; max-width:690px; font-size:clamp(54px,7.1vw,102px); line-height:.91; letter-spacing:-.065em; }
+    h1 { margin:0; max-width:690px; font-family:"Space Grotesk",system-ui,sans-serif; font-weight:700; font-size:clamp(54px,7.1vw,102px); line-height:.91; letter-spacing:-.065em; }
     h1 em { color:var(--sage-ink); font-style:normal; }
     .lede { max-width:600px; margin:30px 0 34px; color:var(--muted); font-size:19px; line-height:1.55; }
     .hero-actions { display:flex; flex-wrap:wrap; align-items:center; gap:12px; }
