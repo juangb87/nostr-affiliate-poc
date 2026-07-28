@@ -4943,7 +4943,7 @@ def merchant_bootstrap(body: MerchantBootstrapIn, request: Request) -> dict[str,
     duplicate = False
     publish_needed = True
     relay_results: list[dict[str, str]] = []
-    status = "paused"
+    status = "active"
 
     with _MERCHANT_BOOTSTRAP_LOCK:
         with engine().begin() as c:
@@ -4988,7 +4988,7 @@ def merchant_bootstrap(body: MerchantBootstrapIn, request: Request) -> dict[str,
                     "window_days": defaults["window_days"],
                     "destination_url": defaults["destination_url"],
                     "terms_hash": terms_hash,
-                    "status": "paused",
+                    "status": "active",
                 }
                 event = build_campaign_event(campaign, defaults["terms_url"])
                 inserted = c.execute(

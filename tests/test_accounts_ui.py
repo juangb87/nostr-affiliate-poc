@@ -599,7 +599,8 @@ def test_bound_owner_can_sign_in_before_tenant_has_a_campaign(tmp_path, monkeypa
     assert "Crear tu Programa de Afiliados" in page.text
     assert 'data-merchant-bootstrap' in page.text
     assert f'value="{merchant_identity.public_key().to_bech32()}"' in page.text
-    assert "El programa comienza pausado" in page.text
+    assert "Crear programa activo" in page.text
+    assert "El programa comienza activo" in page.text
     assert "Shopify conectado" not in page.text
 
 
@@ -684,7 +685,7 @@ def test_merchant_bootstrap_requires_session_origin_and_bound_tenant(tmp_path, m
     assert extra_field.status_code == 422
 
 
-def test_merchant_bootstrap_creates_one_paused_default_program_idempotently(tmp_path, monkeypatch):
+def test_merchant_bootstrap_creates_one_active_default_program_idempotently(tmp_path, monkeypatch):
     client = configured_client(tmp_path, monkeypatch)
     human_owner = Keys.generate()
     merchant_identity = Keys.generate()
@@ -717,7 +718,7 @@ def test_merchant_bootstrap_creates_one_paused_default_program_idempotently(tmp_
     assert first.json()["duplicate"] is False
     assert second.json()["duplicate"] is True
     assert first.json()["campaign_id"] == second.json()["campaign_id"]
-    assert first.json()["status"] == second.json()["status"] == "paused"
+    assert first.json()["status"] == second.json()["status"] == "active"
     assert first.json()["merchant_pubkey"] == merchant_npub
     assert len(publish_calls) == 1
     with main.engine().connect() as connection:
@@ -735,7 +736,8 @@ def test_merchant_bootstrap_creates_one_paused_default_program_idempotently(tmp_
     assert campaigns[0]["window_days"] == 30
     assert campaigns[0]["destination_url"] == "https://shapersfit.myshopify.com/"
     assert campaigns[0]["terms_hash"] == main.sha("https://shapersfit.com/affiliate-terms")
-    assert campaigns[0]["status"] == "paused"
+    assert campaigns[0]["status"] == "active"
+    assert ["status", "active"] in json.loads(campaigns[0]["nostr_event_json"])["tags"]
     assert budgets == 1
     assert events == 1
 
