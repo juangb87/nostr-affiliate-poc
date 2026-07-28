@@ -114,6 +114,19 @@ def seed_payable_payout(campaign: dict, enrollment: dict, affiliate: Keys, *, am
     return payout_id
 
 
+def test_login_frontend_preserves_role_card_markup_and_formats_structured_signer_errors(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+
+    script = client.get("/static/app.js")
+
+    assert script.status_code == 200
+    assert "function readableError(error" in script.text
+    assert 'value === "[object Object]"' in script.text
+    assert "new Error(readableError(data.detail" in script.text
+    assert "status.textContent = readableError(error)" in script.text
+    assert "button.textContent = previous" not in script.text
+
+
 def test_nostr_login_issues_http_only_session_and_logout(tmp_path, monkeypatch):
     client = configured_client(tmp_path, monkeypatch)
     merchant = Keys.generate()

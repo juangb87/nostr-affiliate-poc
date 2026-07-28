@@ -5,8 +5,32 @@ async function jsonFetch(url, options = {}) {
   });
   let data = {};
   try { data = await response.json(); } catch (_) {}
-  if (!response.ok) throw new Error(data.detail || `Request failed (${response.status})`);
+  if (!response.ok) {
+    throw new Error(readableError(data.detail, `Request failed (${response.status})`));
+  }
   return data;
+}
+
+function readableError(error, fallback = "No se pudo completar la operación. Intentá nuevamente.") {
+  const seen = new Set();
+  function messageFrom(value, depth = 0) {
+    if (value == null || depth > 3) return "";
+    if (typeof value === "string") return value === "[object Object]" ? "" : value;
+    if (typeof value !== "object") return "";
+    if (seen.has(value)) return "";
+    seen.add(value);
+    for (const key of ["message", "error", "detail", "reason"]) {
+      const message = messageFrom(value[key], depth + 1);
+      if (message) return message;
+    }
+    try {
+      const serialized = JSON.stringify(value);
+      return serialized && serialized !== "{}" ? serialized : "";
+    } catch (_) {
+      return "";
+    }
+  }
+  return messageFrom(error) || fallback;
 }
 
 let affiliateInvitationToken = null;
@@ -51,7 +75,7 @@ async function resolveAffiliateInvitation() {
     status.textContent = "Usá la identidad Affiliate que querés asociar a esta campaña.";
   } catch (error) {
     affiliateInvitationToken = null;
-    status.textContent = error.message;
+    status.textContent = readableError(error);
     status.classList.add("error");
     page.querySelector(".lede").textContent = "Esta invitación ya no está disponible.";
   }
@@ -64,7 +88,6 @@ async function loginWithNostr(role, button) {
     status.classList.add("error");
     return;
   }
-  const previous = button.textContent;
   button.disabled = true;
   status.classList.remove("error");
   status.textContent = "Preparando desafío seguro…";
@@ -89,10 +112,9 @@ async function loginWithNostr(role, button) {
     });
     window.location.assign(result.redirect);
   } catch (error) {
-    status.textContent = error.message;
+    status.textContent = readableError(error);
     status.classList.add("error");
     button.disabled = false;
-    button.textContent = previous;
   }
 }
 
@@ -136,7 +158,7 @@ document.addEventListener("click", async (event) => {
       status.textContent = "Invitación aceptada. Abriendo tu workspace…";
       window.location.assign(result.redirect);
     } catch (error) {
-      status.textContent = error.message;
+      status.textContent = readableError(error);
       status.classList.add("error");
       invite.disabled = false;
     }
@@ -196,7 +218,7 @@ document.addEventListener("click", async (event) => {
       status.textContent = `Invoice listo por ${result.amount_sats} sats. Generarlo no realiza el pago.`;
     } catch (error) {
       clearPreparedInvoice(form);
-      status.textContent = error.message;
+      status.textContent = readableError(error);
       status.classList.add("error");
     } finally {
       prepareInvoice.disabled = false;
@@ -227,7 +249,7 @@ document.addEventListener("click", async (event) => {
       window.location.assign("/app");
     } catch (error) {
       logout.disabled = false;
-      if (globalStatus) globalStatus.textContent = `No se pudo cerrar sesión: ${error.message}`;
+      if (globalStatus) globalStatus.textContent = `No se pudo cerrar sesión: ${readableError(error)}`;
     }
   }
 });
@@ -252,7 +274,7 @@ document.addEventListener("submit", async (event) => {
       status.textContent = "Programa creado. Cargando condiciones…";
       window.location.reload();
     } catch (error) {
-      status.textContent = error.message;
+      status.textContent = readableError(error);
       status.classList.add("error");
       button.disabled = false;
     }
@@ -273,7 +295,7 @@ document.addEventListener("submit", async (event) => {
       });
       status.textContent = `Destino guardado. ${result.updated_payouts} pago(s) pendiente(s) actualizado(s).`;
     } catch (error) {
-      status.textContent = error.message; status.classList.add("error");
+      status.textContent = readableError(error); status.classList.add("error");
     } finally { button.disabled = false; }
     return;
   }
@@ -300,7 +322,7 @@ document.addEventListener("submit", async (event) => {
       });
       status.textContent = "Pago registrado."; window.location.reload();
     } catch (error) {
-      status.textContent = error.message; status.classList.add("error"); button.disabled = false;
+      status.textContent = readableError(error); status.classList.add("error"); button.disabled = false;
     }
     return;
   }
@@ -336,7 +358,7 @@ document.addEventListener("submit", async (event) => {
     const expiresAt = new Date(result.expires_at).toLocaleString();
     status.textContent = `Invitación lista para ${result.campaign_name}. Expira: ${expiresAt}.`;
   } catch (error) {
-    status.textContent = error.message;
+    status.textContent = readableError(error);
     status.classList.add("error");
   } finally {
     button.disabled = false;
