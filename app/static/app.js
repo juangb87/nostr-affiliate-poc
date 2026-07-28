@@ -233,6 +233,32 @@ document.addEventListener("click", async (event) => {
 });
 
 document.addEventListener("submit", async (event) => {
+  const bootstrapForm = event.target.closest("[data-merchant-bootstrap]");
+  if (bootstrapForm) {
+    event.preventDefault();
+    const status = bootstrapForm.querySelector("[data-bootstrap-status]");
+    const button = bootstrapForm.querySelector("button[type='submit']");
+    const fields = new FormData(bootstrapForm);
+    const payload = {
+      merchant_pubkey: String(fields.get("merchant_pubkey") || "").trim()
+    };
+    button.disabled = true;
+    status.classList.remove("error");
+    status.textContent = "Creando programa y guardando su prueba Nostr…";
+    try {
+      await jsonFetch("/app/merchant/bootstrap", {
+        method: "POST", body: JSON.stringify(payload)
+      });
+      status.textContent = "Programa creado. Cargando condiciones…";
+      window.location.reload();
+    } catch (error) {
+      status.textContent = error.message;
+      status.classList.add("error");
+      button.disabled = false;
+    }
+    return;
+  }
+
   const lightningForm = event.target.closest("[data-affiliate-lightning-address]");
   if (lightningForm) {
     event.preventDefault();

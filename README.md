@@ -138,7 +138,12 @@ Recommended environment variables:
 - `SHOPIFY_STORE_DOMAIN`: permanent `*.myshopify.com` domain accepted in signed webhook headers.
 - `SHOPIFY_MERCHANT_PUBKEY`: merchant identity assigned to authoritative Shopify conversions.
 - `OPS_NOSTR_PUBKEYS`: comma-separated Nostr pubkeys authorized for `/ops`.
-- `MERCHANT_ACCOUNT_BINDINGS`: comma-separated `owner_pubkey:merchant_pubkey` ownership pairs.
+- `MERCHANT_ACCOUNT_BINDINGS`: comma-separated `owner_pubkey:merchant_pubkey` administrative ownership pairs. For pilot bootstrap these identities must be distinct: the owner signs in through NIP-07 and the merchant pubkey identifies the tenant. Removing the pair revokes that delegated workspace access. Meerat never requests the owner's `nsec`.
+- `MERCHANT_DEFAULT_PROGRAM_NAME`: server-controlled name for a bootstrapped Merchant's first Affiliate Program. Default: `Meerat Affiliate Program`.
+- `MERCHANT_DEFAULT_COMMISSION_BPS`: commission for that first paused program. Default: `800` (8%).
+- `MERCHANT_DEFAULT_WINDOW_DAYS`: attribution window for that first paused program. Default: `30`.
+- `MERCHANT_DEFAULT_DESTINATION_URL`: storefront destination for that first paused program; must be HTTP(S). Falls back to `DEFAULT_DESTINATION_URL`.
+- `MERCHANT_DEFAULT_TERMS_URL`: terms URL hashed into the first campaign event; must be HTTP(S).
 - `ENABLE_LEGACY_DEMO_MUTATIONS`: explicit opt-in for legacy setup/demo mutations; keep `false` in production.
 - `SATS_PER_USD`: server-side USD→sats conversion rate used only when merchant reports `currency: "USD"`. Default: `2500`.
 - `PAYOUT_ADMIN_KEY`: bearer secret required by budget, attempt, ledger, recovery, reconciliation, and payout execution endpoints.

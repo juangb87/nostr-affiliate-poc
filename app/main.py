@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import fcntl
 import hashlib
 import html as html_lib
 import hmac
@@ -79,6 +80,8 @@ DEFAULT_RELAYS = "wss://nos.lol,wss://relay.damus.io,wss://relay.primal.net"
 DEFAULT_MERCHANT_NPUB = "npub1540rxhz9x7fpc73nu5q3qydykej7lceh5j4jej6mmpc6n3saw3cqv7s8js"
 DEFAULT_AFFILIATE_NPUB = "npub16ghkhw9d4g9x6pxp6l6dtyjqaeuavwucrq8gpkt60x0kx9fzqwpszhtw0n"
 _MERCHANT_ENROLLMENT_LOCK = threading.Lock()
+_MERCHANT_BOOTSTRAP_LOCK = threading.Lock()
+_NOSTR_PUBLICATION_LOCKS = tuple(threading.Lock() for _ in range(64))
 _MERCHANT_CONVERSION_LOCKS = tuple(threading.Lock() for _ in range(64))
 _INIT_DB_LOCK = threading.RLock()
 _INVITATION_ACCEPT_LOCK = threading.Lock()
@@ -546,8 +549,12 @@ def persist_nostr_event(c: Any, event: dict[str, Any], entity_type: str, entity_
             VALUES (:event_id, :kind, :pubkey, :content, :tags_json, :event_json,
             :entity_type, :entity_id, :relay_status, :created_at, :published_at)
             ON CONFLICT(event_id) DO UPDATE SET
-                event_json=excluded.event_json,
-                relay_status=excluded.relay_status,
+                event_json=CASE
+                    WHEN nostr_events.relay_status='published' AND excluded.relay_status<>'published'
+                    THEN nostr_events.event_json ELSE excluded.event_json END,
+                relay_status=CASE
+                    WHEN nostr_events.relay_status='published' AND excluded.relay_status<>'published'
+                    THEN nostr_events.relay_status ELSE excluded.relay_status END,
                 published_at=COALESCE(excluded.published_at, nostr_events.published_at)
             """
         ),
@@ -577,28 +584,150 @@ def persist_nostr_event(c: Any, event: dict[str, Any], entity_type: str, entity_
         )
 
 
-def finalize_committed_nostr_event(event: dict[str, Any], entity_type: str, entity_id: str) -> list[dict[str, str]]:
-    """Publish only after the financial transaction committed; keep a durable pending outbox on failure."""
-    relay_results = publish_event(event)
+@contextmanager
+def _nostr_publication_lock(event_id: str):
+    """Serialize one event's relay publication across threads and worker processes."""
+    thread_lock = _NOSTR_PUBLICATION_LOCKS[int(hashlib.sha256(event_id.encode()).hexdigest(), 16) % len(_NOSTR_PUBLICATION_LOCKS)]
+    with thread_lock:
+        current_engine = engine()
+        if current_engine.dialect.name == "postgresql":
+            connection = current_engine.connect()
+            locked = False
+            try:
+                connection.execute(
+                    text("SELECT pg_advisory_lock(hashtextextended(:lock_key, 0))"),
+                    {"lock_key": f"nostr-publication:{event_id}"},
+                )
+                connection.commit()
+                locked = True
+                yield connection
+            finally:
+                if locked:
+                    try:
+                        connection.execute(
+                            text("SELECT pg_advisory_unlock(hashtextextended(:lock_key, 0))"),
+                            {"lock_key": f"nostr-publication:{event_id}"},
+                        )
+                        connection.commit()
+                    except Exception:
+                        connection.invalidate()
+                connection.close()
+        elif current_engine.dialect.name == "sqlite":
+            database_identity = str(current_engine.url.database or database_url())
+            lock_digest = hashlib.sha256(f"{database_identity}:{event_id}".encode()).hexdigest()
+            lock_path = Path("/tmp") / f"meerat-nostr-{lock_digest}.lock"
+            with lock_path.open("a+") as lock_file:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield None
+                finally:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        else:
+            yield None
+
+
+def _finalize_committed_nostr_event_unlocked(
+    event: dict[str, Any],
+    entity_type: str,
+    entity_id: str,
+    publication_connection: Any | None = None,
+) -> list[dict[str, str]]:
+    """Publish only after commit; persist through the connection that owns any advisory lock."""
     try:
-        with engine().begin() as c:
-            persist_nostr_event(c, event, entity_type, entity_id, relay_results)
-            if entity_type == "conversion":
-                c.execute(
-                    text("UPDATE conversions SET nostr_event_json=:event_json WHERE id=:id"),
-                    {"id": entity_id, "event_json": json.dumps(event)},
-                )
-            elif entity_type == "campaign":
-                c.execute(
-                    text("UPDATE campaigns SET nostr_event_json=:event_json WHERE id=:id"),
-                    {"id": entity_id, "event_json": json.dumps(event)},
-                )
+        relay_results = publish_event(event)
+    except Exception as exc:
+        logger.exception("failed to publish committed Nostr outbox event %s", event.get("id"))
+        relay_results = [
+            {"relay": relay, "status": "failed", "error": str(exc)}
+            for relay in nostr_relays()
+        ]
+
+    def persist_result(c: Any) -> None:
+        persist_nostr_event(c, event, entity_type, entity_id, relay_results)
+        if entity_type == "conversion":
+            c.execute(
+                text("""
+                    UPDATE conversions SET nostr_event_json=:event_json
+                    WHERE id=:id AND EXISTS (
+                        SELECT 1 FROM nostr_events
+                        WHERE event_id=:event_id AND relay_status=:relay_status
+                    )
+                """),
+                {
+                    "id": entity_id,
+                    "event_id": event["id"],
+                    "relay_status": event["relay_status"],
+                    "event_json": json.dumps(event),
+                },
+            )
+        elif entity_type == "campaign":
+            c.execute(
+                text("""
+                    UPDATE campaigns SET nostr_event_json=:event_json
+                    WHERE id=:id AND EXISTS (
+                        SELECT 1 FROM nostr_events
+                        WHERE event_id=:event_id AND relay_status=:relay_status
+                    )
+                """),
+                {
+                    "id": entity_id,
+                    "event_id": event["id"],
+                    "relay_status": event["relay_status"],
+                    "event_json": json.dumps(event),
+                },
+            )
+
+    try:
+        if publication_connection is not None:
+            with publication_connection.begin():
+                persist_result(publication_connection)
+        else:
+            with engine().begin() as c:
+                persist_result(c)
     except Exception:
         logger.exception("failed to finalize committed Nostr outbox event %s", event.get("id"))
         event["relay_status"] = "pending_publication"
         event["relay_results"] = []
         return []
     return relay_results
+
+
+def finalize_committed_nostr_event(event: dict[str, Any], entity_type: str, entity_id: str) -> list[dict[str, str]]:
+    event_id = str(event.get("id", ""))
+    if not event_id:
+        raise ValueError("Nostr event id is required before publication")
+    with _nostr_publication_lock(event_id) as publication_connection:
+        if publication_connection is not None:
+            stored = asdict(
+                publication_connection.execute(
+                    text("SELECT relay_status, event_json FROM nostr_events WHERE event_id=:event_id"),
+                    {"event_id": event_id},
+                ).fetchone()
+            )
+            publication_connection.commit()
+        else:
+            with engine().connect() as c:
+                stored = asdict(
+                    c.execute(
+                        text("SELECT relay_status, event_json FROM nostr_events WHERE event_id=:event_id"),
+                        {"event_id": event_id},
+                    ).fetchone()
+                )
+        if stored:
+            current_event = json.loads(stored["event_json"])
+            current_event["relay_status"] = stored["relay_status"]
+            relay_results = current_event.get("relay_results", [])
+            if stored["relay_status"] == "published":
+                return relay_results
+            if stored["relay_status"] == "skipped" and not nostr_publish_enabled():
+                return relay_results
+            event = current_event
+        return _finalize_committed_nostr_event_unlocked(
+            event,
+            entity_type,
+            entity_id,
+            publication_connection=publication_connection,
+        )
 
 
 def retry_conversion_outbox(conversion_id: str) -> None:
@@ -1193,6 +1322,12 @@ class CampaignIn(BaseModel):
     terms_url: str = "https://bumbei.com/terms/affiliate"
 
 
+class MerchantBootstrapIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    merchant_pubkey: str = Field(..., min_length=32, max_length=128)
+
+
 class EnrollmentIn(BaseModel):
     campaign_id: str = Field(..., min_length=1, max_length=80)
     affiliate_pubkey: str = Field(..., min_length=1, max_length=128, examples=[DEFAULT_AFFILIATE_NPUB])
@@ -1388,27 +1523,23 @@ def _grant_role_if_authorized(c: Any, account_id: str, pubkey_hex: str, role: st
         except ValueError as exc:
             if not authorized:
                 raise HTTPException(503, "merchant account binding configuration is invalid") from exc
-            bindings = None
-        if bindings is not None:
+            bindings = []
+        c.execute(
+            text("DELETE FROM merchant_account_links WHERE account_id=:account_id AND source='environment_binding'"),
+            {"account_id": account_id},
+        )
+        for owner_hex, merchant_hex in bindings:
+            if owner_hex != pubkey_hex or merchant_hex == owner_hex:
+                continue
+            authorized = True
             c.execute(
-                text("DELETE FROM merchant_account_links WHERE account_id=:account_id AND source='environment_binding'"),
-                {"account_id": account_id},
+                text("""
+                    INSERT INTO merchant_account_links (account_id, merchant_pubkey_hex, source, created_at)
+                    VALUES (:account_id, :merchant_hex, 'environment_binding', :created_at)
+                    ON CONFLICT (account_id, merchant_pubkey_hex) DO NOTHING
+                """),
+                {"account_id": account_id, "merchant_hex": merchant_hex, "created_at": now()},
             )
-            for owner_hex, merchant_hex in bindings:
-                if owner_hex != pubkey_hex:
-                    continue
-                exists = c.execute(text("SELECT 1 FROM campaigns WHERE merchant_pubkey_hex=:hex OR merchant_pubkey=:hex LIMIT 1"), {"hex": merchant_hex}).fetchone()
-                if not exists:
-                    continue
-                authorized = True
-                c.execute(
-                    text("""
-                        INSERT INTO merchant_account_links (account_id, merchant_pubkey_hex, source, created_at)
-                        VALUES (:account_id, :merchant_hex, 'environment_binding', :created_at)
-                        ON CONFLICT (account_id, merchant_pubkey_hex) DO NOTHING
-                    """),
-                    {"account_id": account_id, "merchant_hex": merchant_hex, "created_at": now()},
-                )
     elif role == "ops":
         try:
             authorized = pubkey_hex in parse_pubkey_set(os.getenv("OPS_NOSTR_PUBKEYS", ""))
@@ -4707,6 +4838,24 @@ def merchant_account_page(request: Request) -> Response:
                 {"account_id": session["account_id"], "hex": shopify_merchant_hex},
             ).fetchone()
         )
+        bootstrap_rows = c.execute(
+            text(
+                """
+                SELECT merchant_pubkey_hex FROM merchant_account_links
+                WHERE account_id=:account_id AND source='environment_binding'
+                  AND merchant_pubkey_hex<>:owner_hex
+                ORDER BY merchant_pubkey_hex
+                """
+            ),
+            {"account_id": session["account_id"], "owner_hex": session["nostr_pubkey_hex"]},
+        ).fetchall()
+    bootstrap_tenants = [
+        {
+            "merchant_pubkey": PublicKey.parse(row._mapping["merchant_pubkey_hex"]).to_bech32(),
+            "merchant_short": workspace_short(PublicKey.parse(row._mapping["merchant_pubkey_hex"]).to_bech32()),
+        }
+        for row in bootstrap_rows
+    ]
     webhook = shopify_webhook_status() if owns_shopify_store else {"secret_configured": False, "store_configured": False, "receipts": {}}
     configured = bool(webhook.get("secret_configured") and webhook.get("store_configured"))
     processed = int(webhook.get("receipts", {}).get("processed", 0))
@@ -4724,6 +4873,7 @@ def merchant_account_page(request: Request) -> Response:
         name="merchant.html",
         context={
             **data,
+            "bootstrap_tenants": bootstrap_tenants,
             "account": _account_shell(session, "merchant"),
             "role_label": "Merchant account",
             "nav": [
@@ -4742,6 +4892,149 @@ def _require_same_origin(request: Request) -> None:
     supplied = urlparse(request.headers.get("origin", ""))
     if supplied.scheme != expected.scheme or supplied.netloc != expected.netloc:
         raise HTTPException(403, "same-origin request required")
+
+
+def _merchant_default_program() -> dict[str, Any]:
+    try:
+        commission_bps = int(os.getenv("MERCHANT_DEFAULT_COMMISSION_BPS", "800"))
+        window_days = int(os.getenv("MERCHANT_DEFAULT_WINDOW_DAYS", "30"))
+    except ValueError as exc:
+        raise HTTPException(503, "merchant default program configuration is invalid") from exc
+    if not 1 <= commission_bps <= 10_000 or not 1 <= window_days <= 365:
+        raise HTTPException(503, "merchant default program configuration is invalid")
+
+    name = safe_text(os.getenv("MERCHANT_DEFAULT_PROGRAM_NAME", "Meerat Affiliate Program"), 160)
+    if not name:
+        raise HTTPException(503, "merchant default program configuration is invalid")
+
+    def configured_url(env_name: str, fallback: str) -> str:
+        value = safe_text(os.getenv(env_name, fallback), 3000)
+        parsed = urlparse(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise HTTPException(503, "merchant default program configuration is invalid")
+        return value
+
+    return {
+        "name": name,
+        "commission_bps": commission_bps,
+        "window_days": window_days,
+        "destination_url": configured_url("MERCHANT_DEFAULT_DESTINATION_URL", DEFAULT_DESTINATION),
+        "terms_url": configured_url("MERCHANT_DEFAULT_TERMS_URL", "https://bumbei.com/terms/affiliate"),
+    }
+
+
+def _merchant_campaign_publication_needed(event: dict[str, Any]) -> bool:
+    relay_status = event.get("relay_status")
+    if relay_status == "published":
+        return False
+    if relay_status == "skipped":
+        return nostr_publish_enabled()
+    return True
+
+
+@app.post("/app/merchant/bootstrap", tags=["Accounts"])
+def merchant_bootstrap(body: MerchantBootstrapIn, request: Request) -> dict[str, Any]:
+    session = require_account_session(request, "merchant")
+    _require_same_origin(request)
+    merchant = normalize_pubkey(body.merchant_pubkey, "merchant_pubkey")
+    defaults = _merchant_default_program()
+    campaign_id = f"camp_default_{merchant['hex']}"
+    event: dict[str, Any] | None = None
+    duplicate = False
+    publish_needed = True
+    relay_results: list[dict[str, str]] = []
+    status = "paused"
+
+    with _MERCHANT_BOOTSTRAP_LOCK:
+        with engine().begin() as c:
+            if c.engine.dialect.name == "postgresql":
+                c.execute(
+                    text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+                    {"lock_key": f"merchant-bootstrap:{merchant['hex']}"},
+                )
+            elif c.engine.dialect.name == "sqlite":
+                c.exec_driver_sql("BEGIN IMMEDIATE")
+            linked = c.execute(
+                text(
+                    """
+                    SELECT 1 FROM merchant_account_links
+                    WHERE account_id=:account_id AND merchant_pubkey_hex=:merchant_hex
+                      AND source='environment_binding'
+                    LIMIT 1
+                    """
+                ),
+                {"account_id": session["account_id"], "merchant_hex": merchant["hex"]},
+            ).fetchone()
+            if not linked or merchant["hex"] == session["nostr_pubkey_hex"]:
+                raise HTTPException(404, "merchant bootstrap target not found")
+
+            existing = asdict(c.execute(text("SELECT * FROM campaigns WHERE id=:id"), {"id": campaign_id}).fetchone())
+            if existing:
+                if existing.get("merchant_pubkey_hex") != merchant["hex"]:
+                    raise HTTPException(409, "default program identity conflict")
+                event = json.loads(existing["nostr_event_json"])
+                duplicate = True
+                status = existing["status"]
+                relay_results = event.get("relay_results", [])
+                publish_needed = _merchant_campaign_publication_needed(event)
+            else:
+                terms_hash = sha(defaults["terms_url"])
+                campaign = {
+                    "id": campaign_id,
+                    "merchant_pubkey": merchant["npub"],
+                    "merchant_pubkey_hex": merchant["hex"],
+                    "name": defaults["name"],
+                    "commission_bps": defaults["commission_bps"],
+                    "window_days": defaults["window_days"],
+                    "destination_url": defaults["destination_url"],
+                    "terms_hash": terms_hash,
+                    "status": "paused",
+                }
+                event = build_campaign_event(campaign, defaults["terms_url"])
+                inserted = c.execute(
+                    text(
+                        """
+                        INSERT INTO campaigns
+                          (id, merchant_pubkey, merchant_pubkey_hex, name, commission_bps, window_days,
+                           destination_url, terms_hash, status, nostr_event_id, nostr_event_json, created_at)
+                        VALUES
+                          (:id, :merchant_pubkey, :merchant_pubkey_hex, :name, :commission_bps, :window_days,
+                           :destination_url, :terms_hash, :status, :nostr_event_id, :nostr_event_json, :created_at)
+                        ON CONFLICT(id) DO NOTHING
+                        """
+                    ),
+                    {
+                        **campaign,
+                        "nostr_event_id": event["id"],
+                        "nostr_event_json": json.dumps(event),
+                        "created_at": now(),
+                    },
+                )
+                if inserted.rowcount == 1:
+                    ensure_campaign_budget(c, campaign_id)
+                    persist_nostr_event(c, event, "campaign", campaign_id, [])
+                else:
+                    existing = asdict(c.execute(text("SELECT * FROM campaigns WHERE id=:id"), {"id": campaign_id}).fetchone())
+                    if not existing or existing.get("merchant_pubkey_hex") != merchant["hex"]:
+                        raise HTTPException(409, "default program identity conflict")
+                    event = json.loads(existing["nostr_event_json"])
+                    duplicate = True
+                    status = existing["status"]
+                    relay_results = event.get("relay_results", [])
+                    publish_needed = _merchant_campaign_publication_needed(event)
+
+    assert event is not None
+    if publish_needed:
+        relay_results = finalize_committed_nostr_event(event, "campaign", campaign_id)
+    return {
+        "ok": True,
+        "duplicate": duplicate,
+        "campaign_id": campaign_id,
+        "status": status,
+        "merchant_pubkey": merchant["npub"],
+        "nostr_event_id": event["id"],
+        "relay_results": relay_results,
+    }
 
 
 def _normalize_lightning_address(value: str) -> str:

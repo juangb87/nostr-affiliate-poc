@@ -2,6 +2,21 @@
 {% block title %}Merchant · Meerat{% endblock %}
 {% block content %}
 <header class="page-header"><div><p class="eyebrow">Merchant account</p><h1>Tu programa, bajo control.</h1><p class="lede">Campañas, atribución y obligaciones de pago de tus comercios, sin mezclar datos de otros merchants.</p></div><div class="header-actions"><a class="button secondary" href="#integration">Ver integración</a></div></header>
+{% if not totals.campaigns and bootstrap_tenants %}
+<section class="section" id="onboarding" data-merchant-onboarding>
+  <div class="section-head"><div><p class="eyebrow">Primer paso</p><h2>Crear tu Programa de Afiliados</h2><p>Tu identidad owner ya está vinculada a un Merchant autorizado. Creá el programa inicial para revisar sus condiciones antes de invitar Affiliates.</p></div></div>
+  <form class="panel form-panel" data-merchant-bootstrap>
+    {% if bootstrap_tenants|length == 1 %}
+      <input type="hidden" name="merchant_pubkey" value="{{ bootstrap_tenants[0].merchant_pubkey }}">
+      <label><span>Identidad Merchant</span><code>{{ bootstrap_tenants[0].merchant_short }}</code></label>
+    {% else %}
+      <label><span>Identidad Merchant</span><select name="merchant_pubkey" required>{% for tenant in bootstrap_tenants %}<option value="{{ tenant.merchant_pubkey }}">{{ tenant.merchant_short }}</option>{% endfor %}</select></label>
+    {% endif %}
+    <button class="button" type="submit">Crear programa pausado</button>
+    <p class="form-status" role="status" aria-live="polite" data-bootstrap-status>El programa comienza pausado. Vas a revisar comisión, destino e integración antes de activarlo.</p>
+  </form>
+</section>
+{% endif %}
 <section class="metrics" aria-label="Resumen merchant">
   <article class="metric"><span>Campañas activas</span><strong>{{ totals.active_campaigns }}</strong><small>de {{ totals.campaigns }} campañas</small></article>
   <article class="metric"><span>Afiliados</span><strong>{{ totals.affiliates }}</strong><small>enrollments únicos</small></article>

@@ -1,5 +1,8 @@
 import base64
 import json
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from fastapi.testclient import TestClient
@@ -147,6 +150,31 @@ def test_direct_merchant_owner_ignores_malformed_optional_bindings(tmp_path, mon
 
     assert result.json()["account"]["npub"] == merchant.public_key().to_bech32()
     assert client.get("/app/merchant").status_code == 200
+
+
+def test_malformed_bindings_remove_stale_delegation_for_direct_owner(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    direct_owner = Keys.generate()
+    delegated_tenant = Keys.generate()
+    create_campaign(client, direct_owner, name="Direct owner campaign")
+    create_campaign(client, delegated_tenant, name="Delegated tenant campaign")
+    monkeypatch.setenv(
+        "MERCHANT_ACCOUNT_BINDINGS",
+        f"{direct_owner.public_key().to_bech32()}:{delegated_tenant.public_key().to_bech32()}",
+    )
+    login(client, direct_owner, "merchant")
+    assert "Delegated tenant campaign" in client.get("/app/merchant").text
+
+    monkeypatch.setenv("MERCHANT_ACCOUNT_BINDINGS", "malformed-binding")
+    page = client.get("/app/merchant")
+
+    assert page.status_code == 200
+    assert "Direct owner campaign" in page.text
+    assert "Delegated tenant campaign" not in page.text
+    with main.engine().connect() as connection:
+        assert connection.execute(
+            text("SELECT COUNT(*) FROM merchant_account_links WHERE source='environment_binding'")
+        ).scalar_one() == 0
 
 
 def test_malformed_bindings_do_not_authorize_unrelated_identity(tmp_path, monkeypatch):
@@ -467,6 +495,306 @@ def test_human_owner_can_be_bound_to_merchant_identity(tmp_path, monkeypatch):
     assert 'data-merchant-invitation' in page.text
     assert 'name="affiliate_pubkey"' not in page.text
     assert 'value="' + campaign["campaign_id"] + '"' in page.text
+
+
+def test_bound_owner_can_sign_in_before_tenant_has_a_campaign(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    human_owner = Keys.generate()
+    merchant_identity = Keys.generate()
+    monkeypatch.setenv(
+        "MERCHANT_ACCOUNT_BINDINGS",
+        f"{human_owner.public_key().to_bech32()}:{merchant_identity.public_key().to_bech32()}",
+    )
+
+    result = login(client, human_owner, "merchant")
+
+    assert result.json()["account"]["npub"] == human_owner.public_key().to_bech32()
+    with main.engine().connect() as connection:
+        link = connection.execute(
+            text("SELECT merchant_pubkey_hex, source FROM merchant_account_links"),
+        ).one()._mapping
+        campaign_count = connection.execute(text("SELECT COUNT(*) FROM campaigns")).scalar_one()
+    assert link["merchant_pubkey_hex"] == merchant_identity.public_key().to_hex()
+    assert link["source"] == "environment_binding"
+    assert campaign_count == 0
+    page = client.get("/app/merchant")
+    assert page.status_code == 200
+    assert "Crear tu Programa de Afiliados" in page.text
+    assert 'data-merchant-bootstrap' in page.text
+    assert f'value="{merchant_identity.public_key().to_bech32()}"' in page.text
+    assert "El programa comienza pausado" in page.text
+    assert "Shopify conectado" not in page.text
+
+
+def test_merchant_bootstrap_browser_contract_is_same_origin_json(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    human_owner = Keys.generate()
+    merchant_identity = Keys.generate()
+    monkeypatch.setenv(
+        "MERCHANT_ACCOUNT_BINDINGS",
+        f"{human_owner.public_key().to_bech32()}:{merchant_identity.public_key().to_bech32()}",
+    )
+    login(client, human_owner, "merchant")
+
+    page = client.get("/app/merchant")
+    script = client.get("/static/app.js")
+
+    assert page.status_code == 200
+    assert 'name="merchant_pubkey"' in page.text
+    assert 'data-bootstrap-status' in page.text
+    assert script.status_code == 200
+    assert 'event.target.closest("[data-merchant-bootstrap]")' in script.text
+    assert 'jsonFetch("/app/merchant/bootstrap"' in script.text
+    assert 'merchant_pubkey: String(fields.get("merchant_pubkey")' in script.text
+
+
+def test_self_binding_does_not_bootstrap_campaignless_merchant(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    merchant = Keys.generate()
+    merchant_npub = merchant.public_key().to_bech32()
+    monkeypatch.setenv("MERCHANT_ACCOUNT_BINDINGS", f"{merchant_npub}:{merchant_npub}")
+    challenge = client.post("/auth/nostr/challenge", json={"role": "merchant"}).json()
+
+    response = client.post(
+        "/auth/nostr/verify",
+        json={"event": signed_login_event(merchant, challenge)},
+    )
+
+    assert response.status_code == 403
+    with main.engine().connect() as connection:
+        assert connection.execute(text("SELECT COUNT(*) FROM merchant_account_links")).scalar_one() == 0
+        assert connection.execute(text("SELECT COUNT(*) FROM campaigns")).scalar_one() == 0
+
+
+def test_merchant_bootstrap_requires_session_origin_and_bound_tenant(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    human_owner = Keys.generate()
+    merchant_identity = Keys.generate()
+    foreign_merchant = Keys.generate()
+    monkeypatch.setenv(
+        "MERCHANT_ACCOUNT_BINDINGS",
+        f"{human_owner.public_key().to_bech32()}:{merchant_identity.public_key().to_bech32()}",
+    )
+    payload = {"merchant_pubkey": merchant_identity.public_key().to_bech32()}
+
+    anonymous = client.post(
+        "/app/merchant/bootstrap",
+        headers={"origin": "https://testserver"},
+        json=payload,
+    )
+    assert anonymous.status_code == 401
+
+    login(client, human_owner, "merchant")
+    wrong_origin = client.post(
+        "/app/merchant/bootstrap",
+        headers={"origin": "https://evil.example"},
+        json=payload,
+    )
+    assert wrong_origin.status_code == 403
+    missing_origin = client.post("/app/merchant/bootstrap", json=payload)
+    assert missing_origin.status_code == 403
+    foreign_tenant = client.post(
+        "/app/merchant/bootstrap",
+        headers={"origin": "https://testserver"},
+        json={"merchant_pubkey": foreign_merchant.public_key().to_bech32()},
+    )
+    assert foreign_tenant.status_code == 404
+    extra_field = client.post(
+        "/app/merchant/bootstrap",
+        headers={"origin": "https://testserver"},
+        json={**payload, "commission_bps": 1},
+    )
+    assert extra_field.status_code == 422
+
+
+def test_merchant_bootstrap_creates_one_paused_default_program_idempotently(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    human_owner = Keys.generate()
+    merchant_identity = Keys.generate()
+    merchant_npub = merchant_identity.public_key().to_bech32()
+    monkeypatch.setenv(
+        "MERCHANT_ACCOUNT_BINDINGS",
+        f"{human_owner.public_key().to_bech32()}:{merchant_npub}",
+    )
+    monkeypatch.setenv("MERCHANT_DEFAULT_PROGRAM_NAME", "Shapersfit Affiliate Program")
+    monkeypatch.setenv("MERCHANT_DEFAULT_COMMISSION_BPS", "800")
+    monkeypatch.setenv("MERCHANT_DEFAULT_WINDOW_DAYS", "30")
+    monkeypatch.setenv("MERCHANT_DEFAULT_DESTINATION_URL", "https://shapersfit.myshopify.com/")
+    monkeypatch.setenv("MERCHANT_DEFAULT_TERMS_URL", "https://shapersfit.com/affiliate-terms")
+    publish_calls = []
+
+    def fake_publish(event):
+        publish_calls.append(event["id"])
+        return [{"relay": "wss://relay.example", "status": "skipped", "error": "test"}]
+
+    monkeypatch.setattr(main, "publish_event", fake_publish)
+    login(client, human_owner, "merchant")
+    payload = {"merchant_pubkey": merchant_npub}
+    headers = {"origin": "https://testserver"}
+
+    first = client.post("/app/merchant/bootstrap", headers=headers, json=payload)
+    second = client.post("/app/merchant/bootstrap", headers=headers, json=payload)
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assert first.json()["duplicate"] is False
+    assert second.json()["duplicate"] is True
+    assert first.json()["campaign_id"] == second.json()["campaign_id"]
+    assert first.json()["status"] == second.json()["status"] == "paused"
+    assert first.json()["merchant_pubkey"] == merchant_npub
+    assert len(publish_calls) == 1
+    with main.engine().connect() as connection:
+        campaigns = [dict(row._mapping) for row in connection.execute(text("SELECT * FROM campaigns")).fetchall()]
+        budgets = connection.execute(text("SELECT COUNT(*) FROM campaign_budgets")).scalar_one()
+        events = connection.execute(
+            text("SELECT COUNT(*) FROM nostr_events WHERE entity_type='campaign' AND entity_id=:id"),
+            {"id": first.json()["campaign_id"]},
+        ).scalar_one()
+    assert len(campaigns) == 1
+    assert campaigns[0]["merchant_pubkey"] == merchant_npub
+    assert campaigns[0]["merchant_pubkey_hex"] == merchant_identity.public_key().to_hex()
+    assert campaigns[0]["name"] == "Shapersfit Affiliate Program"
+    assert campaigns[0]["commission_bps"] == 800
+    assert campaigns[0]["window_days"] == 30
+    assert campaigns[0]["destination_url"] == "https://shapersfit.myshopify.com/"
+    assert campaigns[0]["terms_hash"] == main.sha("https://shapersfit.com/affiliate-terms")
+    assert campaigns[0]["status"] == "paused"
+    assert budgets == 1
+    assert events == 1
+
+
+def test_removing_merchant_binding_revokes_session_after_bootstrap(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    human_owner = Keys.generate()
+    merchant_identity = Keys.generate()
+    merchant_npub = merchant_identity.public_key().to_bech32()
+    monkeypatch.setenv(
+        "MERCHANT_ACCOUNT_BINDINGS",
+        f"{human_owner.public_key().to_bech32()}:{merchant_npub}",
+    )
+    login(client, human_owner, "merchant")
+    created = client.post(
+        "/app/merchant/bootstrap",
+        headers={"origin": "https://testserver"},
+        json={"merchant_pubkey": merchant_npub},
+    )
+    assert created.status_code == 200
+
+    monkeypatch.delenv("MERCHANT_ACCOUNT_BINDINGS", raising=False)
+    denied = client.get("/app/merchant", follow_redirects=False)
+
+    assert denied.status_code == 303
+    assert denied.headers["location"] == "/app?role=merchant"
+    with main.engine().connect() as connection:
+        assert connection.execute(text("SELECT COUNT(*) FROM merchant_account_links")).scalar_one() == 0
+        assert connection.execute(
+            text("SELECT COUNT(*) FROM account_sessions WHERE revoked_at IS NOT NULL")
+        ).scalar_one() == 1
+        assert connection.execute(text("SELECT COUNT(*) FROM campaigns")).scalar_one() == 1
+
+
+def test_failed_bootstrap_relay_is_durable_and_retry_is_duplicate(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    human_owner = Keys.generate()
+    merchant_identity = Keys.generate()
+    merchant_npub = merchant_identity.public_key().to_bech32()
+    monkeypatch.setenv(
+        "MERCHANT_ACCOUNT_BINDINGS",
+        f"{human_owner.public_key().to_bech32()}:{merchant_npub}",
+    )
+    publish_calls = []
+
+    def failed_then_published(event):
+        publish_calls.append(event["id"])
+        if len(publish_calls) == 1:
+            raise RuntimeError("relay publisher offline")
+        return [{"relay": "wss://relay.example", "status": "published"}]
+
+    monkeypatch.setattr(main, "publish_event", failed_then_published)
+    login(client, human_owner, "merchant")
+    request = {
+        "headers": {"origin": "https://testserver"},
+        "json": {"merchant_pubkey": merchant_npub},
+    }
+
+    first = client.post("/app/merchant/bootstrap", **request)
+    second = client.post("/app/merchant/bootstrap", **request)
+
+    assert first.status_code == 200
+    assert first.json()["relay_results"][0]["status"] == "failed"
+    assert second.status_code == 200
+    assert second.json()["duplicate"] is True
+    assert second.json()["relay_results"][0]["status"] == "published"
+    assert len(publish_calls) == 2
+    with main.engine().connect() as connection:
+        event = connection.execute(
+            text("SELECT relay_status FROM nostr_events WHERE entity_type='campaign'")
+        ).one()._mapping
+        assert connection.execute(text("SELECT COUNT(*) FROM campaigns")).scalar_one() == 1
+        assert connection.execute(text("SELECT COUNT(*) FROM nostr_events WHERE entity_type='campaign'")).scalar_one() == 1
+    assert event["relay_status"] == "published"
+
+
+def test_concurrent_bootstrap_publication_cannot_downgrade_published_event(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    human_owner = Keys.generate()
+    merchant_identity = Keys.generate()
+    merchant_npub = merchant_identity.public_key().to_bech32()
+    monkeypatch.setenv(
+        "MERCHANT_ACCOUNT_BINDINGS",
+        f"{human_owner.public_key().to_bech32()}:{merchant_npub}",
+    )
+    login(client, human_owner, "merchant")
+    first_started = threading.Event()
+    release_first = threading.Event()
+    calls = []
+    calls_lock = threading.Lock()
+
+    def racing_publish(event):
+        with calls_lock:
+            calls.append(event["id"])
+            attempt = len(calls)
+        if attempt == 1:
+            first_started.set()
+            assert release_first.wait(5)
+            return [{"relay": "wss://relay.example", "status": "failed", "error": "late failure"}]
+        return [{"relay": "wss://relay.example", "status": "published"}]
+
+    monkeypatch.setattr(main, "publish_event", racing_publish)
+
+    def bootstrap():
+        return client.post(
+            "/app/merchant/bootstrap",
+            headers={"origin": "https://testserver"},
+            json={"merchant_pubkey": merchant_npub},
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(bootstrap)
+        assert first_started.wait(5)
+        second = pool.submit(bootstrap)
+        try:
+            time.sleep(0.15)
+            assert len(calls) == 1
+        finally:
+            release_first.set()
+        responses = [first.result(timeout=5), second.result(timeout=5)]
+
+    assert [response.status_code for response in responses] == [200, 200]
+    assert sorted(response.json()["duplicate"] for response in responses) == [False, True]
+    assert len(calls) == 2
+    with main.engine().connect() as connection:
+        stored = connection.execute(
+            text("SELECT relay_status, published_at, event_json FROM nostr_events WHERE entity_type='campaign'")
+        ).one()._mapping
+        campaign_event = connection.execute(
+            text("SELECT nostr_event_json FROM campaigns WHERE id=:id"),
+            {"id": responses[0].json()["campaign_id"]},
+        ).scalar_one()
+    assert stored["relay_status"] == "published"
+    assert stored["published_at"] is not None
+    assert json.loads(stored["event_json"])["relay_status"] == "published"
+    assert json.loads(campaign_event)["relay_status"] == "published"
 
 
 def test_legacy_enrollment_hook_is_removed(tmp_path, monkeypatch):
