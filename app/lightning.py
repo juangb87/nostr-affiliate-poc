@@ -16,10 +16,15 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from bolt11 import Bolt11Exception, decode
 from nostr_sdk import (
+    Client,
+    Filter,
+    Kind,
+    LookupInvoiceRequest,
     NostrWalletConnectOptions,
     NostrWalletConnectUri,
     Nwc,
     PayInvoiceRequest,
+    TransactionState,
 )
 
 
@@ -40,6 +45,16 @@ class LightningPaymentResult:
     payment_hash: str
     fees_paid_msats: int | None
     invoice: str
+
+
+@dataclass(frozen=True)
+class NwcLookupResult:
+    status: str
+    payment_hash: str
+    fee_paid_msats: int | None
+    fee_paid_sats: int | None
+    provider_reference: str
+    preimage: None = None
 
 
 JsonGetter = Callable[[str], dict[str, Any]]
@@ -179,7 +194,7 @@ def request_lnurl_invoice(address: str, amount_sats: int, get_json: JsonGetter =
     return invoice, payment_hash
 
 
-async def pay_nwc_invoice(invoice: str, expected_payment_hash: str) -> LightningPaymentResult:
+def _nwc_client() -> Nwc:
     connection_uri = os.getenv("NWC_CONNECTION_URI", "").strip()
     if not connection_uri:
         raise LightningPaymentError("NWC connection is not configured")
@@ -187,7 +202,156 @@ async def pay_nwc_invoice(invoice: str, expected_payment_hash: str) -> Lightning
         uri = NostrWalletConnectUri.parse(connection_uri)
         timeout_seconds = max(5, min(int(os.getenv("NWC_TIMEOUT_SECONDS", "30")), 60))
         options = NostrWalletConnectOptions().timeout(timedelta(seconds=timeout_seconds))
-        wallet = Nwc.with_opts(uri, options)
+        return Nwc.with_opts(uri, options)
+    except LightningPaymentError:
+        raise
+    except Exception as exc:
+        raise LightningPaymentError("NWC connection configuration is invalid") from exc
+
+
+async def _nwc_info_capabilities() -> tuple[list[str], list[str]]:
+    """Read the standard kind-13194 capability event without strict extension decoding."""
+    connection_uri = os.getenv("NWC_CONNECTION_URI", "").strip()
+    client: Client | None = None
+    try:
+        uri = NostrWalletConnectUri.parse(connection_uri)
+        client = Client()
+        for relay in uri.relays():
+            await client.add_relay(relay)
+        await client.connect()
+        timeout_seconds = max(5, min(int(os.getenv("NWC_TIMEOUT_SECONDS", "30")), 60))
+        events = (
+            await client.fetch_events(
+                Filter().kind(Kind(13194)).author(uri.public_key()).limit(5),
+                timedelta(seconds=timeout_seconds),
+            )
+        ).to_vec()
+    except Exception as exc:
+        raise LightningPaymentError("NWC capability discovery failed") from exc
+    finally:
+        if client is not None:
+            try:
+                await client.shutdown()
+            except Exception:
+                pass
+    if not events:
+        raise LightningPaymentError("NWC wallet published no capability event")
+    latest = max(events, key=lambda event: event.created_at().as_secs())
+    methods = sorted({
+        item for item in str(latest.content()).split()
+        if 0 < len(item) <= 50 and all(ch.islower() or ch.isdigit() or ch == "_" for ch in item)
+    })
+    try:
+        tags = json.loads(latest.as_json()).get("tags", [])
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise LightningPaymentError("NWC capability event is invalid") from exc
+    notifications: set[str] = set()
+    for tag in tags:
+        if isinstance(tag, list) and len(tag) >= 2 and tag[0] == "notifications":
+            notifications.update(
+                item for item in str(tag[1]).split()
+                if 0 < len(item) <= 80 and all(ch.islower() or ch.isdigit() or ch == "_" for ch in item)
+            )
+    return methods, sorted(notifications)
+
+
+def _nwc_method_name(method: Any) -> str:
+    name = getattr(method, "name", None)
+    if name:
+        return str(name).lower()
+    return str(method).rsplit(".", 1)[-1].lower()
+
+
+async def probe_nwc_wallet() -> dict[str, Any]:
+    """Perform read-only NWC capability checks without exposing connection credentials."""
+    wallet = _nwc_client()
+    alias: str | None = None
+    network: str | None = None
+    authenticated = False
+    try:
+        info = await wallet.get_info()
+        authenticated = True
+        methods = sorted({_nwc_method_name(method) for method in (getattr(info, "methods", None) or [])})
+        notifications = sorted({str(item)[:80] for item in (getattr(info, "notifications", None) or [])})
+        raw_alias = "".join(ch for ch in str(getattr(info, "alias", "") or "") if ch.isprintable())[:100]
+        raw_network = "".join(ch for ch in str(getattr(info, "network", "") or "") if ch.isprintable())[:30]
+        alias = raw_alias or None
+        network = raw_network or None
+    except Exception:
+        # Wallet extensions unknown to an SDK enum must not break standard capability discovery.
+        methods, notifications = await _nwc_info_capabilities()
+    supports_balance = "get_balance" in methods
+    balance_accessible = False
+    has_canary_balance: bool | None = None
+    if supports_balance:
+        try:
+            balance_msats = max(0, int(await wallet.get_balance()))
+            minimum_sats = max(1, int(os.getenv("NWC_CANARY_MIN_SATS", "21")))
+            authenticated = True
+            balance_accessible = True
+            has_canary_balance = balance_msats >= minimum_sats * 1000
+        except Exception:
+            # Balance visibility is optional and must not make pay/lookup readiness fail.
+            balance_accessible = False
+    return {
+        "connected": authenticated,
+        "authenticated": authenticated,
+        "capabilities_discovered": True,
+        "alias": alias,
+        "network": network,
+        "methods": methods,
+        "notifications": notifications,
+        "supports_pay_invoice": "pay_invoice" in methods,
+        "supports_lookup_invoice": "lookup_invoice" in methods,
+        "balance_accessible": balance_accessible,
+        "has_canary_balance": has_canary_balance,
+    }
+
+
+async def lookup_nwc_payment(payment_hash: str) -> NwcLookupResult:
+    """Read provider state for an existing invoice; this never initiates a payment."""
+    reference = str(payment_hash or "").strip().lower()
+    if len(reference) != 64 or any(ch not in "0123456789abcdef" for ch in reference):
+        raise LightningPaymentError("NWC lookup requires a valid payment hash")
+    try:
+        result = await _nwc_client().lookup_invoice(
+            LookupInvoiceRequest(payment_hash=reference, invoice=None)
+        )
+    except LightningPaymentError:
+        raise
+    except Exception as exc:
+        raise LightningPaymentError("NWC payment lookup failed") from exc
+    reported_hash = str(getattr(result, "payment_hash", "") or "").lower()
+    if len(reported_hash) != 64 or not hmac.compare_digest(reference, reported_hash):
+        raise NwcPaymentError("NWC lookup payment hash does not match prepared evidence")
+    preimage_hex = str(getattr(result, "preimage", "") or "")
+    if preimage_hex:
+        try:
+            preimage = bytes.fromhex(preimage_hex)
+        except ValueError as exc:
+            raise NwcPaymentError("NWC lookup returned invalid settlement evidence") from exc
+        if len(preimage) != 32 or not hmac.compare_digest(hashlib.sha256(preimage).hexdigest(), reference):
+            raise NwcPaymentError("NWC lookup preimage does not match prepared evidence")
+    state = getattr(result, "state", None)
+    if state == TransactionState.SETTLED:
+        status = "SUCCESS"
+    elif state in {TransactionState.FAILED, TransactionState.EXPIRED}:
+        status = "FAILURE"
+    else:
+        status = "PENDING"
+    fees_msats = max(0, int(getattr(result, "fees_paid", 0) or 0))
+    return NwcLookupResult(
+        status=status,
+        payment_hash=reported_hash,
+        fee_paid_msats=fees_msats,
+        fee_paid_sats=(fees_msats + 999) // 1000,
+        provider_reference=reported_hash,
+    )
+
+
+async def pay_nwc_invoice(invoice: str, expected_payment_hash: str) -> LightningPaymentResult:
+    try:
+        wallet = _nwc_client()
         paid = await wallet.pay_invoice(PayInvoiceRequest(id=None, invoice=invoice, amount=None))
         preimage = bytes.fromhex(paid.preimage)
     except LightningPaymentError:

@@ -1,15 +1,20 @@
+import asyncio
 import hashlib
 import time
+from types import SimpleNamespace
 
 import pytest
 from bolt11 import Bolt11, MilliSatoshi, Tag, TagChar, Tags, encode
+from nostr_sdk import Method, TransactionState
 
+import app.lightning as lightning
 from app.lightning import (
     LightningPaymentError,
     lightning_address_url,
     request_lnurl_invoice,
     validate_bolt11_invoice,
 )
+
 
 
 PRIVATE_KEY = "11" * 32
@@ -95,3 +100,118 @@ def test_request_lnurl_invoice_enforces_limits_and_callback_amount():
 
     with pytest.raises(LightningPaymentError, match="outside"):
         request_lnurl_invoice("affiliate@example.com", 200, too_small)
+
+
+def test_nwc_readiness_and_lookup_use_safe_provider_evidence(monkeypatch):
+    preimage = "44" * 32
+    payment_hash = hashlib.sha256(bytes.fromhex(preimage)).hexdigest()
+
+    class Wallet:
+        async def get_info(self):
+            return SimpleNamespace(
+                alias="Pilot wallet",
+                network="mainnet",
+                methods=[Method.PAY_INVOICE, Method.LOOKUP_INVOICE, Method.GET_INFO, Method.GET_BALANCE],
+                notifications=["payment_sent"],
+            )
+
+        async def get_balance(self):
+            return 250_000
+
+        async def lookup_invoice(self, request):
+            assert request.payment_hash == payment_hash
+            assert request.invoice is None
+            return SimpleNamespace(
+                state=TransactionState.SETTLED,
+                payment_hash=payment_hash,
+                preimage=preimage,
+                fees_paid=1_500,
+            )
+
+    monkeypatch.setattr(lightning, "_nwc_client", lambda: Wallet())
+    readiness = asyncio.run(lightning.probe_nwc_wallet())
+    assert readiness == {
+        "connected": True,
+        "authenticated": True,
+        "capabilities_discovered": True,
+        "alias": "Pilot wallet",
+        "network": "mainnet",
+        "methods": ["get_balance", "get_info", "lookup_invoice", "pay_invoice"],
+        "notifications": ["payment_sent"],
+        "supports_pay_invoice": True,
+        "supports_lookup_invoice": True,
+        "balance_accessible": True,
+        "has_canary_balance": True,
+    }
+    assert "secret" not in str(readiness).lower()
+
+    result = asyncio.run(lightning.lookup_nwc_payment(payment_hash))
+    assert result.status == "SUCCESS"
+    assert result.payment_hash == payment_hash
+    assert result.fee_paid_msats == 1_500
+    assert result.fee_paid_sats == 2
+    assert result.provider_reference == payment_hash
+    assert result.preimage is None
+
+
+def test_nwc_lookup_rejects_mismatched_or_invalid_provider_evidence(monkeypatch):
+    expected_hash = "55" * 32
+
+    class Wallet:
+        async def lookup_invoice(self, _request):
+            return SimpleNamespace(
+                state=TransactionState.SETTLED,
+                payment_hash="66" * 32,
+                preimage=None,
+                fees_paid=0,
+            )
+
+    monkeypatch.setattr(lightning, "_nwc_client", lambda: Wallet())
+    with pytest.raises(lightning.NwcPaymentError, match="match"):
+        asyncio.run(lightning.lookup_nwc_payment(expected_hash))
+    with pytest.raises(LightningPaymentError, match="payment hash"):
+        asyncio.run(lightning.lookup_nwc_payment("not-a-payment-hash"))
+
+
+def test_nwc_readiness_falls_back_to_standard_info_event_for_wallet_extensions(monkeypatch):
+    class Wallet:
+        async def get_info(self):
+            raise RuntimeError("SDK cannot decode wallet extension method")
+
+        async def get_balance(self):
+            return 21_000
+
+    async def capabilities():
+        return ["get_balance", "get_budget", "lookup_invoice", "pay_invoice"], ["payment_sent"]
+
+    monkeypatch.setattr(lightning, "_nwc_client", lambda: Wallet())
+    monkeypatch.setattr(lightning, "_nwc_info_capabilities", capabilities)
+    readiness = asyncio.run(lightning.probe_nwc_wallet())
+    assert readiness["connected"] is True
+    assert readiness["authenticated"] is True
+    assert readiness["capabilities_discovered"] is True
+    assert readiness["alias"] is None
+    assert readiness["network"] is None
+    assert readiness["methods"] == ["get_balance", "get_budget", "lookup_invoice", "pay_invoice"]
+    assert readiness["supports_lookup_invoice"] is True
+    assert readiness["has_canary_balance"] is True
+
+
+def test_nwc_public_capability_event_alone_is_not_authenticated_readiness(monkeypatch):
+    class Wallet:
+        async def get_info(self):
+            raise TimeoutError("wallet did not answer")
+
+        async def get_balance(self):
+            raise TimeoutError("wallet did not answer")
+
+    async def capabilities():
+        return ["get_balance", "lookup_invoice", "pay_invoice"], []
+
+    monkeypatch.setattr(lightning, "_nwc_client", lambda: Wallet())
+    monkeypatch.setattr(lightning, "_nwc_info_capabilities", capabilities)
+    readiness = asyncio.run(lightning.probe_nwc_wallet())
+    assert readiness["capabilities_discovered"] is True
+    assert readiness["authenticated"] is False
+    assert readiness["connected"] is False
+    assert readiness["balance_accessible"] is False

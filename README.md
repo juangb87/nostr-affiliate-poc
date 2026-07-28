@@ -155,10 +155,25 @@ Recommended environment variables:
 - `LIGHTNING_MAX_PAYOUT_SATS`: hard maximum for one admin-triggered affiliate payment.
 - `PAYMENT_RAIL`: `nwc` (default), `fake`, or `blink`.
 - `ALLOW_FAKE_PAYMENT_RAIL`: must also be `true` before `PAYMENT_RAIL=fake` can execute.
-- `NWC_CONNECTION_URI`: private NWC connection used only by the `nwc` adapter.
+- `NWC_CONNECTION_URI`: private NWC connection used only by the `nwc` adapter. Treat it as a spend credential and never log or return it.
+- `NWC_TIMEOUT_SECONDS`: NWC relay/provider timeout, clamped to 5–60 seconds. Default: `30`.
+- `NWC_CANARY_MIN_SATS`: minimum wallet balance threshold checked by readiness without exposing the balance. Default: `21`.
 - `BLINK_API_KEY`: private Blink API key; required only when `PAYMENT_RAIL=blink`.
 - `BLINK_WALLET_ID`: dedicated merchant BTC wallet id for Blink.
 - `BLINK_GRAPHQL_URL`: Blink GraphQL endpoint; defaults to `https://api.staging.blink.sv/graphql`.
+
+## NWC readiness and reconciliation
+
+Before enabling real payouts, operators can run the authenticated, read-only readiness probe:
+
+```bash
+curl "$BASE_URL/admin/payments/nwc/readiness" \
+  -H "Authorization: Bearer <PAYOUT_ADMIN_KEY>"
+```
+
+The response reports capability discovery, an authenticated wallet check, `pay_invoice` / `lookup_invoice` support, and whether the wallet can fund the configured canary threshold. It never returns the connection URI or exact balance and never initiates a payment. `LIGHTNING_PAYOUTS_ENABLED=false` may remain set while probing.
+
+NWC attempts persist the prepared payment hash before payment. Ambiguous outcomes remain `UNKNOWN` and are never retried automatically; `POST /admin/payment-attempts/{attempt_id}/refresh` uses NIP-47 `lookup_invoice` to reconcile the existing hash without creating a payment.
 
 ## Merchant tracking snippet
 

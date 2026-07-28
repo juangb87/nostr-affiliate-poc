@@ -23,6 +23,7 @@ from urllib.request import Request, urlopen
 from app.lightning import (
     LightningPaymentError,
     NwcPaymentError,
+    lookup_nwc_payment,
     pay_nwc_invoice,
     prepare_lnurl_payment,
 )
@@ -142,16 +143,20 @@ class NwcPaymentRail:
 
     name = "nwc"
 
-    def __init__(self, prepare=None, pay=None):
+    def __init__(self, prepare=None, pay=None, lookup=None, balance=None):
         self._prepare = prepare or prepare_lnurl_payment
         self._pay = pay or pay_nwc_invoice
+        self._lookup = lookup or lookup_nwc_payment
+        self._balance = balance
         self._prepared_evidence_recorder = None
 
     def set_prepared_evidence_recorder(self, recorder) -> None:
         self._prepared_evidence_recorder = recorder
 
     async def get_balance(self) -> int:
-        raise RuntimeError("NWC balance lookup is not implemented")
+        if self._balance is None:
+            raise RuntimeError("NWC balance lookup is available through the readiness probe")
+        return int(await self._balance())
 
     async def pay_to_lightning_address(
         self, address: str, amount_sats: int, memo: str, idempotency_key: str
@@ -169,7 +174,9 @@ class NwcPaymentRail:
         try:
             paid = await self._pay(invoice, expected_hash)
         except NwcPaymentError as exc:
-            raise PaymentRailAmbiguousError(str(exc), payment_hash=expected_hash) from exc
+            raise PaymentRailAmbiguousError(
+                str(exc), payment_hash=expected_hash, provider_reference=expected_hash
+            ) from exc
         except LightningPaymentError as exc:
             return PaymentResult(status=PaymentStatus.FAILURE, error=str(exc), retryable=False)
         return PaymentResult(
@@ -184,7 +191,16 @@ class NwcPaymentRail:
         raise RuntimeError("NWC invoice payments require an expected payment hash")
 
     async def lookup_payment(self, reference: str) -> PaymentResult | None:
-        return None
+        lookup = await self._lookup(reference)
+        return PaymentResult(
+            status=PaymentStatus(lookup.status),
+            payment_hash=lookup.payment_hash,
+            preimage=None,
+            fee_paid_sats=lookup.fee_paid_sats,
+            fee_paid_msats=lookup.fee_paid_msats,
+            provider_reference=lookup.provider_reference,
+            retryable=False,
+        )
 
 
 BlinkTransport = Callable[..., dict[str, Any]]

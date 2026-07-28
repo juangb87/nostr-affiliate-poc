@@ -2,6 +2,7 @@ from fastapi.testclient import TestClient
 
 import app.main as main
 from app.lightning import LightningPaymentResult, NwcPaymentError
+from app.payment_rails import PaymentResult, PaymentStatus
 
 
 def create_demo_payout(client: TestClient) -> str:
@@ -143,6 +144,52 @@ def test_ambiguous_nwc_failure_is_not_retried(tmp_path, monkeypatch):
         headers={"Authorization": "Bearer admin-test-key"},
     ).json()["attempts"]
     assert "manual reconciliation" in attempts[0]["error"]
+    assert attempts[0]["provider_reference"] == "cd" * 32
+
+    # Legacy NWC UNKNOWN attempts may predate provider_reference but still have prepared hash evidence.
+    with main.engine().begin() as connection:
+        connection.execute(
+            main.text("UPDATE payment_attempts SET provider_reference=NULL WHERE id=:id"),
+            {"id": attempts[0]["id"]},
+        )
+
+    class ReconcilingNwcRail:
+        name = "nwc"
+
+        def __init__(self):
+            self.calls = 0
+
+        async def lookup_payment(self, reference: str):
+            assert reference == "cd" * 32
+            self.calls += 1
+            return PaymentResult(
+                status=PaymentStatus.PENDING if self.calls == 1 else PaymentStatus.SUCCESS,
+                payment_hash=reference,
+                provider_reference=reference,
+                fee_paid_sats=1,
+            )
+
+    rail = ReconcilingNwcRail()
+    monkeypatch.setattr(main, "configured_payment_rail", lambda: rail)
+    refresh = client.post(
+        f"/admin/payment-attempts/{attempts[0]['id']}/refresh",
+        headers={"Authorization": "Bearer admin-test-key"},
+    )
+    assert refresh.status_code == 200, refresh.text
+    assert refresh.json()["resolved"] is False
+    backfilled = client.get(
+        f"/admin/payouts/{payout_id}/attempts",
+        headers={"Authorization": "Bearer admin-test-key"},
+    ).json()["attempts"][0]
+    assert backfilled["provider_reference"] == "cd" * 32
+
+    settled = client.post(
+        f"/admin/payment-attempts/{attempts[0]['id']}/refresh",
+        headers={"Authorization": "Bearer admin-test-key"},
+    )
+    assert settled.status_code == 200, settled.text
+    assert settled.json()["resolved"] is True
+    assert settled.json()["payment_hash"] == "cd" * 32
 
     flow = client.get(f"/flows/{payout['conversion_id']}").json()
     public_urls = [
@@ -164,4 +211,73 @@ def test_ambiguous_nwc_failure_is_not_retried(tmp_path, monkeypatch):
         f"/admin/payouts/{payout_id}/execute",
         headers={"Authorization": "Bearer admin-test-key"},
     )
-    assert second.status_code == 409
+    assert second.status_code == 200
+    assert second.json()["payment_hash"] == "cd" * 32
+    assert rail.calls == 2
+
+
+def test_nwc_readiness_requires_admin_but_not_payment_execution(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path}/readiness.db")
+    monkeypatch.setenv("PAYOUT_ADMIN_KEY", "admin-test-key")
+    monkeypatch.setenv("NWC_CONNECTION_URI", "nostr+walletconnect://configured-but-never-returned")
+    monkeypatch.setenv("PAYMENT_RAIL", "nwc")
+    monkeypatch.setenv("LIGHTNING_PAYOUTS_ENABLED", "false")
+    monkeypatch.setenv("LIGHTNING_MAX_PAYOUT_SATS", "100")
+
+    async def fake_probe():
+        return {
+            "connected": True,
+            "authenticated": True,
+            "capabilities_discovered": True,
+            "alias": "Pilot wallet",
+            "network": "mainnet",
+            "methods": ["get_info", "lookup_invoice", "pay_invoice"],
+            "notifications": [],
+            "supports_pay_invoice": True,
+            "supports_lookup_invoice": True,
+            "balance_accessible": False,
+            "has_canary_balance": None,
+        }
+
+    monkeypatch.setattr(main, "probe_nwc_wallet", fake_probe)
+    client = TestClient(main.app)
+    assert client.get("/admin/payments/nwc/readiness").status_code == 401
+    response = client.get(
+        "/admin/payments/nwc/readiness",
+        headers={"Authorization": "Bearer admin-test-key"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "ok": True,
+        "configured": True,
+        "connected": True,
+        "authenticated": True,
+        "capabilities_discovered": True,
+        "payment_rail": "nwc",
+        "payment_execution_enabled": False,
+        "max_payout_sats": 100,
+        "alias": "Pilot wallet",
+        "network": "mainnet",
+        "methods": ["get_info", "lookup_invoice", "pay_invoice"],
+        "notifications": [],
+        "supports_pay_invoice": True,
+        "supports_lookup_invoice": True,
+        "balance_accessible": False,
+        "has_canary_balance": None,
+    }
+    assert "walletconnect://" not in response.text
+
+    async def public_capabilities_only():
+        payload = await fake_probe()
+        payload["connected"] = False
+        payload["authenticated"] = False
+        payload["has_canary_balance"] = None
+        return payload
+
+    monkeypatch.setattr(main, "probe_nwc_wallet", public_capabilities_only)
+    not_authenticated = client.get(
+        "/admin/payments/nwc/readiness",
+        headers={"Authorization": "Bearer admin-test-key"},
+    )
+    assert not_authenticated.status_code == 200
+    assert not_authenticated.json()["ok"] is False

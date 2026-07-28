@@ -58,6 +58,7 @@ from app.lightning import (
     lightning_address_url,
     pay_nwc_invoice,
     prepare_lnurl_payment,
+    probe_nwc_wallet,
 )
 from app.payment_rails import (
     NwcPaymentRail,
@@ -3476,8 +3477,22 @@ def refresh_payment_attempt(
     if safe_text(getattr(rail, "name", ""), 50).lower() != attempt["rail"]:
         raise HTTPException(409, "configured payment rail does not match attempt rail")
     reference = attempt.get("provider_reference")
+    used_prepared_hash = False
+    if not reference and attempt["rail"] == "nwc":
+        prepared_hash = str(attempt.get("payment_hash") or "").lower()
+        if valid_payment_hash(prepared_hash):
+            reference = prepared_hash
+            used_prepared_hash = True
     if not reference:
         raise HTTPException(409, "attempt has no provider reference for read-only refresh")
+    if used_prepared_hash:
+        with engine().begin() as c:
+            c.execute(text("""
+                UPDATE payment_attempts
+                SET provider_reference=:reference, updated_at=:updated_at
+                WHERE id=:id AND status='UNKNOWN' AND provider_reference IS NULL
+                  AND payment_hash=:reference
+            """), {"reference": reference, "updated_at": now(), "id": attempt_id})
     try:
         result = asyncio.run(rail.lookup_payment(reference))
     except Exception as exc:
@@ -3807,6 +3822,34 @@ def mark_payout_paid(
     if attempt_id:
         result["attempt_id"] = attempt_id
     return result
+
+
+@app.get("/admin/payments/nwc/readiness")
+def nwc_payment_readiness(authorization: Optional[str] = Header(None)) -> dict[str, Any]:
+    """Probe NWC read-only capabilities; never initiates or enables a payment."""
+    require_payout_admin_key(authorization)
+    configured = bool(os.getenv("NWC_CONNECTION_URI", "").strip())
+    if not configured:
+        raise HTTPException(503, "NWC connection is not configured")
+    if os.getenv("PAYMENT_RAIL", "nwc").strip().lower() != "nwc":
+        raise HTTPException(409, "NWC is not the configured payment rail")
+    try:
+        readiness = asyncio.run(probe_nwc_wallet())
+    except LightningPaymentError as exc:
+        raise HTTPException(502, safe_text(str(exc), 300)) from exc
+    ready = bool(
+        readiness.get("authenticated")
+        and readiness.get("supports_pay_invoice")
+        and readiness.get("supports_lookup_invoice")
+    )
+    return {
+        "ok": ready,
+        "configured": True,
+        **readiness,
+        "payment_rail": "nwc",
+        "payment_execution_enabled": lightning_payouts_enabled(),
+        "max_payout_sats": lightning_max_payout_sats(),
+    }
 
 
 @app.post("/admin/payouts/{payout_id}/execute")
