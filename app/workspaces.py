@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from sqlalchemy import bindparam, text
@@ -13,6 +14,16 @@ def short(value: Any, left: int = 12, right: int = 8) -> str:
 
 def _rows(connection: Any, statement: Any, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     return [dict(row._mapping) for row in connection.execute(statement, params or {}).fetchall()]
+
+
+def money_display(value: Any, currency: str) -> str:
+    try:
+        amount = Decimal(str(value or "0")).quantize(Decimal("0.01"))
+    except (InvalidOperation, TypeError, ValueError):
+        amount = Decimal("0.00")
+    code = str(currency or "").upper()
+    formatted = f"{amount:,.2f}"
+    return f"${formatted}" if code == "USD" else f"{formatted} {code}".strip()
 
 
 def merchant_workspace_data(connection: Any, session: dict[str, Any], *, base_url: str, shopify_ready: bool, shopify_detail: str) -> dict[str, Any]:
@@ -42,7 +53,10 @@ def merchant_workspace_data(connection: Any, session: dict[str, Any], *, base_ur
 
     conversions: list[dict[str, Any]] = []
     payouts: list[dict[str, Any]] = []
-    totals = {"affiliates": 0, "conversions": 0, "commission_sats": 0, "actionable_payouts": 0}
+    clicks: list[dict[str, Any]] = []
+    enrollments: list[dict[str, Any]] = []
+    shopify_sales: list[dict[str, Any]] = []
+    totals = {"affiliates": 0, "clicks": 0, "conversions": 0, "commission_sats": 0, "actionable_payouts": 0}
     tracking_events = 0
     if campaign_ids:
         conversions_stmt = text(
@@ -68,10 +82,52 @@ def merchant_workspace_data(connection: Any, session: dict[str, Any], *, base_ur
             """
         ).bindparams(bindparam("campaign_ids", expanding=True))
         payouts = _rows(connection, payouts_stmt, {"campaign_ids": campaign_ids})
+        clicks_stmt = text(
+            """
+            SELECT cl.id, cl.ref_code, cl.affiliate_pubkey, cl.landing_url, cl.created_at,
+                   c.name AS campaign_name
+            FROM clicks cl JOIN campaigns c ON c.id=cl.campaign_id
+            WHERE cl.campaign_id IN :campaign_ids
+            ORDER BY cl.created_at DESC LIMIT 50
+            """
+        ).bindparams(bindparam("campaign_ids", expanding=True))
+        clicks = _rows(connection, clicks_stmt, {"campaign_ids": campaign_ids})
+        enrollments_stmt = text(
+            """
+            SELECT e.id, e.affiliate_pubkey, e.affiliate_pubkey_hex, e.ref_code,
+                   e.status, e.created_at, c.name AS campaign_name
+            FROM enrollments e JOIN campaigns c ON c.id=e.campaign_id
+            WHERE e.campaign_id IN :campaign_ids
+            ORDER BY e.created_at DESC
+            """
+        ).bindparams(bindparam("campaign_ids", expanding=True))
+        enrollments = _rows(connection, enrollments_stmt, {"campaign_ids": campaign_ids})
+        shopify_sales_stmt = text(
+            """
+            SELECT d.currency, d.order_total_decimal, d.order_total
+            FROM shopify_webhook_deliveries d
+            JOIN conversions v ON v.id=d.conversion_id
+            WHERE d.status='processed' AND v.status='approved' AND v.campaign_id IN :campaign_ids
+            ORDER BY d.created_at
+            """
+        ).bindparams(bindparam("campaign_ids", expanding=True))
+        shopify_sale_rows = _rows(connection, shopify_sales_stmt, {"campaign_ids": campaign_ids})
+        totals_by_currency: dict[str, dict[str, Any]] = {}
+        for row in shopify_sale_rows:
+            currency = str(row.get("currency") or "").upper() or "USD"
+            bucket = totals_by_currency.setdefault(currency, {"currency": currency, "orders": 0, "total": Decimal("0")})
+            raw_total = row.get("order_total_decimal") or row.get("order_total") or "0"
+            try:
+                bucket["total"] += Decimal(str(raw_total))
+            except InvalidOperation:
+                continue
+            bucket["orders"] += 1
+        shopify_sales = [totals_by_currency[key] for key in sorted(totals_by_currency)]
         aggregate_stmt = text(
             """
             SELECT
               (SELECT COUNT(DISTINCT e.affiliate_pubkey_hex) FROM enrollments e WHERE e.campaign_id IN :campaign_ids) AS affiliates,
+              (SELECT COUNT(*) FROM clicks cl WHERE cl.campaign_id IN :campaign_ids) AS clicks,
               (SELECT COUNT(*) FROM conversions v WHERE v.campaign_id IN :campaign_ids AND v.status='approved') AS conversions,
               (SELECT COALESCE(SUM(v.commission_sats),0) FROM conversions v WHERE v.campaign_id IN :campaign_ids AND v.status='approved') AS commission_sats,
               (SELECT COUNT(*) FROM payouts p JOIN conversions v ON v.id=p.conversion_id
@@ -90,6 +146,22 @@ def merchant_workspace_data(connection: Any, session: dict[str, Any], *, base_ur
 
     for campaign in campaigns:
         campaign["commission_percent"] = f"{int(campaign['commission_bps']) / 100:g}"
+    for click in clicks:
+        click["affiliate_short"] = short(click.get("affiliate_pubkey"))
+        click["id_short"] = short(click.get("id"), 10, 6)
+    for enrollment in enrollments:
+        enrollment["affiliate_npub"] = str(enrollment.get("affiliate_pubkey") or enrollment.get("affiliate_pubkey_hex") or "")
+        enrollment["affiliate_short"] = short(enrollment["affiliate_npub"])
+    for sale in shopify_sales:
+        sale["display"] = money_display(sale.get("total"), str(sale.get("currency") or ""))
+        sale["orders"] = int(sale.get("orders") or 0)
+    primary_sale = next(
+        (sale for sale in shopify_sales if sale.get("currency") == "USD"),
+        shopify_sales[0] if shopify_sales else None,
+    )
+    other_sales = [sale for sale in shopify_sales if sale is not primary_sale]
+    shopify_orders = int(primary_sale["orders"]) if primary_sale else 0
+    shopify_orders_total = sum(sale["orders"] for sale in shopify_sales)
     for payout in payouts:
         payout["affiliate_short"] = short(payout.get("affiliate_pubkey"))
         payout["user_state"] = payout_user_state(payout.get("state"))
@@ -109,12 +181,15 @@ def merchant_workspace_data(connection: Any, session: dict[str, Any], *, base_ur
 
     return {
         "campaigns": campaigns,
+        "clicks": clicks,
+        "enrollments": enrollments,
         "conversions": conversions,
         "payouts": payouts,
         "totals": {
             "campaigns": len(campaigns),
             "active_campaigns": sum(1 for row in campaigns if row.get("status") == "active"),
             "affiliates": int(totals.get("affiliates") or 0),
+            "clicks": int(totals.get("clicks") or 0),
             "conversions": int(totals.get("conversions") or 0),
             "commission_sats": int(totals.get("commission_sats") or 0),
             "actionable_payouts": int(totals.get("actionable_payouts") or 0),
@@ -122,6 +197,11 @@ def merchant_workspace_data(connection: Any, session: dict[str, Any], *, base_ur
         "integration": {
             "shopify_ready": shopify_ready,
             "shopify_detail": shopify_detail,
+            "shopify_sales": shopify_sales,
+            "shopify_sales_primary_display": primary_sale["display"] if primary_sale else "$0.00",
+            "shopify_sales_other": other_sales,
+            "shopify_orders": shopify_orders,
+            "shopify_orders_total": shopify_orders_total,
             "tracking_events": tracking_events,
         },
     }

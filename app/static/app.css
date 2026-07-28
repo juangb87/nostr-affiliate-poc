@@ -276,6 +276,28 @@ h3 { margin: 0; font-size: 16px; }
 .integration-card { min-width: 0; padding: 19px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow); }
 .integration-card p { margin: 7px 0 0; color: var(--muted); font-size: 13px; line-height: 1.55; }
 .integration-card .badge { margin-top: 13px; }
+
+.merchant-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.section-count { color: var(--sage); font-family: var(--mono); font-size: 12px; white-space: nowrap; }
+.identity-record { grid-template-columns: minmax(280px, 2fr) minmax(130px, .7fr) auto auto; }
+.click-record { grid-template-columns: minmax(190px, 1fr) minmax(130px, .6fr) minmax(150px, .7fr) minmax(180px, 1fr); }
+.identity-code { display: block; max-width: 100%; overflow-wrap: anywhere; color: var(--arena); font-family: var(--mono); font-size: 12px; line-height: 1.6; }
+.landing-url { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.copy-action { min-height: 36px; padding: 7px 11px; appearance: none; border: 1px solid var(--line-strong); background: transparent; color: var(--sage); cursor: pointer; font: 500 11px var(--mono); white-space: nowrap; }
+.copy-action:hover { border-color: var(--sage); background: rgba(156, 201, 126, .08); }
+.installation-grid { display: grid; gap: 16px; margin-top: 16px; }
+.installation-card { min-width: 0; padding: 20px; border: 1px solid var(--line); background: var(--surface); }
+.installation-card > small { display: block; margin-top: 12px; color: var(--muted); line-height: 1.55; }
+.installation-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; margin-bottom: 15px; }
+.installation-head > div { display: flex; align-items: flex-start; gap: 14px; min-width: 0; }
+.installation-head h3 { margin: 0 0 5px; }
+.installation-head p { margin: 0; max-width: 760px; color: var(--muted); font-size: 13px; line-height: 1.55; }
+.step-number { display: grid; flex: 0 0 34px; width: 34px; height: 34px; place-items: center; border: 1px solid var(--sage); color: var(--sage); font-family: var(--mono); font-size: 11px; }
+.code-block { max-height: 360px; margin: 0; padding: 16px; overflow: auto; border: 1px solid var(--line); background: var(--night); color: var(--arena-soft); direction: ltr; text-align: left; }
+.code-block code { display: block; white-space: pre; font-family: var(--mono); font-size: 11px; line-height: 1.65; }
+.endpoint-code { display: block; padding: 14px; overflow-wrap: anywhere; border: 1px solid var(--line); background: var(--night); color: var(--sage); }
+.webhook-card { border-color: var(--sage-deep); }
+
 .merchant-logo-preview, .merchant-logo-placeholder { width: 82px; height: 82px; border: 1px solid var(--line); border-radius: 13px; background: #fff; }
 .merchant-logo-preview { object-fit: contain; }
 .merchant-logo-placeholder { display: grid; place-items: center; background: linear-gradient(145deg, #fff1ed, #fff); color: var(--orange-dark); font: 800 24px var(--heading); }
@@ -358,6 +380,7 @@ h3 { margin: 0; font-size: 16px; }
 
 @media (max-width: 680px) {
   .main { padding: 22px 15px 52px; }
+  .section { scroll-margin-top: 150px; }
   .page-header { display: block; }
   .header-actions { margin-top: 18px; }
   .metrics { grid-template-columns: 1fr; gap: 10px; }
@@ -381,6 +404,12 @@ h3 { margin: 0; font-size: 16px; }
   .role-card { min-height: auto; }
   .section-head { display: block; }
   .section-head p { margin-top: 6px; }
+  .section-count { display: block; margin-top: 8px; }
+  .installation-head, .installation-head > div { display: block; }
+  .installation-head .step-number { margin-bottom: 10px; }
+  .installation-head .button { width: 100%; margin-top: 14px; }
+  .installation-card { padding: 16px; }
+  .code-block { max-height: 300px; padding: 13px; }
   .mobile-account code { display: none; }
   .mobile-bar { padding-inline: 15px; }
   .login-shell { padding: 18px 14px; }

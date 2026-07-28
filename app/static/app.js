@@ -243,17 +243,20 @@ document.addEventListener("click", async (event) => {
     }
     return;
   }
-  const copy = event.target.closest("[data-copy]");
+  const copy = event.target.closest("[data-copy], [data-copy-target]");
   if (copy) {
     const original = copy.textContent;
     const globalStatus = document.querySelector("[data-global-status]");
+    const target = copy.dataset.copyTarget ? document.querySelector(copy.dataset.copyTarget) : null;
+    const copyValue = target ? target.textContent : copy.dataset.copy;
     try {
-      await navigator.clipboard.writeText(copy.dataset.copy);
+      if (!copyValue) throw new Error("No hay contenido para copiar");
+      await navigator.clipboard.writeText(copyValue);
       copy.textContent = "Copiado";
-      if (globalStatus) globalStatus.textContent = "Enlace copiado";
+      if (globalStatus) globalStatus.textContent = "Contenido copiado";
     } catch (_) {
       copy.textContent = "Copiá manualmente";
-      if (globalStatus) globalStatus.textContent = "No se pudo copiar el enlace automáticamente";
+      if (globalStatus) globalStatus.textContent = "No se pudo copiar automáticamente";
     }
     setTimeout(() => { copy.textContent = original; }, 1800);
     return;

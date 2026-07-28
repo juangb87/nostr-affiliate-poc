@@ -1,6 +1,9 @@
 from fastapi.testclient import TestClient
+from sqlalchemy import text
 
-from app.main import app
+from app import main
+
+app = main.app
 
 
 def event_payload() -> dict:
@@ -93,6 +96,75 @@ def test_legacy_bumbei_routes_remain_working_aliases(tmp_path, monkeypatch):
     status = client.get("/bumbei/status")
     assert status.status_code == 200
     assert status.json()["total_events"] == 2
+
+
+def test_tracking_minimizes_sensitive_browser_payload_and_rejects_mismatched_attribution(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path}/privacy.db")
+    main._ENGINE = None
+    main._ENGINE_URL = None
+    main.init_db()
+    with main.engine().begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO clicks (id, ref_code, campaign_id, affiliate_pubkey, landing_url, created_at)
+                VALUES ('clk_private', 'ref_actual', 'camp_private', 'npub_private',
+                        'https://merchant.example/', :created_at)
+                """
+            ),
+            {"created_at": main.now()},
+        )
+    client = TestClient(app)
+
+    mismatch = client.post(
+        "/v1/events",
+        json={"type": "page_view", "bb_ref": "ref_other", "bb_click_id": "clk_private", "path": "/shop"},
+    )
+    assert mismatch.status_code == 400
+
+    conversion = client.post(
+        "/v1/conversions",
+        json={
+            "type": "checkout_completed",
+            "bb_ref": "ref_actual",
+            "bb_click_id": "clk_private",
+            "order_id": "sensitive-order-123",
+            "checkout_token": "sensitive-checkout-token",
+            "url": "https://merchant.example/thank-you?email=buyer@example.com&token=secret",
+            "referrer": "https://merchant.example/checkout?token=other-secret",
+            "path": "/thank-you",
+            "user_agent": "private-browser-fingerprint",
+            "total_price": "42.50",
+            "currency": "USD",
+            "metadata": {"event_id": "pixel-event-1", "source": "shopify_custom_pixel", "private": "drop-me"},
+        },
+    )
+    assert conversion.status_code == 200
+    with main.engine().connect() as connection:
+        row = dict(
+            connection.execute(
+                text("SELECT * FROM tracking_events WHERE id=:id"), {"id": conversion.json()["event_id"]}
+            ).one()._mapping
+        )
+    assert row["order_id_hash"] == main.sha("sensitive-order-123")
+    assert row["checkout_token_hash"] == main.sha("sensitive-checkout-token")
+    assert row["url"] == "https://merchant.example/thank-you"
+    assert row["referrer"] == "https://merchant.example/checkout"
+    assert "sensitive-order-123" not in row["payload_json"]
+    assert "sensitive-checkout-token" not in row["payload_json"]
+    assert "buyer@example.com" not in row["payload_json"]
+    assert "private-browser-fingerprint" not in row["payload_json"]
+    assert "drop-me" not in row["payload_json"]
+    assert "pixel-event-1" in row["payload_json"]
+
+
+def test_tracking_cors_includes_configured_shopify_store(monkeypatch):
+    monkeypatch.setenv("TRACKING_CORS_ORIGINS", "https://lightningkoffee.io")
+    monkeypatch.setenv("SHOPIFY_STORE_DOMAIN", "6c12wg-re.myshopify.com")
+    origins = main.tracking_cors_origins()
+    assert "https://lightningkoffee.io" in origins
+    assert "https://6c12wg-re.myshopify.com" in origins
+    assert "null" in origins
 
 
 def test_absolute_redirect_url():

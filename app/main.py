@@ -107,6 +107,13 @@ def tracking_cors_origins() -> list[str]:
         "https://shapersfit.com,https://www.shapersfit.com,https://shapersfit.myshopify.com",
     )
     origins = [origin.strip() for origin in raw.split(",") if origin.strip()]
+    shop = os.getenv("SHOPIFY_STORE_DOMAIN", "").strip().lower().rstrip("/")
+    if "://" in shop:
+        shop = shop.split("://", 1)[1]
+    if re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,252}", shop):
+        shop_origin = f"https://{shop}"
+        if shop_origin not in origins:
+            origins.append(shop_origin)
     # Shopify Custom Pixels run in a strict sandbox with an opaque origin,
     # serialized by browsers as the literal Origin header value "null".
     if "null" not in origins:
@@ -2350,6 +2357,19 @@ def _request_ip(request: Request) -> str:
     return forwarded or (request.client.host if request.client else "unknown")
 
 
+def _tracking_safe_url(value: Any, max_length: int) -> str | None:
+    raw = safe_text(value, max_length)
+    if not raw:
+        return None
+    try:
+        parsed = urlparse(raw)
+    except ValueError:
+        return None
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return None
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path or "/", "", "", ""))
+
+
 def store_tracking_event(kind: str, body: BrowserEventIn | BrowserConversionIn, request: Request) -> dict[str, Any]:
     init_db()
     ref_code = _tracking_ref(body)
@@ -2357,7 +2377,6 @@ def store_tracking_event(kind: str, body: BrowserEventIn | BrowserConversionIn, 
     if not ref_code and not click_id:
         raise HTTPException(400, "missing bb_ref or bb_click_id")
 
-    payload = body.model_dump(mode="json")
     event_id = hid("evt")
     user_agent = safe_text(getattr(body, "user_agent", None) or request.headers.get("user-agent", ""), 500)
     order_id = safe_text(getattr(body, "order_id", None), 300)
@@ -2370,8 +2389,28 @@ def store_tracking_event(kind: str, body: BrowserEventIn | BrowserConversionIn, 
 
     with engine().begin() as c:
         click = asdict(c.execute(text("SELECT * FROM clicks WHERE id=:id"), {"id": click_id}).fetchone()) if click_id else None
-        if click and not ref_code:
+        if click:
+            if ref_code and ref_code != click["ref_code"]:
+                raise HTTPException(400, "bb_ref does not match bb_click_id")
             ref_code = click["ref_code"]
+        raw_metadata = getattr(body, "metadata", None) or {}
+        safe_metadata = {
+            key: safe_text(raw_metadata.get(key), 200)
+            for key in ("event_id", "source")
+            if safe_text(raw_metadata.get(key), 200)
+        }
+        payload = {
+            "type": safe_text(getattr(body, "type", None) or kind, 80),
+            "shop": safe_text(getattr(body, "shop", None), 120) or None,
+            "bb_ref": ref_code or None,
+            "bb_click_id": click_id or None,
+            "path": safe_text(getattr(body, "path", None), 1000) or None,
+            "order_total": order_total,
+            "currency": safe_text(getattr(body, "currency", None), 20).upper() or None,
+            "ts": safe_text(getattr(body, "ts", None), 80) or None,
+            "metadata": safe_metadata,
+        }
+        payload = {key: value for key, value in payload.items() if value not in (None, {}, "")}
         c.execute(
             text(
                 """
@@ -2390,9 +2429,9 @@ def store_tracking_event(kind: str, body: BrowserEventIn | BrowserConversionIn, 
                 "ref_code": ref_code or None,
                 "click_id": click_id or None,
                 "shop": safe_text(getattr(body, "shop", None), 120) or None,
-                "url": safe_text(getattr(body, "url", None), 3000) or None,
+                "url": _tracking_safe_url(getattr(body, "url", None), 3000),
                 "path": safe_text(getattr(body, "path", None), 1000) or None,
-                "referrer": safe_text(getattr(body, "referrer", None), 2000) or None,
+                "referrer": _tracking_safe_url(getattr(body, "referrer", None), 2000),
                 "order_id_hash": sha(order_id) if order_id else None,
                 "order_name": safe_text(getattr(body, "order_name", None), 200) or None,
                 "checkout_token_hash": sha(checkout_token) if checkout_token else None,
@@ -2660,6 +2699,96 @@ def normalized_shopify_store_domain() -> str:
     if "://" in raw:
         raw = raw.split("://", 1)[1]
     return raw
+
+
+def shopify_installation_snippets(base_url: str, shop_domain: str) -> dict[str, str]:
+    endpoint = base_url.rstrip("/")
+    parsed_endpoint = urlparse(endpoint)
+    if parsed_endpoint.scheme not in {"http", "https"} or not parsed_endpoint.hostname:
+        endpoint = "http://localhost:8000"
+    safe_shop = shop_domain if re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,252}", shop_domain or "") else "<store>.myshopify.com"
+    events_url_literal = json.dumps(f"{endpoint}/v1/events")
+    conversions_url_literal = json.dumps(f"{endpoint}/v1/conversions")
+    shop_literal = json.dumps(safe_shop)
+    theme_script = """<script>
+(function () {
+  function param(name) { return new URLSearchParams(window.location.search).get(name); }
+  function setCookie(name, value) {
+    if (!value) return;
+    var expires = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toUTCString();
+    document.cookie = name + "=" + encodeURIComponent(value) + "; expires=" + expires + "; path=/; SameSite=Lax";
+  }
+  function getCookie(name) {
+    var match = document.cookie.match(new RegExp("(?:^|; )" + name + "=([^;]*)"));
+    return match ? decodeURIComponent(match[1]) : "";
+  }
+
+  var ref = param("bb_ref") || param("bumbei_ref") || param("ref") || param("affiliate");
+  var clickId = param("bb_click_id") || param("click_id");
+  if (ref) { setCookie("bb_ref", ref); setCookie("bumbei_ref", ref); }
+  if (clickId) setCookie("bb_click_id", clickId);
+
+  ref = ref || getCookie("bb_ref") || getCookie("bumbei_ref");
+  clickId = clickId || getCookie("bb_click_id");
+  if (!ref && !clickId) return;
+
+  fetch("/cart/update.js", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ attributes: { bb_ref: ref || "", bb_click_id: clickId || "" } })
+  }).catch(function () {});
+
+  fetch(__EVENTS_URL__, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    keepalive: true,
+    body: JSON.stringify({
+      type: "page_view",
+      shop: __SHOP_LITERAL__,
+      bb_ref: ref || null,
+      bb_click_id: clickId || null,
+      path: window.location.pathname,
+      ts: new Date().toISOString()
+    })
+  }).catch(function () {});
+})();
+</script>""".replace("__EVENTS_URL__", events_url_literal).replace("__SHOP_LITERAL__", shop_literal)
+    custom_pixel = """analytics.subscribe("checkout_completed", async (event) => {
+  const checkout = event.data && event.data.checkout ? event.data.checkout : {};
+  async function cookie(names) {
+    for (const name of names) {
+      const value = await browser.cookie.get(name);
+      if (value) return value;
+    }
+    return null;
+  }
+
+  const ref = await cookie(["bb_ref", "bumbei_ref"]);
+  const clickId = await cookie(["bb_click_id", "click_id"]);
+  if (!ref && !clickId) return;
+
+  await fetch(__CONVERSIONS_URL__, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      type: "checkout_completed",
+      shop: __SHOP_LITERAL__,
+      bb_ref: ref,
+      bb_click_id: clickId,
+      order_id: checkout.order && checkout.order.id ? String(checkout.order.id) : null,
+      total_price: checkout.totalPrice && checkout.totalPrice.amount ? checkout.totalPrice.amount : null,
+      currency: checkout.currencyCode || null,
+      ts: event.timestamp || new Date().toISOString(),
+      metadata: { event_id: event.id || null, source: "shopify_custom_pixel" }
+    })
+  });
+});""".replace("__CONVERSIONS_URL__", conversions_url_literal).replace("__SHOP_LITERAL__", shop_literal)
+    return {
+        "theme_script": theme_script,
+        "custom_pixel": custom_pixel,
+        "webhook_url": f"{endpoint}/shopify/webhooks/orders-paid",
+        "shop_domain": safe_shop,
+    }
 
 
 def verify_shopify_webhook(raw_body: bytes, signature: str) -> None:
@@ -4954,12 +5083,17 @@ def merchant_account_page(request: Request) -> Response:
         context={
             **data,
             "bootstrap_tenants": bootstrap_tenants,
+            "shopify_installation": shopify_installation_snippets(
+                BASE_URL, normalized_shopify_store_domain()
+            ) if owns_shopify_store else None,
             "program_defaults": _merchant_default_program(),
             "account": _account_shell(session, "merchant"),
             "role_label": "Merchant account",
             "nav": [
                 {"label": "Resumen", "href": "/app/merchant", "active": True},
                 {"label": "Campañas", "href": "#campaigns", "active": False},
+                {"label": "Afiliados", "href": "#affiliates", "active": False},
+                {"label": "Clicks", "href": "#clicks", "active": False},
                 {"label": "Actividad", "href": "#activity", "active": False},
                 {"label": "Pagos", "href": "#payouts", "active": False},
                 {"label": "Integración", "href": "#integration", "active": False},

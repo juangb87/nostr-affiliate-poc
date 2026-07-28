@@ -121,7 +121,7 @@ def test_login_frontend_preserves_role_card_markup_and_formats_structured_signer
     login_page = client.get("/app?role=merchant")
 
     assert script.status_code == 200
-    assert '/static/app.js?v=20260728-merchant-form1' in login_page.text
+    assert '/static/app.js?v=20260728-merchant-insights1' in login_page.text
     assert "function readableError(error" in script.text
     assert 'value === "[object Object]"' in script.text
     assert "new Error(readableError(data.detail" in script.text
@@ -162,7 +162,7 @@ def test_login_frontend_rejects_empty_or_invalid_signer_responses_before_verify(
     assert "NostrKey no devolvió un evento firmado" in script.text
     assert "requireSignedNostrEvent(await window.nostr.signEvent(unsignedEvent))" in script.text
     assert 'JSON.stringify({event})' in script.text
-    assert '/static/app.js?v=20260728-merchant-form1' in login_page.text
+    assert '/static/app.js?v=20260728-merchant-insights1' in login_page.text
 
 
 def test_nostr_login_issues_http_only_session_and_logout(tmp_path, monkeypatch):
@@ -1297,6 +1297,75 @@ def test_workspace_kpis_exclude_reversed_conversions(tmp_path, monkeypatch):
         )
     assert affiliate_data["totals"]["conversions"] == 1
     assert affiliate_data["totals"]["gross_sats"] == 100
+
+
+def test_merchant_dashboard_exposes_clicks_affiliate_npubs_shopify_sales_and_copyable_installation_code(tmp_path, monkeypatch):
+    monkeypatch.setenv("SHOPIFY_STORE_DOMAIN", "pilot-shop.myshopify.com")
+    client = configured_client(tmp_path, monkeypatch)
+    merchant = Keys.generate()
+    monkeypatch.setenv("SHOPIFY_MERCHANT_PUBKEY", merchant.public_key().to_bech32())
+    affiliate_a = Keys.generate()
+    affiliate_b = Keys.generate()
+    other_merchant = Keys.generate()
+    other_affiliate = Keys.generate()
+
+    campaign = create_campaign(client, merchant, name="Pilot program")
+    enrollment_a = create_enrollment(client, campaign["campaign_id"], affiliate_a)
+    create_enrollment(client, campaign["campaign_id"], affiliate_b)
+    payout_id = seed_payable_payout(campaign, enrollment_a, affiliate_a, amount_sats=320)
+
+    other_campaign = create_campaign(client, other_merchant, name="Other private program")
+    create_enrollment(client, other_campaign["campaign_id"], other_affiliate)
+
+    timestamp = main.now()
+    with main.engine().begin() as connection:
+        conversion_id = connection.execute(
+            text("SELECT conversion_id FROM payouts WHERE id=:id"), {"id": payout_id}
+        ).scalar_one()
+        connection.execute(
+            text("UPDATE conversions SET order_total=149.50, order_total_decimal='149.50', currency='USD' WHERE id=:id"),
+            {"id": conversion_id},
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO shopify_webhook_deliveries
+                  (webhook_id, order_key, shop_domain, topic, click_id, order_total,
+                   order_total_decimal, currency, status, conversion_id, error, created_at, processed_at)
+                VALUES
+                  ('wh_dashboard', 'order_dashboard', 'pilot-shop.myshopify.com', 'orders/paid',
+                   :click_id, 149.50, '149.50', 'USD', 'processed', :conversion_id, NULL,
+                   :created_at, :processed_at)
+                """
+            ),
+            {
+                "click_id": connection.execute(
+                    text("SELECT click_id FROM conversions WHERE id=:id"), {"id": conversion_id}
+                ).scalar_one(),
+                "conversion_id": conversion_id,
+                "created_at": timestamp,
+                "processed_at": timestamp,
+            },
+        )
+
+    login(client, merchant, "merchant")
+    page = client.get("/app/merchant")
+
+    assert page.status_code == 200
+    assert "Clicks" in page.text
+    assert "Compras Shopify" in page.text
+    assert "$149.50" in page.text
+    assert affiliate_a.public_key().to_bech32() in page.text
+    assert affiliate_b.public_key().to_bech32() in page.text
+    assert other_affiliate.public_key().to_bech32() not in page.text
+    assert "Shopify Theme Script" in page.text
+    assert "Shopify Custom Pixel" in page.text
+    assert "https://testserver/v1/events" in page.text
+    assert "https://testserver/v1/conversions" in page.text
+    assert "pilot-shop.myshopify.com" in page.text
+    assert "/cart/update.js" in page.text
+    assert 'data-copy-target="#shopify-theme-script"' in page.text
+    assert 'data-copy-target="#shopify-custom-pixel"' in page.text
 
 
 def test_affiliate_updates_lightning_address_and_only_safe_pending_payouts(tmp_path, monkeypatch):
