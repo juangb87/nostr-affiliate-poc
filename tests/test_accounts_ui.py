@@ -118,8 +118,10 @@ def test_login_frontend_preserves_role_card_markup_and_formats_structured_signer
     client = configured_client(tmp_path, monkeypatch)
 
     script = client.get("/static/app.js")
+    login_page = client.get("/app?role=merchant")
 
     assert script.status_code == 200
+    assert '/static/app.js?v=20260728-safari-errors1' in login_page.text
     assert "function readableError(error" in script.text
     assert 'value === "[object Object]"' in script.text
     assert "new Error(readableError(data.detail" in script.text
