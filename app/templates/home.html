@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="es" data-theme="night" data-lang="es">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Meerat conecta merchants y affiliates con atribución vinculada a Nostr, liquidación Lightning no custodial y receipts con evidencia declarada.">
+  <meta name="theme-color" content="#141914">
+  <title>Meerat · Affiliate commerce on Nostr</title>
+  <link rel="icon" href="/static/brand/favicon.svg?v=salvia-8a1" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/home.css?v=20260728-salvia-home1">
+  <script src="/static/home.js?v=20260728-salvia-home1" defer></script>
+</head>
+<body>
+
+<a class="skip-link" href="#main-content"><span data-copy-lang="es">Saltar al contenido</span><span data-copy-lang="en">Skip to content</span></a>
+  <header class="shell">
+    <nav class="nav" aria-label="Navegación principal" data-label-es="Navegación principal" data-label-en="Main navigation">
+      <a class="brand" href="/" aria-label="Meerat inicio" data-label-es="Meerat inicio" data-label-en="Meerat home">
+        <img class="night-logo" src="/static/brand/wordmark-night.png?v=salvia-8a1" width="1428" height="648" alt="Meerat">
+        <img class="arena-logo" src="/static/brand/wordmark-arena.png?v=salvia-home1" width="1428" height="648" alt="Meerat">
+      </a>
+      <div class="nav-actions">
+        <div class="switch theme-switch" role="group" aria-label="Tema" data-label-es="Tema" data-label-en="Theme">
+          <button type="button" data-theme-button="night" data-text-es="Noche" data-text-en="Night" data-short="N" aria-pressed="true">Noche</button>
+          <button type="button" data-theme-button="arena" data-text-es="Arena" data-text-en="Arena" data-short="A" aria-pressed="false">Arena</button>
+        </div>
+        <div class="switch" role="group" aria-label="Idioma" data-label-es="Idioma" data-label-en="Language">
+          <button type="button" data-language="es" aria-pressed="true">ES</button>
+          <button type="button" data-language="en" aria-pressed="false">EN</button>
+        </div>
+        <a class="nav-login" href="/app"><span data-copy-lang="es">Entrar</span><span data-copy-lang="en">Sign in</span></a>
+      </div>
+    </nav>
+  </header>
+
+  <main id="main-content">
+    <section class="hero shell">
+      <div class="hero-copy">
+        <p class="eyebrow">
+          <span data-copy-lang="es">Comercio afiliado sobre Nostr</span>
+          <span data-copy-lang="en">Affiliate commerce on Nostr</span>
+        </p>
+        <h1 data-copy-lang="es">Cada venta deja una <em>firma.</em></h1>
+        <h1 data-copy-lang="en">Every sale leaves a <em>signature.</em></h1>
+        <p class="lede" data-copy-lang="es">Meerat conecta merchants y affiliates con atribución vinculada a Nostr, liquidación Lightning no custodial y receipts con evidencia declarada.</p>
+        <p class="lede" data-copy-lang="en">Meerat connects merchants and affiliates through Nostr-linked attribution, non-custodial Lightning settlement, and receipts with disclosed evidence.</p>
+        <div class="hero-actions">
+          <a class="button" href="/app?role=merchant">
+            <span data-copy-lang="es">Entrar como Merchant</span><span data-copy-lang="en">Enter as Merchant</span>
+            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14M14 7l5 5-5 5" stroke="currentColor" stroke-width="2"/></svg>
+          </a>
+          <a class="button secondary" href="/app?role=affiliate"><span data-copy-lang="es">Entrar como Affiliate</span><span data-copy-lang="en">Enter as Affiliate</span></a>
+        </div>
+        <div class="signature" aria-hidden="true"><span></span><span></span><span></span></div>
+      </div>
+
+      <div class="proof-wrap" id="proof">
+        <article class="proof" aria-label="Ejemplo de payout receipt" data-label-es="Ejemplo de payout receipt" data-label-en="Example payout receipt">
+          <div class="proof-top">
+            <div><p class="proof-kicker"><span data-copy-lang="es">Receipt de payout · ejemplo</span><span data-copy-lang="en">Payout receipt · example</span></p><h2><span data-copy-lang="es">Recompensa Affiliate</span><span data-copy-lang="en">Affiliate reward</span></h2></div>
+            <span class="status"><span data-copy-lang="es">ejemplo</span><span data-copy-lang="en">example</span></span>
+          </div>
+          <div class="amount"><strong>21,480 sats</strong><span data-copy-lang="es">Comisión sobre una compra de USD 128.40</span><span data-copy-lang="en">Commission on a USD 128.40 purchase</span></div>
+          <div class="proof-grid">
+            <div class="proof-cell"><span class="label">Nostr kind</span><span class="value">2802</span></div>
+            <div class="proof-cell"><span class="label"><span data-copy-lang="es">Evidencia</span><span data-copy-lang="en">Evidence</span></span><span class="value">merchant_attestation</span></div>
+            <div class="proof-cell wide"><span class="label"><span data-copy-lang="es">Referencia del evento</span><span data-copy-lang="en">Event reference</span></span><span class="value">example-event-2802</span></div>
+            <div class="proof-cell"><span class="label"><span data-copy-lang="es">Modo de pago</span><span data-copy-lang="en">Payment mode</span></span><span class="value">non-sandbox</span></div>
+            <div class="proof-cell"><span class="label"><span data-copy-lang="es">Fuente del claim</span><span data-copy-lang="en">Claim source</span></span><span class="value">signed event</span></div>
+          </div>
+          <div class="relay-row"><div class="relay-dots" aria-label="2 de 3 relays confirmados" data-label-es="2 de 3 relays confirmados" data-label-en="2 of 3 relays acknowledged"><i></i><i></i><i></i></div><span data-copy-lang="es">2 / 3 relays · 1 reintentando</span><span data-copy-lang="en">2 / 3 relays · 1 retrying</span></div>
+          <p class="proof-note" data-copy-lang="es">Ejemplo ilustrativo: una atestación del merchant no equivale a evidencia trustless de settlement. No se expone ningún preimage.</p>
+          <p class="proof-note" data-copy-lang="en">Illustrative example: a merchant attestation is not trustless settlement evidence. No preimage is disclosed.</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="shell">
+        <div class="section-head">
+          <h2 data-copy-lang="es">Una señal clara en cada paso.</h2>
+          <h2 data-copy-lang="en">A clear signal at every step.</h2>
+          <p data-copy-lang="es">La firma segmentada se convierte en sistema: atribuir, pagar y verificar. Sin dashboards opacos ni promesas que la evidencia no puede sostener.</p>
+          <p data-copy-lang="en">The segmented signature becomes a system: attribute, pay, verify. No opaque dashboards or claims the evidence cannot support.</p>
+        </div>
+        <div class="journey">
+          <article class="step"><div class="step-number"><span>01</span></div><h3 data-copy-lang="es">Atribuir</h3><h3 data-copy-lang="en">Attribute</h3><p data-copy-lang="es">Un click referido viaja con la compra y queda vinculado a una identidad Nostr.</p><p data-copy-lang="en">A referred click travels with the purchase and is bound to a Nostr identity.</p></article>
+          <article class="step"><div class="step-number"><span>02</span></div><h3 data-copy-lang="es">Pagar</h3><h3 data-copy-lang="en">Pay</h3><p data-copy-lang="es">El merchant liquida la comisión desde su propia wallet Lightning. Meerat no custodia fondos.</p><p data-copy-lang="en">The merchant settles the commission from their own Lightning wallet. Meerat never holds funds.</p></article>
+          <article class="step"><div class="step-number"><span>03</span></div><h3 data-copy-lang="es">Verificar</h3><h3 data-copy-lang="en">Verify</h3><p data-copy-lang="es">El receipt enlaza monto, campaña, identidades y evidencia firmada sin exagerar su nivel de confianza.</p><p data-copy-lang="en">The receipt binds amount, campaign, identities, and signed evidence without overstating its trust level.</p></article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="roles">
+      <div class="shell">
+        <div class="section-head">
+          <h2 data-copy-lang="es">Dos roles. Una red abierta.</h2><h2 data-copy-lang="en">Two roles. One open network.</h2>
+          <p data-copy-lang="es">Cada persona ve lo que necesita. El merchant controla campañas y pagos; el affiliate sigue atribución, earnings y receipts.</p><p data-copy-lang="en">Each person sees what they need. Merchants control campaigns and payouts; affiliates track attribution, earnings, and receipts.</p>
+        </div>
+        <div class="roles">
+          <article class="role-card"><span class="role-tag">Merchant</span><h3 data-copy-lang="es">Convertí ventas en comunidad.</h3><h3 data-copy-lang="en">Turn sales into community.</h3><p data-copy-lang="es">Definí comisiones, aprobá affiliates y pagá desde tu wallet, sin ceder la custodia.</p><p data-copy-lang="en">Set commissions, approve affiliates, and pay from your wallet without giving up custody.</p><div class="role-ui"><div class="role-stat"><span data-copy-lang="es">Campaña</span><span data-copy-lang="en">Campaign</span><strong>Summer run</strong></div><div class="role-stat"><span data-copy-lang="es">Comisión</span><span data-copy-lang="en">Commission</span><strong>8%</strong></div><div class="role-stat"><span>Payout</span><strong class="amber"><span data-copy-lang="es">Listo · 21,480 sats</span><span data-copy-lang="en">Ready · 21,480 sats</span></strong></div></div></article>
+          <article class="role-card"><span class="role-tag">Affiliate</span><h3 data-copy-lang="es">Tu aporte, visible y verificable.</h3><h3 data-copy-lang="en">Your impact, visible and verifiable.</h3><p data-copy-lang="es">Compartí tu link, seguí conversiones y conservá un receipt firmado de cada recompensa.</p><p data-copy-lang="en">Share your link, track conversions, and keep a signed receipt for every reward.</p><div class="role-ui"><div class="role-stat"><span>Clicks</span><strong>184</strong></div><div class="role-stat"><span data-copy-lang="es">Ventas aprobadas</span><span data-copy-lang="en">Approved sales</span><strong>7</strong></div><div class="role-stat"><span data-copy-lang="es">Ganado</span><span data-copy-lang="en">Earned</span><strong class="amber">94,220 sats</strong></div></div></article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="shell trust">
+        <div class="trust-copy">
+          <h2 data-copy-lang="es">Prueba antes que promesa.</h2><h2 data-copy-lang="en">Proof before promise.</h2>
+          <p data-copy-lang="es">Meerat separa firma, publicación y settlement. Un receipt puede ser verificable sin afirmar que una evidencia limitada demuestra más de lo que realmente demuestra.</p><p data-copy-lang="en">Meerat separates signature, publication, and settlement. A receipt can be verifiable without claiming limited evidence proves more than it actually does.</p>
+          <ul class="truth-list">
+            <li><svg viewBox="0 0 24 24" fill="none"><path d="M5 12l4 4L19 6" stroke="currentColor" stroke-width="2"/></svg><span data-copy-lang="es">ID, firma y binding semántico verificados.</span><span data-copy-lang="en">ID, signature, and semantic binding verified.</span></li>
+            <li><svg viewBox="0 0 24 24" fill="none"><path d="M5 12l4 4L19 6" stroke="currentColor" stroke-width="2"/></svg><span data-copy-lang="es">Fuente de claims declarada: signed, mixed o local.</span><span data-copy-lang="en">Claim source disclosed: signed, mixed, or local.</span></li>
+            <li><svg viewBox="0 0 24 24" fill="none"><path d="M5 12l4 4L19 6" stroke="currentColor" stroke-width="2"/></svg><span data-copy-lang="es">Estado de publicación por relay visible, incluidos modo local, fallos y reintentos.</span><span data-copy-lang="en">Relay publication state visible, including local mode, failures, and retries.</span></li>
+          </ul>
+        </div>
+        <aside class="kind-panel"><span class="label"><span data-copy-lang="es">Kind de evento Nostr</span><span data-copy-lang="en">Nostr event kind</span></span><strong>2802</strong><p data-copy-lang="es">Payout proof de Meerat. Este es un ejemplo ilustrativo y no representa una transacción real.</p><p data-copy-lang="en">Meerat payout proof. This is an illustrative example and does not represent a real transaction.</p><div class="signature" aria-hidden="true"><span></span><span></span><span></span></div></aside>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="shell footer-row">
+      <div class="footer-brand"><img class="night-logo" src="/static/brand/wordmark-night.png?v=salvia-8a1" width="1428" height="648" alt="Meerat"><img class="arena-logo" src="/static/brand/wordmark-arena.png?v=salvia-home1" width="1428" height="648" alt="Meerat"><p class="footer-copy"><span data-copy-lang="es">Comercio abierto · Identidades Nostr · Recompensas Lightning</span><span data-copy-lang="en">Open commerce · Nostr identities · Lightning rewards</span></p></div>
+      <div class="footer-meta">PILOT POC · 2026<br>OPEN PROTOCOLS · NON-CUSTODIAL</div>
+    </div>
+  </footer>
+
+</body>
+</html>

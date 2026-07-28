@@ -129,6 +129,36 @@ def test_login_frontend_preserves_role_card_markup_and_formats_structured_signer
     assert "button.textContent = previous" not in script.text
 
 
+def test_salvia_homepage_is_the_public_root(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+
+    homepage = client.get("/", follow_redirects=False)
+    stylesheet = client.get("/static/home.css")
+    script = client.get("/static/home.js")
+    arena_wordmark = client.get("/static/brand/wordmark-arena.png")
+
+    assert homepage.status_code == 200
+    assert "Cada venta deja una" in homepage.text
+    assert "Every sale leaves a" in homepage.text
+    assert 'href="/app?role=merchant"' in homepage.text
+    assert 'href="/app?role=affiliate"' in homepage.text
+    assert 'href="/static/home.css?v=20260728-salvia-home1"' in homepage.text
+    assert 'src="/static/home.js?v=20260728-salvia-home1"' in homepage.text
+    assert "Concept preview" not in homepage.text
+    assert "not production" not in homepage.text
+    assert "atribución pública" not in homepage.text
+    assert 'role="group"' in homepage.text
+    assert "example-event-2802" in homepage.text
+    assert stylesheet.status_code == 200
+    assert "--night: #141914" in stylesheet.text
+    assert "--sage: #9cc97e" in stylesheet.text
+    assert "--sage-ink: #3f6b2d" in stylesheet.text
+    assert script.status_code == 200
+    assert "data-language" in script.text
+    assert "data-label-es" in script.text
+    assert arena_wordmark.status_code == 200
+
+
 def test_salvia_concept_brand_contract_is_served(tmp_path, monkeypatch):
     client = configured_client(tmp_path, monkeypatch)
 

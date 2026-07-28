@@ -6059,5 +6059,5 @@ def dashboard() -> Response:
 
 
 @app.get("/", response_class=HTMLResponse)
-def home() -> Response:
-    return RedirectResponse("/app", status_code=303)
+def home(request: Request) -> Response:
+    return templates.TemplateResponse(request=request, name="home.html", context={})
