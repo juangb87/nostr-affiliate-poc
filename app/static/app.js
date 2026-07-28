@@ -33,6 +33,23 @@ function readableError(error, fallback = "No se pudo completar la operación. In
   return messageFrom(error) || fallback;
 }
 
+function requireSignedNostrEvent(result) {
+  if (typeof result === "string") {
+    try { result = JSON.parse(result); } catch (_) { result = null; }
+  }
+  if (result && typeof result === "object" && result.event) {
+    result = result.event;
+  }
+  if (result && typeof result === "object" && (result.error || result.message)) {
+    throw new Error(readableError(result));
+  }
+  const required = ["id", "pubkey", "sig", "kind", "created_at", "tags", "content"];
+  if (!result || typeof result !== "object" || required.some(key => !(key in result))) {
+    throw new Error("NostrKey no devolvió un evento firmado. Verificá que esté desbloqueado y aprobá la solicitud de firma.");
+  }
+  return result;
+}
+
 let affiliateInvitationToken = null;
 
 function clearPreparedInvoice(form) {
@@ -96,7 +113,7 @@ async function loginWithNostr(role, button) {
       method: "POST", body: JSON.stringify({role})
     });
     status.textContent = "Confirmá la firma en tu extensión Nostr…";
-    const event = await window.nostr.signEvent({
+    const unsignedEvent = {
       kind: challenge.kind,
       created_at: Math.floor(Date.now() / 1000),
       tags: [
@@ -105,7 +122,8 @@ async function loginWithNostr(role, button) {
         ["role", challenge.role]
       ],
       content: ""
-    });
+    };
+    const event = requireSignedNostrEvent(await window.nostr.signEvent(unsignedEvent));
     status.textContent = "Validando identidad…";
     const result = await jsonFetch("/auth/nostr/verify", {
       method: "POST", body: JSON.stringify({event})
@@ -150,7 +168,7 @@ document.addEventListener("click", async (event) => {
         ],
         content: ""
       };
-      const signedEvent = await window.nostr.signEvent(eventToSign);
+      const signedEvent = requireSignedNostrEvent(await window.nostr.signEvent(eventToSign));
       status.textContent = "Creando tu enrollment y link único…";
       const result = await jsonFetch("/invite/accept", {
         method: "POST", body: JSON.stringify({token, event: signedEvent})

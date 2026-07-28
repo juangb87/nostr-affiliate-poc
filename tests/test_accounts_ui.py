@@ -121,12 +121,29 @@ def test_login_frontend_preserves_role_card_markup_and_formats_structured_signer
     login_page = client.get("/app?role=merchant")
 
     assert script.status_code == 200
-    assert '/static/app.js?v=20260728-safari-errors1' in login_page.text
+    assert '/static/app.js?v=20260728-safari-signer1' in login_page.text
     assert "function readableError(error" in script.text
     assert 'value === "[object Object]"' in script.text
     assert "new Error(readableError(data.detail" in script.text
     assert "status.textContent = readableError(error)" in script.text
     assert "button.textContent = previous" not in script.text
+
+
+def test_login_frontend_rejects_empty_or_invalid_signer_responses_before_verify(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+
+    script = client.get("/static/app.js")
+    login_page = client.get("/app?role=merchant")
+
+    assert script.status_code == 200
+    assert "function requireSignedNostrEvent(result)" in script.text
+    assert 'typeof result === "string"' in script.text
+    assert 'result = result.event' in script.text
+    assert 'const required = ["id", "pubkey", "sig", "kind", "created_at", "tags", "content"]' in script.text
+    assert "NostrKey no devolvió un evento firmado" in script.text
+    assert "requireSignedNostrEvent(await window.nostr.signEvent(unsignedEvent))" in script.text
+    assert 'JSON.stringify({event})' in script.text
+    assert '/static/app.js?v=20260728-safari-signer1' in login_page.text
 
 
 def test_nostr_login_issues_http_only_session_and_logout(tmp_path, monkeypatch):
