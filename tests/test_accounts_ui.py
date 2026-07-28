@@ -129,6 +129,25 @@ def test_login_frontend_preserves_role_card_markup_and_formats_structured_signer
     assert "button.textContent = previous" not in script.text
 
 
+def test_salvia_concept_brand_contract_is_served(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+
+    login_page = client.get("/app?role=merchant")
+    stylesheet = client.get("/static/app.css")
+    wordmark = client.get("/static/brand/wordmark-night.png")
+    favicon = client.get("/static/brand/favicon.svg")
+
+    assert login_page.status_code == 200
+    assert '/static/app.css?v=20260728-salvia-concept1' in login_page.text
+    assert '/static/brand/wordmark-night.png' in login_page.text
+    assert stylesheet.status_code == 200
+    assert "--sage: #9cc97e" in stylesheet.text.lower()
+    assert '"Space Grotesk"' in stylesheet.text
+    assert wordmark.status_code == 200
+    assert wordmark.headers["content-type"] == "image/png"
+    assert favicon.status_code == 200
+
+
 def test_login_frontend_rejects_empty_or_invalid_signer_responses_before_verify(tmp_path, monkeypatch):
     client = configured_client(tmp_path, monkeypatch)
 

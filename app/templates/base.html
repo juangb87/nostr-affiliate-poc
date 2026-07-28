@@ -3,19 +3,20 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta name="theme-color" content="#f5f7fb">
+  <meta name="theme-color" content="#141914">
+  <link rel="icon" href="/static/brand/favicon.svg?v=salvia-8a1" type="image/svg+xml">
   <title>{% block title %}Meerat{% endblock %}</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&family=Unbounded:wght@600;700;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/app.css?v=20260728-salvia1">
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/app.css?v=20260728-salvia-concept1">
   <script src="/static/app.js?v=20260728-merchant-form1" defer></script>
 </head>
 <body>
 <a class="skip-link" href="#main">Saltar al contenido</a>
 <div class="mobile-bar">
   <div class="mobile-top">
-    <a class="brand" href="/app">Meerat<span class="brand-dot">.</span></a>
+    <a class="brand" href="/app" aria-label="Meerat"><img src="/static/brand/wordmark-night.png?v=salvia-8a1" width="1428" height="648" alt="Meerat"></a>
     <div class="mobile-account"><span class="account-avatar" aria-hidden="true">{{ role_label[:1] }}</span><code title="{{ account.npub }}">{{ account.npub_short }}</code><button class="link-button" type="button" data-logout>Cerrar sesión</button></div>
   </div>
   <nav aria-label="Navegación móvil">
@@ -24,7 +25,7 @@
 </div>
 <div class="app-shell">
   <aside class="sidebar">
-    <a class="brand" href="/app">Meerat<span class="brand-dot">.</span></a>
+    <a class="brand" href="/app" aria-label="Meerat"><img src="/static/brand/wordmark-night.png?v=salvia-8a1" width="1428" height="648" alt="Meerat"></a>
     <div class="account-chip">
       <span class="account-avatar" aria-hidden="true">{{ role_label[:1] }}</span>
       <div><small>{{ role_label }}</small><code title="{{ account.npub }}">{{ account.npub_short }}</code></div>

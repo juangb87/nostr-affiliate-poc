@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  
+  <rect width="64" height="64" fill="#141914"></rect>
+  <text x="32" y="40" text-anchor="middle" font-family="Space Grotesk, sans-serif" font-weight="700" font-size="34" fill="#EEF2EC">m</text>
+  <g fill="#9CC97E">
+    <rect x="21" y="46" width="13" height="3"></rect>
+    <rect x="36" y="46" width="5" height="3" opacity="0.55"></rect>
+    <rect x="43" y="46" width="2.5" height="3" opacity="0.25"></rect>
+  </g>
+</svg>
