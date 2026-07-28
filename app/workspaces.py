@@ -149,7 +149,8 @@ def affiliate_workspace_data(connection: Any, session: dict[str, Any], *, base_u
         text(
             """
             SELECT e.id, e.ref_code, e.status, e.lightning_address, e.created_at, c.id AS campaign_id,
-                   c.name AS campaign_name, c.commission_bps, c.window_days, c.destination_url
+                   c.name AS campaign_name, c.merchant_pubkey, c.status AS campaign_status,
+                   c.commission_bps, c.window_days, c.destination_url
             FROM enrollments e JOIN campaigns c ON c.id=e.campaign_id
             WHERE e.affiliate_pubkey=:npub OR e.affiliate_pubkey_hex=:hex OR e.affiliate_pubkey=:hex
             ORDER BY e.created_at DESC
@@ -189,6 +190,14 @@ def affiliate_workspace_data(connection: Any, session: dict[str, Any], *, base_u
     for link in links:
         link["commission_percent"] = f"{int(link['commission_bps']) / 100:g}"
         link["ref_url"] = f"{base_url}/r/{link['ref_code']}"
+        link["merchant_short"] = short(link.get("merchant_pubkey"))
+        link["available"] = bool(link.get("status") == "approved" and link.get("campaign_status") == "active")
+        if link["available"]:
+            link["user_state"] = "Listo para compartir"
+        elif link.get("campaign_status") != "active":
+            link["user_state"] = "Programa pausado"
+        else:
+            link["user_state"] = "Acceso pendiente"
     for payout in payouts:
         payout["user_state"] = payout_user_state(payout.get("state"))
         payout["payment_hash_short"] = short(payout.get("payment_hash"), 8, 6) if payout.get("payment_hash") else None
@@ -214,7 +223,7 @@ def affiliate_workspace_data(connection: Any, session: dict[str, Any], *, base_u
         "conversions": conversions,
         "payouts": payouts,
         "totals": {
-            "active_links": sum(1 for row in links if row.get("status") == "approved"),
+            "active_links": sum(1 for row in links if row.get("available")),
             "clicks": clicks,
             "conversions": int(affiliate_totals.get("conversions") or 0),
             "gross_sats": int(affiliate_totals.get("gross_sats") or 0),

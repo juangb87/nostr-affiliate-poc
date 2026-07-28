@@ -370,12 +370,19 @@ def test_affiliate_accepts_invitation_with_nip07_and_gets_session(tmp_path, monk
     assert accepted.status_code == 200, accepted.text
     payload = accepted.json()
     assert payload["affiliate_pubkey"] == affiliate.public_key().to_bech32()
-    assert payload["redirect"] == "/app/affiliate"
+    assert payload["redirect"] == "/app/affiliate#links"
     assert payload["ref_url"].startswith("https://testserver/r/")
     assert main.SESSION_COOKIE.lower() in accepted.headers["set-cookie"].lower()
     workspace = client.get("/app/affiliate")
     assert workspace.status_code == 200
+    assert "Tu link para compartir" in workspace.text
     assert "Signed invitation campaign" in workspace.text
+    assert main.workspace_short(merchant.public_key().to_bech32()) in workspace.text
+    assert payload["ref_url"] in workspace.text
+    assert "8% · ventana 30 días" in workspace.text
+    assert "Listo para compartir" in workspace.text
+    assert "Copiar" in workspace.text
+    assert "Abrir visita de prueba" in workspace.text
 
     replay = client.post(
         "/invite/accept",
@@ -393,6 +400,44 @@ def test_affiliate_accepts_invitation_with_nip07_and_gets_session(tmp_path, monk
         json={"token": token, "event": invitation_acceptance_event(other_affiliate, token)},
     )
     assert stolen_replay.status_code == 409
+
+
+def test_paused_campaign_link_is_visible_but_not_actionable(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    merchant = Keys.generate()
+    affiliate = Keys.generate()
+    campaign = create_campaign(client, merchant, name="Paused pilot program")
+    login(client, merchant, "merchant")
+    invitation = create_invitation(client, campaign["campaign_id"])
+    token = invitation["invite_url"].split("#token=", 1)[1]
+    client.post("/auth/logout")
+    accepted = client.post(
+        "/invite/accept",
+        headers={"origin": "https://testserver"},
+        json={"token": token, "event": invitation_acceptance_event(affiliate, token)},
+    )
+    assert accepted.status_code == 200
+    with main.engine().begin() as connection:
+        connection.execute(
+            text("UPDATE campaigns SET status='paused' WHERE id=:campaign_id"),
+            {"campaign_id": campaign["campaign_id"]},
+        )
+    session = {
+        "npub": affiliate.public_key().to_bech32(),
+        "nostr_pubkey_hex": affiliate.public_key().to_hex(),
+    }
+    with main.engine().connect() as connection:
+        data = affiliate_workspace_data(connection, session, base_url="https://testserver")
+    assert data["totals"]["active_links"] == 0
+    assert data["links"][0]["campaign_status"] == "paused"
+    assert data["links"][0]["available"] is False
+
+    workspace = client.get("/app/affiliate")
+    assert workspace.status_code == 200
+    assert accepted.json()["ref_url"] in workspace.text
+    assert "Programa pausado" in workspace.text
+    assert "Esperá que el Merchant active el programa" in workspace.text
+    assert "Abrir visita de prueba" not in workspace.text
 
 
 def test_inactive_account_cannot_consume_invitation(tmp_path, monkeypatch):

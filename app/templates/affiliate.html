@@ -2,8 +2,23 @@
 {% block title %}Afiliado · Meerat{% endblock %}
 {% block content %}
 <header class="page-header"><div><p class="eyebrow">Affiliate account</p><h1>Tus links. Tus conversiones. Tus sats.</h1><p class="lede">Una vista privada de tu actividad como afiliado y pruebas públicas verificables para cada resultado.</p></div></header>
+<section class="section" id="links">
+  <div class="section-head"><div><h2>{% if links %}Tu link para compartir{% else %}Todavía no tenés links{% endif %}</h2><p>{% if links %}Usá el link canónico del programa; cada visita crea un click nuevo sin cambiar tu ref code.{% else %}Abrí una invitación del Merchant y firmala con esta misma identidad Nostr.{% endif %}</p></div></div>
+  <div class="panel record-list">
+  {% for link in links %}
+    <article class="record" data-affiliate-link>
+      <div class="record-main"><strong>{{ link.campaign_name }}</strong><span>Merchant {{ link.merchant_short }} · {{ link.commission_percent }}% · ventana {{ link.window_days }} días</span></div>
+      <div><span class="label-mobile">Estado</span><span class="badge {% if link.available %}success{% endif %}">{{ link.user_state }}</span></div>
+      <div class="record-span"><span class="label-mobile">Link</span><div class="copy-row"><code class="copy-value" title="{{ link.ref_url }}">{{ link.ref_url }}</code>{% if link.available %}<button class="copy-button" type="button" data-copy="{{ link.ref_url }}">Copiar</button>{% endif %}</div>{% if not link.available %}<small>Esperá que el Merchant active el programa antes de compartirlo.</small>{% endif %}</div>
+      {% if link.available %}<a class="action" href="{{ link.ref_url }}" target="_blank" rel="noopener">Abrir visita de prueba</a>{% endif %}
+    </article>
+  {% else %}
+    <div class="empty">Pedile al Merchant una invitación, abrila en este navegador y aceptala usando la misma identidad Nostr de tu cuenta Affiliate.</div>
+  {% endfor %}
+  </div>
+</section>
 <section class="metrics" aria-label="Resumen afiliado">
-  <article class="metric"><span>Links activos</span><strong>{{ totals.active_links }}</strong><small>campañas aprobadas</small></article>
+  <article class="metric"><span>Links activos</span><strong>{{ totals.active_links }}</strong><small>programas listos</small></article>
   <article class="metric"><span>Clicks</span><strong>{{ totals.clicks }}</strong><small>visitas atribuidas</small></article>
   <article class="metric"><span>Conversiones</span><strong>{{ totals.conversions }}</strong><small>ventas confirmadas</small></article>
   <article class="metric"><span>Comisión bruta</span><strong>{{ totals.gross_sats }}</strong><small>{{ totals.paid_sats }} sats pagados</small></article>
@@ -15,10 +30,6 @@
     <p class="form-status" role="status" aria-live="polite" data-lightning-status>Meerat no recibe ni custodia estos fondos.</p>
   </form>
 </section>
-<section class="section" id="links"><div class="section-head"><div><h2>Mis links</h2><p>Compartí el enlace de cada campaña.</p></div></div><div class="panel record-list">
-{% for link in links %}<article class="record"><div class="record-main"><strong>{{ link.campaign_name }}</strong><span>{{ link.commission_percent }}% · ventana {{ link.window_days }} días</span></div><div><span class="label-mobile">Estado</span><span class="badge {% if link.status == 'approved' %}success{% endif %}">{{ link.status }}</span></div><div class="record-span"><span class="label-mobile">Link</span><div class="copy-row"><code class="copy-value" title="{{ link.ref_url }}">{{ link.ref_url }}</code><button class="copy-button" type="button" data-copy="{{ link.ref_url }}">Copiar</button></div></div><a class="action" href="{{ link.ref_url }}" target="_blank" rel="noopener">Abrir</a></article>
-{% else %}<div class="empty">Esta identidad todavía no está asociada a una campaña.</div>{% endfor %}
-</div></section>
 <section class="section" id="earnings"><div class="section-head"><div><h2>Ganancias</h2><p>Comisiones atribuidas y su estado de liquidación.</p></div></div><div class="panel record-list">
 {% for payout in payouts %}<article class="record"><div class="record-main"><strong>{{ payout.campaign_name }}</strong><span>{{ payout.created_at }}</span></div><div><span class="label-mobile">Comisión</span><strong>{{ payout.amount_sats }} sats</strong></div><div><span class="label-mobile">Estado</span><span class="badge {% if payout.state in ['SETTLED','PUBLISHED'] %}success{% elif payout.state in ['FAILED','UNKNOWN'] %}danger{% endif %}">{{ payout.user_state }}</span></div><div><span class="label-mobile">Payment hash</span><code>{{ payout.payment_hash_short or 'Pendiente' }}</code></div><a class="action" href="/payouts/{{ payout.id }}/receipt">Receipt</a></article>
 {% else %}<div class="empty">Todavía no hay payouts asociados a tus conversiones.</div>{% endfor %}

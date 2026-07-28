@@ -5493,7 +5493,7 @@ def accept_affiliate_invitation(request: Request, response: Response, body: Affi
                     "ref_url": f"{BASE_URL}/r/{enrollment['ref_code']}",
                     "nostr_status": recovery_nostr_status,
                     "session_expires_at": session_expires_at,
-                    "redirect": "/app/affiliate",
+                    "redirect": "/app/affiliate#links",
                 }
             if invitation["status"] != "pending":
                 raise HTTPException(409, "invitation was revoked")
@@ -5600,7 +5600,7 @@ def accept_affiliate_invitation(request: Request, response: Response, body: Affi
         "ref_url": f"{BASE_URL}/r/{enrollment['ref_code']}",
         "nostr_status": nostr_status,
         "session_expires_at": session_expires_at,
-        "redirect": "/app/affiliate",
+        "redirect": "/app/affiliate#links",
     }
 
 
