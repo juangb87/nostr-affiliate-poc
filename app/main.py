@@ -2594,9 +2594,16 @@ def dashboard_data() -> dict[str, Any]:
             "enrollments": c.execute(text("SELECT COUNT(*) FROM enrollments")).scalar_one(),
             "clicks": c.execute(text("SELECT COUNT(*) FROM clicks")).scalar_one(),
             "conversions": c.execute(text("SELECT COUNT(*) FROM conversions")).scalar_one(),
-            "pending_sats": c.execute(text("SELECT COALESCE(SUM(amount_sats), 0) FROM payouts WHERE status='pending'")).scalar_one(),
+            "pending_sats": c.execute(
+                text("SELECT COALESCE(SUM(amount_sats), 0) FROM payouts WHERE state NOT IN ('SETTLED','PUBLISHED','CANCELLED')")
+            ).scalar_one(),
             "nostr_events": c.execute(text("SELECT COUNT(*) FROM nostr_events")).scalar_one(),
             "published_events": c.execute(text("SELECT COUNT(*) FROM nostr_events WHERE relay_status='published'")).scalar_one(),
+            "pending_events": c.execute(text("SELECT COUNT(*) FROM nostr_events WHERE relay_status<>'published'")).scalar_one(),
+            "failed_relays": c.execute(text("SELECT COUNT(*) FROM nostr_event_relays WHERE status='failed'")).scalar_one(),
+            "actionable_payouts": c.execute(
+                text("SELECT COUNT(*) FROM payouts WHERE state IN ('PAYABLE','FAILED','UNKNOWN')")
+            ).scalar_one(),
         }
         campaigns = [dict(r._mapping) for r in c.execute(text("SELECT id, merchant_pubkey, name, commission_bps, window_days, destination_url, nostr_event_id, created_at FROM campaigns ORDER BY created_at DESC LIMIT 10")).fetchall()]
         enrollments = [dict(r._mapping) for r in c.execute(text("SELECT id, campaign_id, affiliate_pubkey, lightning_address, ref_code, nostr_event_id, created_at FROM enrollments ORDER BY created_at DESC LIMIT 10")).fetchall()]
@@ -2609,7 +2616,43 @@ def dashboard_data() -> dict[str, Any]:
         relays_by_event.setdefault(row["event_id"], []).append(row)
     for event in events:
         event["relays"] = relays_by_event.get(event["event_id"], [])
-    return {"health": health(), "counts": counts, "campaigns": campaigns, "enrollments": enrollments, "clicks": clicks, "conversions": conversions, "events": events}
+    service_health = health()
+    attention: list[dict[str, Any]] = []
+    if not service_health["nostr_publish"]:
+        attention.append({
+            "severity": "warning",
+            "title": "Publicación Nostr desactivada",
+            "detail": "Las pruebas se firman localmente, pero no se envían a relays.",
+        })
+    if counts["pending_events"]:
+        attention.append({
+            "severity": "warning",
+            "title": "Publicación pendiente",
+            "detail": f"{counts['pending_events']} evento(s) todavía no figuran como publicados.",
+        })
+    if counts["failed_relays"]:
+        attention.append({
+            "severity": "danger",
+            "title": "Entregas a relays fallidas",
+            "detail": f"{counts['failed_relays']} intento(s) requieren revisión.",
+        })
+    if counts["actionable_payouts"]:
+        attention.append({
+            "severity": "warning",
+            "title": "Payouts que requieren atención",
+            "detail": f"{counts['actionable_payouts']} payout(s) están listos, fallidos o con estado desconocido.",
+        })
+    return {
+        "health": service_health,
+        "counts": counts,
+        "attention": attention,
+        "snapshot_at": now(),
+        "campaigns": campaigns,
+        "enrollments": enrollments,
+        "clicks": clicks,
+        "conversions": conversions,
+        "events": events,
+    }
 
 
 @contextmanager
@@ -6213,8 +6256,9 @@ def affiliate_account_page(request: Request) -> Response:
 
 
 @app.get("/ops/data", tags=["Operations"])
-def ops_dashboard_data(request: Request) -> dict[str, Any]:
+def ops_dashboard_data(request: Request, response: Response) -> dict[str, Any]:
     require_account_session(request, "ops")
+    response.headers["Cache-Control"] = "no-store"
     return dashboard_data()
 
 
@@ -6225,9 +6269,30 @@ def legacy_dashboard_data(request: Request) -> Response:
 
 @app.get("/ops", response_class=HTMLResponse)
 def operations_dashboard(request: Request) -> Response:
-    if not _session_account(request, "ops"):
+    session = _session_account(request, "ops")
+    if not session:
         return RedirectResponse("/app?role=ops", status_code=303)
-    return HTMLResponse(DASHBOARD_HTML)
+    data = dashboard_data()
+    healthy = bool(data["health"]["nostr_publish"] and not data["counts"]["failed_relays"])
+    return templates.TemplateResponse(
+        request=request,
+        name="ops.html",
+        headers={"Cache-Control": "no-store"},
+        context={
+            "data": data,
+            "account": _account_shell(session, "ops"),
+            "role_label": "Operations",
+            "workspace_status": {
+                "label": "Operativo" if healthy else "Revisar estado",
+                "class": "is-healthy" if healthy else "is-degraded",
+            },
+            "nav": [
+                {"label": "Resumen", "href": "/ops", "active": True},
+                {"label": "Conversiones", "href": "#conversions", "active": False},
+                {"label": "Nostr", "href": "#nostr", "active": False},
+            ],
+        },
+    )
 
 
 @app.get("/dashboard", response_class=HTMLResponse)

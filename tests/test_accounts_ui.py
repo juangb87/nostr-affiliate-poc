@@ -419,10 +419,25 @@ def test_ops_is_allowlisted_and_dashboard_redirects(tmp_path, monkeypatch):
     login(client, operator, "ops")
     ops = client.get("/ops")
     assert ops.status_code == 200
-    assert "Nostr Affiliate POC Dashboard" in ops.text
+    assert "Estado de la red" in ops.text
+    assert "Observabilidad" in ops.text
+    assert "Conversiones recientes" in ops.text
+    assert "Nostr &amp; relays" in ops.text
+    assert "data-ops-health" in ops.text
+    assert "data-ops-metric" in ops.text
+    assert "Nostr Affiliate POC Dashboard" not in ops.text
+    assert "Run full demo" not in ops.text
+    assert "onclick=" not in ops.text
+    assert ops.headers["cache-control"] == "no-store"
     ops_data = client.get("/ops/data")
     assert ops_data.status_code == 200
     assert "counts" in ops_data.json()
+    assert "attention" in ops_data.json()
+    assert "snapshot_at" in ops_data.json()
+    assert ops_data.headers["cache-control"] == "no-store"
+
+    client.post("/auth/logout")
+    assert client.get("/ops/data").status_code == 401
 
 
 def create_invitation(client: TestClient, campaign_id: str) -> dict:
@@ -1543,15 +1558,31 @@ def test_merchants_cannot_see_each_others_campaigns(tmp_path, monkeypatch):
 def test_ops_dashboard_escapes_untrusted_table_values(tmp_path, monkeypatch):
     client = configured_client(tmp_path, monkeypatch)
     attacker = Keys.generate()
-    create_campaign(client, attacker, name='<img src=x onerror="alert(1)">')
+    campaign = create_campaign(client, attacker, name="Unsafe campaign")
+    malicious = '<img src=x onerror="alert(1)">'
+    with main.engine().begin() as connection:
+        event_id = connection.execute(
+            text("SELECT event_id FROM nostr_events WHERE entity_id=:campaign_id LIMIT 1"),
+            {"campaign_id": campaign["campaign_id"]},
+        ).scalar_one()
+        connection.execute(
+            text(
+                """
+                INSERT INTO nostr_event_relays (event_id, relay_url, status, error, created_at)
+                VALUES (:event_id, 'wss://unsafe.example', 'failed', :error, :created_at)
+                """
+            ),
+            {"event_id": event_id, "error": malicious, "created_at": main.now()},
+        )
     operator = Keys.generate()
     monkeypatch.setenv("OPS_NOSTR_PUBKEYS", operator.public_key().to_bech32())
     login(client, operator, "ops")
 
     source = client.get("/ops").text
-    assert "function esc(value)" in source
-    assert "c[2]?c[2](r[c[1]],r):esc(r[c[1]])" in source
-    assert "safePath(v)" in source
+    assert malicious not in source
+    assert "&lt;img src=x onerror=&#34;alert(1)&#34;&gt;" in source
+    assert "unsafe.example" in source
+    assert "Deslizá para ver todas las columnas" in source
 
 
 def test_removing_ops_allowlist_revokes_active_session(tmp_path, monkeypatch):

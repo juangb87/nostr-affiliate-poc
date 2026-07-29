@@ -1,0 +1,131 @@
+{% extends "base.html" %}
+{% block title %}Operations · Meerat{% endblock %}
+{% block content %}
+<header class="page-header ops-page-header">
+  <div>
+    <p class="eyebrow">Observabilidad</p>
+    <h1>Estado de la red</h1>
+    <p class="lede">Salud del servicio, actividad de atribución y publicación de pruebas en una vista operativa.</p>
+  </div>
+  <div class="ops-header-actions">
+    <span class="ops-last-updated">Snapshot <time datetime="{{ data.snapshot_at }}">{{ data.snapshot_at[:16].replace('T', ' ') }} UTC</time></span>
+    <a class="button secondary" href="/ops">Actualizar</a>
+  </div>
+</header>
+
+<section class="ops-health-strip" aria-label="Salud del sistema" data-ops-health>
+  <article class="ops-health-item is-healthy">
+    <span class="ops-status-dot" aria-hidden="true"></span>
+    <div><small>Base de datos</small><strong>{{ data.health.db|upper }}</strong></div>
+  </article>
+  <article class="ops-health-item {{ 'is-healthy' if data.health.nostr_publish else 'is-degraded' }}">
+    <span class="ops-status-dot" aria-hidden="true"></span>
+    <div><small>Publicación Nostr</small><strong>{{ 'Activa' if data.health.nostr_publish else 'Desactivada' }}</strong></div>
+  </article>
+  <article class="ops-health-item {{ 'is-failed' if data.counts.failed_relays else 'is-healthy' }}">
+    <span class="ops-status-dot" aria-hidden="true"></span>
+    <div><small>Relays con errores</small><strong>{{ data.counts.failed_relays }}</strong></div>
+  </article>
+  <article class="ops-health-item {{ 'is-degraded' if data.counts.pending_events else 'is-healthy' }}">
+    <span class="ops-status-dot" aria-hidden="true"></span>
+    <div><small>Eventos pendientes</small><strong>{{ data.counts.pending_events }}</strong></div>
+  </article>
+</section>
+
+<section class="ops-kpis" aria-label="Métricas operativas">
+  <article class="ops-metric" data-ops-metric><span>Campañas</span><strong>{{ data.counts.campaigns }}</strong><small>programas registrados</small></article>
+  <article class="ops-metric" data-ops-metric><span>Affiliates</span><strong>{{ data.counts.enrollments }}</strong><small>enrollments totales</small></article>
+  <article class="ops-metric" data-ops-metric><span>Clicks</span><strong>{{ data.counts.clicks }}</strong><small>atribuciones registradas</small></article>
+  <article class="ops-metric" data-ops-metric><span>Conversiones</span><strong>{{ data.counts.conversions }}</strong><small>señales procesadas</small></article>
+  <article class="ops-metric {{ 'needs-attention' if data.counts.pending_sats else '' }}" data-ops-metric><span>Sats pendientes</span><strong>{{ data.counts.pending_sats }}</strong><small>obligaciones no cerradas</small></article>
+  <article class="ops-metric" data-ops-metric><span>Pruebas publicadas</span><strong>{{ data.counts.published_events }}</strong><small>de {{ data.counts.nostr_events }} eventos</small></article>
+</section>
+
+<div class="ops-overview-grid">
+  <section class="section ops-attention" id="attention">
+    <div class="section-head"><div><h2>Requiere atención</h2><p>Señales que merecen revisión operativa.</p></div><span class="section-count">{{ data.attention|length }} alertas</span></div>
+    <div class="panel ops-attention-list">
+      {% for alert in data.attention %}
+      <article class="ops-alert is-{{ alert.severity }}">
+        <span class="ops-status-dot" aria-hidden="true"></span>
+        <div><strong>{{ alert.title }}</strong><p>{{ alert.detail }}</p></div>
+      </article>
+      {% else %}
+      <div class="ops-clear-state"><span class="ops-status-dot" aria-hidden="true"></span><div><strong>Sin incidencias activas</strong><p>Los indicadores observados están dentro de su estado esperado.</p></div></div>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="section ops-service" id="service">
+    <div class="section-head"><div><h2>Servicio</h2><p>Configuración observada en este proceso.</p></div></div>
+    <dl class="panel ops-service-list">
+      <div><dt>Servicio</dt><dd>{{ data.health.service }}</dd></div>
+      <div><dt>Invites dinámicos</dt><dd>{{ 'Activos' if data.health.dynamic_campaign_invites else 'Inactivos' }}</dd></div>
+      <div><dt>Relays configurados</dt><dd>{{ data.health.relays|length }}</dd></div>
+      <div><dt>Schema Nostr</dt><dd>v{{ data.health.nostr_schema_version }}</dd></div>
+    </dl>
+  </section>
+</div>
+
+<section class="section" id="conversions">
+  <div class="section-head"><div><h2>Conversiones recientes</h2><p>Últimas señales procesadas y su prueba verificable.</p></div><span class="section-count">{{ data.conversions|length }} recientes</span></div>
+  <div class="panel ops-data-panel">
+    {% if data.conversions %}
+    <p class="ops-table-hint">Deslizá para ver todas las columnas →</p>
+    <div class="ops-table-wrap">
+      <table class="ops-table">
+        <thead><tr><th>Fecha</th><th>Conversión</th><th>Affiliate</th><th>Orden</th><th>Comisión</th><th>Estado</th><th>Prueba</th></tr></thead>
+        <tbody>
+          {% for conversion in data.conversions %}
+          <tr>
+            <td><time datetime="{{ conversion.created_at }}">{{ conversion.created_at[:16].replace('T', ' ') }}</time></td>
+            <td><code class="ops-id" title="{{ conversion.id }}">{{ conversion.id }}</code></td>
+            <td><code class="ops-id" title="{{ conversion.affiliate_pubkey }}">{{ conversion.affiliate_pubkey }}</code></td>
+            <td>{{ conversion.order_total }} {{ conversion.currency }}</td>
+            <td><strong class="ops-sats">{{ conversion.commission_sats }} sats</strong></td>
+            <td><span class="ops-badge {{ 'is-healthy' if conversion.status == 'approved' else 'is-degraded' }}">{{ conversion.status }}</span></td>
+            <td><a class="action" href="/flows/{{ conversion.id }}/receipt">Ver recibo</a></td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}<div class="empty">Todavía no hay conversiones registradas.</div>{% endif %}
+  </div>
+</section>
+
+<section class="section" id="nostr">
+  <div class="section-head"><div><h2>Nostr &amp; relays</h2><p>Pruebas firmadas y resultado de publicación por relay.</p></div><span class="section-count">{{ data.events|length }} recientes</span></div>
+  <div class="panel ops-data-panel">
+    {% if data.events %}
+    <p class="ops-table-hint">Deslizá para ver todas las columnas →</p>
+    <div class="ops-table-wrap">
+      <table class="ops-table ops-events-table">
+        <thead><tr><th>Fecha</th><th>Kind</th><th>Entidad</th><th>Estado</th><th>Relays</th><th>Event ID</th></tr></thead>
+        <tbody>
+          {% for event in data.events %}
+          <tr>
+            <td><time datetime="{{ event.created_at }}">{{ event.created_at[:16].replace('T', ' ') }}</time></td>
+            <td><code>{{ event.kind }}</code></td>
+            <td><span>{{ event.entity_type }}</span><code class="ops-id" title="{{ event.entity_id }}">{{ event.entity_id }}</code></td>
+            <td><span class="ops-badge {{ 'is-healthy' if event.relay_status == 'published' else 'is-degraded' }}">{{ event.relay_status.replace('_', ' ') }}</span></td>
+            <td>
+              <div class="ops-relay-list">
+                {% for relay in event.relays %}
+                <details class="ops-relay {{ 'is-healthy' if relay.status == 'published' else ('is-failed' if relay.status == 'failed' else 'is-degraded') }}">
+                  <summary><span class="ops-status-dot" aria-hidden="true"></span>{{ relay.relay_url.replace('wss://', '') }}</summary>
+                  <div><strong>{{ relay.status }}</strong>{% if relay.error %}<p>{{ relay.error }}</p>{% endif %}</div>
+                </details>
+                {% else %}<span class="ops-muted">Sin resultados</span>{% endfor %}
+              </div>
+            </td>
+            <td><a class="action ops-event-link" href="/nostr/events/{{ event.event_id }}"><code class="ops-id" title="{{ event.event_id }}">{{ event.event_id }}</code></a></td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}<div class="empty">Todavía no hay eventos Nostr registrados.</div>{% endif %}
+  </div>
+</section>
+{% endblock %}
