@@ -123,6 +123,27 @@ def lightning_address_url(address: str) -> str:
     return f"https://{host}/.well-known/lnurlp/{name}"
 
 
+def validate_lightning_address(address: str, get_json: JsonGetter = _http_get_json) -> dict[str, Any]:
+    """Resolve a Lightning Address and require a usable LNURL-pay descriptor."""
+    descriptor_url = lightning_address_url(address)
+    _require_public_https_url(descriptor_url, "Lightning Address")
+    descriptor = get_json(descriptor_url)
+    if str(descriptor.get("status", "")).upper() == "ERROR":
+        raise LightningPaymentError("Lightning Address rejected the request")
+    if descriptor.get("tag") != "payRequest":
+        raise LightningPaymentError("Lightning Address did not return an LNURL-pay request")
+    try:
+        minimum = int(descriptor["minSendable"])
+        maximum = int(descriptor["maxSendable"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise LightningPaymentError("LNURL-pay limits are invalid") from exc
+    if minimum <= 0 or maximum < minimum:
+        raise LightningPaymentError("LNURL-pay limits are invalid")
+    callback = str(descriptor.get("callback", ""))
+    _require_public_https_url(callback, "LNURL callback")
+    return descriptor
+
+
 def _decode_bolt11_invoice(invoice: str):
     if not invoice or len(invoice) > 2048:
         raise LightningPaymentError("LNURL returned an invalid BOLT11 invoice length")
@@ -165,13 +186,7 @@ def bolt11_expires_at(invoice: str) -> str:
 def request_lnurl_invoice(address: str, amount_sats: int, get_json: JsonGetter = _http_get_json) -> tuple[str, str]:
     if amount_sats <= 0:
         raise LightningPaymentError("payout amount must be positive")
-    descriptor_url = lightning_address_url(address)
-    _require_public_https_url(descriptor_url, "Lightning Address")
-    descriptor = get_json(descriptor_url)
-    if str(descriptor.get("status", "")).upper() == "ERROR":
-        raise LightningPaymentError("Lightning Address rejected the request")
-    if descriptor.get("tag") != "payRequest":
-        raise LightningPaymentError("Lightning Address did not return an LNURL-pay request")
+    descriptor = validate_lightning_address(address, get_json)
     amount_msats = amount_sats * 1000
     try:
         minimum = int(descriptor["minSendable"])

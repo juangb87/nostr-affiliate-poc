@@ -342,12 +342,12 @@ document.addEventListener("submit", async (event) => {
     const button = lightningForm.querySelector("button[type='submit']");
     button.disabled = true;
     status.classList.remove("error");
-    status.textContent = "Guardando destino…";
+    status.textContent = "Verificando Lightning Address…";
     try {
       const result = await jsonFetch("/app/affiliate/lightning-address", {
         method: "PUT", body: JSON.stringify({lightning_address: String(new FormData(lightningForm).get("lightning_address") || "").trim()})
       });
-      status.textContent = `Destino guardado. ${result.updated_payouts} pago(s) pendiente(s) actualizado(s).`;
+      status.textContent = `Destino verificado y guardado. ${result.updated_payouts} pago(s) pendiente(s) actualizado(s).`;
     } catch (error) {
       status.textContent = readableError(error); status.classList.add("error");
     } finally { button.disabled = false; }

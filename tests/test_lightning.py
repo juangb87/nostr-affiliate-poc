@@ -13,6 +13,7 @@ from app.lightning import (
     lightning_address_url,
     request_lnurl_invoice,
     validate_bolt11_invoice,
+    validate_lightning_address,
 )
 
 
@@ -45,6 +46,28 @@ def test_lightning_address_url():
     for value in ("missing-at", "x@localhost", "x@example.com/path", "x@@example.com"):
         with pytest.raises(LightningPaymentError):
             lightning_address_url(value)
+
+
+def test_validate_lightning_address_requires_live_lnurl_pay_descriptor():
+    valid = {
+        "tag": "payRequest",
+        "callback": "https://api.cash.app/lnurl/payreq/example",
+        "minSendable": 1_000,
+        "maxSendable": 1_000_000,
+    }
+    assert validate_lightning_address("juangb87@cash.app", lambda _url: valid) == valid
+
+    with pytest.raises(LightningPaymentError, match="rejected"):
+        validate_lightning_address(
+            "juang87@cash.app",
+            lambda _url: {"status": "ERROR", "reason": "Error generating LUD06"},
+        )
+    with pytest.raises(LightningPaymentError, match="LNURL-pay"):
+        validate_lightning_address("user@example.com", lambda _url: {**valid, "tag": "withdrawRequest"})
+    with pytest.raises(LightningPaymentError, match="limits"):
+        validate_lightning_address("user@example.com", lambda _url: {**valid, "minSendable": 2_000_000})
+    with pytest.raises(LightningPaymentError, match="public HTTPS"):
+        validate_lightning_address("user@example.com", lambda _url: {**valid, "callback": "http://localhost/pay"})
 
 
 def test_validate_bolt11_requires_exact_mainnet_unexpired_invoice():

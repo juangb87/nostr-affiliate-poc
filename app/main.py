@@ -58,6 +58,7 @@ from app.lightning import (
     pay_nwc_invoice,
     prepare_lnurl_payment,
     probe_nwc_wallet,
+    validate_lightning_address,
 )
 from app.payment_rails import (
     NwcPaymentRail,
@@ -5233,6 +5234,11 @@ def affiliate_update_lightning_address(request: Request, body: AffiliateLightnin
     session = require_account_session(request, "affiliate")
     _require_same_origin(request)
     address = _normalize_lightning_address(body.lightning_address)
+    try:
+        validate_lightning_address(address)
+    except LightningPaymentError as exc:
+        logger.info("Lightning Address verification rejected %s: %s", address, exc)
+        raise HTTPException(422, "La Lightning Address no existe o no ofrece LNURL-pay.") from exc
     init_db()
     params = {"npub": session["npub"], "hex": session["nostr_pubkey_hex"], "address": address}
     with engine().begin() as c:

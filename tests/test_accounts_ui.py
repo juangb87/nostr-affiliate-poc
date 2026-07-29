@@ -1434,12 +1434,37 @@ def test_affiliate_updates_lightning_address_and_only_safe_pending_payouts(tmp_p
     payout_id = seed_payable_payout(campaign, enrollment, affiliate)
     login(client, affiliate, "affiliate")
 
+    def fake_validate(address: str):
+        if address == "juang87@cash.app":
+            raise main.LightningPaymentError("Lightning Address rejected the request")
+        return {
+            "tag": "payRequest",
+            "callback": "https://example.com/lnurl/callback",
+            "minSendable": 1_000,
+            "maxSendable": 1_000_000,
+        }
+
+    monkeypatch.setattr(main, "validate_lightning_address", fake_validate)
+
     wrong_origin = client.put(
         "/app/affiliate/lightning-address",
         headers={"origin": "https://evil.example"},
         json={"lightning_address": "juan@getalby.com"},
     )
     assert wrong_origin.status_code == 403
+
+    invalid = client.put(
+        "/app/affiliate/lightning-address",
+        headers={"origin": "https://testserver"},
+        json={"lightning_address": "juang87@cash.app"},
+    )
+    assert invalid.status_code == 422
+    assert invalid.json()["detail"] == "La Lightning Address no existe o no ofrece LNURL-pay."
+    with main.engine().connect() as connection:
+        assert connection.execute(
+            text("SELECT lightning_address FROM payouts WHERE id=:id"), {"id": payout_id}
+        ).scalar_one() != "juang87@cash.app"
+
     saved = client.put(
         "/app/affiliate/lightning-address",
         headers={"origin": "https://testserver"},
