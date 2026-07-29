@@ -125,7 +125,7 @@ uvicorn app.main:app --host 0.0.0.0 --port $PORT
 
 Recommended environment variables:
 
-- `BASE_URL`: public Railway URL
+- `BASE_URL`: canonical public URL (production: `https://meerat.com`)
 - `DEFAULT_DESTINATION_URL`: merchant checkout URL used for redirect links
 - `DATABASE_URL`: defaults to `sqlite:///./data/poc.db`; supports Railway Postgres URLs (`postgres://...`) for persistence
 - `NOSTR_PRIVATE_KEY`: dedicated backend hex or `nsec...` private key used to sign events
@@ -180,7 +180,7 @@ NWC attempts persist the prepared payment hash before payment. Ambiguous outcome
 Real merchants can add:
 
 ```html
-<script src="https://nostr-affiliate-poc-production.up.railway.app/bb.js"></script>
+<script src="https://meerat.com/bb.js"></script>
 ```
 
 The snippet reads `bb_click_id` and `bb_ref` from URL params, stores them in first-party cookie + localStorage, injects hidden checkout form inputs, and exposes:
@@ -229,7 +229,7 @@ The response includes `order_total_sats`, `receipt_url`, `json_receipt_url`, `no
 Register the Shopify topic `ORDERS_PAID` with this HTTPS callback:
 
 ```text
-https://nostr-affiliate-poc-production.up.railway.app/shopify/webhooks/orders-paid
+https://meerat.com/shopify/webhooks/orders-paid
 ```
 
 The endpoint verifies `X-Shopify-Hmac-Sha256` against the unmodified request body, requires the configured shop domain, and reads `bb_click_id` from `note_attributes`. Paid orders without affiliate attribution are acknowledged and ignored so Shopify does not retry them. Attributed paid orders use the same authoritative conversion, Nostr proof, commission, and pending-payout flow as `/merchant/conversions`.

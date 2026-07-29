@@ -144,6 +144,14 @@ def legacy_demo_mutations_enabled() -> bool:
 
 
 @app.middleware("http")
+async def redirect_www_to_canonical_apex(request: Request, call_next: Any) -> Response:
+    if request.url.hostname and request.url.hostname.lower() == "www.meerat.com":
+        canonical_url = request.url.replace(scheme="https", netloc="meerat.com")
+        return RedirectResponse(str(canonical_url), status_code=308)
+    return await call_next(request)
+
+
+@app.middleware("http")
 async def protect_legacy_demo_mutations(request: Request, call_next: Any) -> Response:
     if request.method == "POST" and request.url.path in LEGACY_DEMO_MUTATION_PATHS and not legacy_demo_mutations_enabled():
         return JSONResponse({"detail": "legacy demo mutations are disabled"}, status_code=404)

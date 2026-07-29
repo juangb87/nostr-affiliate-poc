@@ -170,6 +170,22 @@ def test_salvia_homepage_is_the_public_root(tmp_path, monkeypatch):
     assert space_grotesk.content.startswith(b"wOF2")
 
 
+def test_www_meerat_redirects_to_canonical_apex_and_preserves_path_and_query(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+
+    response = client.get(
+        "/app?role=affiliate",
+        headers={"host": "www.meerat.com"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 308
+    assert response.headers["location"] == "https://meerat.com/app?role=affiliate"
+
+    apex = client.get("/health", headers={"host": "meerat.com"}, follow_redirects=False)
+    assert apex.status_code == 200
+
+
 def test_salvia_concept_brand_contract_is_served(tmp_path, monkeypatch):
     client = configured_client(tmp_path, monkeypatch)
 
