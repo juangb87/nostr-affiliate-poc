@@ -4248,6 +4248,17 @@ def _signed_role_pubkey(event_json: dict[str, Any], role: str) -> str | None:
     return None
 
 
+def _signed_role_matches(event_json: dict[str, Any], role: str, expected_pubkey: str) -> bool:
+    tagged_pubkey = _signed_role_pubkey(event_json, role)
+    if tagged_pubkey is not None:
+        return tagged_pubkey == expected_pubkey
+    # nostr-sdk intentionally omits self-referencing `p` tags while signing. When
+    # the participant is also the event author, the signed author pubkey is the
+    # equivalent cryptographic identity claim. Never use this fallback when a
+    # conflicting explicit role tag is present.
+    return event_json.get("pubkey") == expected_pubkey
+
+
 def _payout_event_matches(data: dict[str, Any], event_json: dict[str, Any]) -> bool:
     payout = data["payout"]
     conversion = data.get("conversion") or {}
@@ -4269,8 +4280,8 @@ def _payout_event_matches(data: dict[str, Any], event_json: dict[str, Any]) -> b
         _signed_tag(event_json, "payment_hash") == payout.get("payment_hash"),
         _signed_tag(event_json, "campaign") == conversion.get("campaign_id"),
         _signed_tag(event_json, "e") == conversion.get("nostr_event_id"),
-        _signed_role_pubkey(event_json, "affiliate") == expected_affiliate,
-        _signed_role_pubkey(event_json, "merchant") == expected_merchant,
+        _signed_role_matches(event_json, "affiliate", expected_affiliate),
+        _signed_role_matches(event_json, "merchant", expected_merchant),
     ))
 
 

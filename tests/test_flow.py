@@ -158,6 +158,39 @@ def test_demo_flow_creates_conversion_and_proof(tmp_path, monkeypatch):
     assert 'Sandbox Lightning payout proof' not in paid_receipt.text
 
     receipt_data = main.payout_data(payout_id)
+
+    # nostr-sdk removes a self-referencing p tag during signing. The signed
+    # author pubkey must still satisfy that participant role when it is the
+    # expected affiliate, while an explicit conflicting role must fail closed.
+    signer_hex = payout_event['pubkey']
+    self_affiliate_tags = [
+        tag for tag in payout_event['tags']
+        if not (tag[0] == 'p' and len(tag) >= 4 and tag[3] == 'affiliate')
+    ] + [['p', signer_hex, '', 'affiliate']]
+    self_affiliate_event = main.build_nostr_event(PAYOUT_KIND, self_affiliate_tags, payout_event['content'])
+    assert not any(
+        tag[0] == 'p' and len(tag) >= 4 and tag[3] == 'affiliate'
+        for tag in self_affiliate_event['tags']
+    )
+    self_affiliate_data = copy.deepcopy(receipt_data)
+    self_affiliate_data['payout']['affiliate_pubkey'] = main.nostr_keys().public_key().to_bech32()
+    self_affiliate_data['payout']['nostr_event_id'] = self_affiliate_event['id']
+    self_affiliate_data['event']['event_id'] = self_affiliate_event['id']
+    self_affiliate_data['event']['event_json'] = self_affiliate_event
+    assert main.payout_receipt_context(self_affiliate_data)['proof']['verified'] is True
+
+    conflicting_event = main.build_nostr_event(
+        PAYOUT_KIND,
+        [tag for tag in self_affiliate_tags if not (tag[0] == 'p' and len(tag) >= 4 and tag[3] == 'affiliate')]
+        + [['p', '33' * 32, '', 'affiliate']],
+        payout_event['content'],
+    )
+    conflicting_data = copy.deepcopy(self_affiliate_data)
+    conflicting_data['payout']['nostr_event_id'] = conflicting_event['id']
+    conflicting_data['event']['event_id'] = conflicting_event['id']
+    conflicting_data['event']['event_json'] = conflicting_event
+    assert main.payout_receipt_context(conflicting_data)['proof']['verified'] is False
+
     wrong_kind_event = main.build_nostr_event(1, payout_event['tags'], payout_event['content'])
     wrong_kind_data = copy.deepcopy(receipt_data)
     wrong_kind_data['payout']['nostr_event_id'] = wrong_kind_event['id']
