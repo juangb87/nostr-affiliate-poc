@@ -1974,8 +1974,11 @@ def test_merchant_manual_settlement_is_owned_idempotent_and_attested(tmp_path, m
     assert "Generar invoice y QR" in merchant_page.text
     assert "data-prepare-invoice" in merchant_page.text
     assert "data-invoice-panel hidden" in merchant_page.text
-    assert "Ya pagué · usar este hash" in merchant_page.text
+    assert "Ya pagué · cargar hash del invoice" in merchant_page.text
     assert "Generar el invoice no realiza ni verifica el pago" in merchant_page.text
+    assert "Payment hash Lightning (64 hex)" in merchant_page.text
+    assert "No pegues el ID UUID de Strike" in merchant_page.text
+    assert 'data-manual-payout="' in merchant_page.text and "novalidate" in merchant_page.text
     assert 'role="status" aria-live="polite" data-manual-status' in merchant_page.text
 
     invalid = client.post(

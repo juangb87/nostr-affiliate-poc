@@ -466,7 +466,12 @@ document.addEventListener("submit", async (event) => {
     let evidence = String(fields.get("evidence") || "").trim().toLowerCase();
     button.disabled = true; status.classList.remove("error");
     try {
-      if (!/^[0-9a-f]{64}$/.test(evidence)) throw new Error("Ingresá exactamente 64 caracteres hexadecimales.");
+      if (!/^[0-9a-f]{64}$/.test(evidence)) {
+        throw new Error("Ingresá el payment hash Lightning: exactamente 64 caracteres hexadecimales, sin guiones. El ID UUID de Strike no es un payment hash.");
+      }
+      if (fields.get("confirmed") !== "on") {
+        throw new Error("Marcá la confirmación únicamente si tu wallet mostró el pago exitoso.");
+      }
       if (fields.get("evidence_type") === "preimage") {
         const bytes = new Uint8Array(evidence.match(/.{2}/g).map(byte => parseInt(byte, 16)));
         const digest = await crypto.subtle.digest("SHA-256", bytes);
