@@ -303,10 +303,55 @@ document.addEventListener("click", async (event) => {
   }
 });
 
+const setMerchantOnboardingStep = (form, requestedStep) => {
+  const steps = [...form.querySelectorAll("[data-onboarding-step]")];
+  const maximum = steps.length;
+  const step = Math.max(1, Math.min(maximum, Number(requestedStep) || 1));
+  steps.forEach((panel) => { panel.hidden = Number(panel.dataset.onboardingStep) !== step; });
+  document.querySelectorAll("[data-onboarding-progress]").forEach((item) => {
+    const itemStep = Number(item.dataset.onboardingProgress);
+    item.classList.toggle("active", itemStep === step);
+    item.classList.toggle("complete", itemStep < step);
+    if (itemStep === step) item.setAttribute("aria-current", "step"); else item.removeAttribute("aria-current");
+  });
+  form.dataset.currentStep = String(step);
+  steps.find((panel) => Number(panel.dataset.onboardingStep) === step)?.querySelector("input:not([type='hidden']), select, textarea")?.focus({preventScroll: true});
+};
+
+document.addEventListener("click", (event) => {
+  const control = event.target.closest("[data-wizard-next], [data-wizard-back]");
+  if (!control) return;
+  const form = control.closest("[data-merchant-onboarding-wizard]");
+  if (!form) return;
+  const current = Number(form.dataset.currentStep || 1);
+  if (control.hasAttribute("data-wizard-next")) {
+    const panel = form.querySelector(`[data-onboarding-step="${current}"]`);
+    const fields = [...panel.querySelectorAll("input, select, textarea")];
+    const invalid = fields.find((field) => !field.checkValidity());
+    if (invalid) { invalid.reportValidity(); return; }
+    setMerchantOnboardingStep(form, current + 1);
+  } else {
+    setMerchantOnboardingStep(form, current - 1);
+  }
+});
+
+document.querySelectorAll("[data-merchant-onboarding-wizard]").forEach((form) => setMerchantOnboardingStep(form, 1));
+
 document.addEventListener("submit", async (event) => {
   const bootstrapForm = event.target.closest("[data-merchant-bootstrap]");
   if (bootstrapForm) {
     event.preventDefault();
+    const isOnboarding = bootstrapForm.hasAttribute("data-merchant-onboarding-wizard");
+    if (isOnboarding) {
+      const currentStep = Number(bootstrapForm.dataset.currentStep || 1);
+      if (currentStep < 3) {
+        const currentPanel = bootstrapForm.querySelector(`[data-onboarding-step="${currentStep}"]`);
+        const controls = [...currentPanel.querySelectorAll("input, select, textarea")];
+        if (!controls.every((control) => control.reportValidity())) return;
+        setMerchantOnboardingStep(bootstrapForm, currentStep + 1);
+        return;
+      }
+    }
     const status = bootstrapForm.querySelector("[data-bootstrap-status]");
     const button = bootstrapForm.querySelector("button[type='submit']");
     const fields = new FormData(bootstrapForm);
@@ -319,15 +364,33 @@ document.addEventListener("submit", async (event) => {
       terms_url: String(fields.get("terms_url") || "").trim(),
       logo_url: String(fields.get("logo_url") || "").trim() || null
     };
+    if (isOnboarding) {
+      Object.assign(payload, {
+        display_name: String(fields.get("display_name") || "").trim(),
+        tagline: String(fields.get("tagline") || "").trim() || null,
+        invite_eyebrow: String(fields.get("invite_eyebrow") || "").trim() || null,
+        invite_headline: String(fields.get("invite_headline") || "").trim() || null,
+        invite_description: String(fields.get("invite_description") || "").trim() || null
+      });
+    }
     button.disabled = true;
     status.classList.remove("error");
     status.textContent = "Creando programa y guardando su prueba Nostr…";
     try {
-      await jsonFetch("/app/merchant/bootstrap", {
-        method: "POST", body: JSON.stringify(payload)
-      });
-      status.textContent = "Programa creado. Cargando condiciones…";
-      window.location.reload();
+      if (isOnboarding) {
+        status.textContent = "Guardando marca, programa e invitación…";
+        await jsonFetch("/app/merchant/onboarding", {
+          method: "POST", body: JSON.stringify(payload)
+        });
+        status.textContent = "Programa listo. Abriendo tu resumen…";
+        window.location.assign("/app/merchant");
+      } else {
+        await jsonFetch("/app/merchant/bootstrap", {
+          method: "POST", body: JSON.stringify(payload)
+        });
+        status.textContent = "Programa creado. Cargando condiciones…";
+        window.location.reload();
+      }
     } catch (error) {
       status.textContent = readableError(error);
       status.classList.add("error");

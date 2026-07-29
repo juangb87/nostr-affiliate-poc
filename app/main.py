@@ -89,7 +89,7 @@ DEFAULT_RELAYS = "wss://nos.lol,wss://relay.damus.io,wss://relay.primal.net"
 DEFAULT_MERCHANT_NPUB = "npub1540rxhz9x7fpc73nu5q3qydykej7lceh5j4jej6mmpc6n3saw3cqv7s8js"
 DEFAULT_AFFILIATE_NPUB = "npub16ghkhw9d4g9x6pxp6l6dtyjqaeuavwucrq8gpkt60x0kx9fzqwpszhtw0n"
 _MERCHANT_ENROLLMENT_LOCK = threading.Lock()
-_MERCHANT_BOOTSTRAP_LOCK = threading.Lock()
+_MERCHANT_BOOTSTRAP_LOCKS = tuple(threading.Lock() for _ in range(64))
 _NOSTR_PUBLICATION_LOCKS = tuple(threading.Lock() for _ in range(64))
 _MERCHANT_CONVERSION_LOCKS = tuple(threading.Lock() for _ in range(64))
 _INIT_DB_LOCK = threading.RLock()
@@ -1462,6 +1462,14 @@ class CampaignInviteBrandingIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     campaign_id: str = Field(..., min_length=1, max_length=80)
+    invite_eyebrow: str | None = Field(default=None, max_length=100)
+    invite_headline: str | None = Field(default=None, max_length=120)
+    invite_description: str | None = Field(default=None, max_length=360)
+
+
+class MerchantOnboardingIn(MerchantBootstrapIn):
+    display_name: str = Field(..., min_length=1, max_length=120)
+    tagline: str | None = Field(default=None, max_length=180)
     invite_eyebrow: str | None = Field(default=None, max_length=100)
     invite_headline: str | None = Field(default=None, max_length=120)
     invite_description: str | None = Field(default=None, max_length=360)
@@ -4888,10 +4896,13 @@ def _account_shell(session: dict[str, Any], role: str) -> dict[str, Any]:
 
 
 @app.get("/app/merchant", response_class=HTMLResponse)
-def merchant_account_page(request: Request) -> Response:
+def merchant_account_page(request: Request, view: str = "overview") -> Response:
     session = _session_account(request, "merchant")
     if not session:
         return RedirectResponse("/app?role=merchant", status_code=303)
+    valid_views = {"overview", "campaigns", "affiliates", "activity", "payouts", "integration", "settings"}
+    if view not in valid_views:
+        raise HTTPException(404, "merchant workspace view not found")
     configured_shopify_merchant = os.getenv("SHOPIFY_MERCHANT_PUBKEY", DEFAULT_MERCHANT_NPUB)
     try:
         shopify_merchant_hex = normalize_pubkey(configured_shopify_merchant, "SHOPIFY_MERCHANT_PUBKEY")["hex"]
@@ -4934,6 +4945,26 @@ def merchant_account_page(request: Request) -> Response:
         detail = "La integración de Shopify todavía no está configurada para este merchant."
     with engine().connect() as c:
         data = merchant_workspace_data(c, session, base_url=BASE_URL, shopify_ready=shopify_ready, shopify_detail=detail)
+    if not data["totals"]["campaigns"]:
+        return RedirectResponse("/app/merchant/onboarding", status_code=303)
+    view_meta = {
+        "overview": {"eyebrow": "Merchant account", "title": "Tu programa, bajo control.", "lede": "El estado de tu programa, las próximas acciones y sus resultados en un solo lugar."},
+        "campaigns": {"eyebrow": "Programa", "title": "Campañas", "lede": "Condiciones públicas, estado y rendimiento de tus programas de afiliados."},
+        "affiliates": {"eyebrow": "Comunidad", "title": "Affiliates", "lede": "Invitá personas y administrá las identidades enroladas en tus campañas."},
+        "activity": {"eyebrow": "Analytics", "title": "Actividad", "lede": "Clicks, conversiones y comisiones confirmadas desde tus enlaces."},
+        "payouts": {"eyebrow": "Lightning", "title": "Pagos", "lede": "Obligaciones de pago sin custodia y evidencia verificable de liquidación."},
+        "integration": {"eyebrow": "Commerce", "title": "Integración Shopify", "lede": "Tracking, Pixel y webhook firmado para atribución autoritativa."},
+        "settings": {"eyebrow": "Configuración", "title": "Marca e invitación", "lede": "Actualizá la identidad pública del Merchant y el mensaje de cada campaña."},
+    }[view]
+    nav_items = [
+        ("Resumen", "overview"),
+        ("Programa", "campaigns"),
+        ("Affiliates", "affiliates"),
+        ("Actividad", "activity"),
+        ("Pagos", "payouts"),
+        ("Shopify", "integration"),
+        ("Configuración", "settings"),
+    ]
     return templates.TemplateResponse(
         request=request,
         name="merchant.html",
@@ -4946,15 +4977,59 @@ def merchant_account_page(request: Request) -> Response:
             "program_defaults": _merchant_default_program(),
             "account": _account_shell(session, "merchant"),
             "role_label": "Merchant account",
+            "view": view,
+            "view_meta": view_meta,
             "nav": [
-                {"label": "Resumen", "href": "/app/merchant", "active": True},
-                {"label": "Campañas", "href": "#campaigns", "active": False},
-                {"label": "Afiliados", "href": "#affiliates", "active": False},
-                {"label": "Clicks", "href": "#clicks", "active": False},
-                {"label": "Actividad", "href": "#activity", "active": False},
-                {"label": "Pagos", "href": "#payouts", "active": False},
-                {"label": "Integración", "href": "#integration", "active": False},
+                {
+                    "label": label,
+                    "href": "/app/merchant" if key == "overview" else f"/app/merchant?view={key}",
+                    "active": view == key,
+                }
+                for label, key in nav_items
             ],
+        },
+    )
+
+
+@app.get("/app/merchant/onboarding", response_class=HTMLResponse)
+def merchant_onboarding_page(request: Request) -> Response:
+    session = _session_account(request, "merchant")
+    if not session:
+        return RedirectResponse("/app?role=merchant", status_code=303)
+    with engine().connect() as c:
+        bootstrap_rows = c.execute(
+            text(
+                """
+                SELECT link.merchant_pubkey_hex FROM merchant_account_links link
+                WHERE link.account_id=:account_id AND link.source='environment_binding'
+                  AND link.merchant_pubkey_hex<>:owner_hex
+                  AND NOT EXISTS (
+                    SELECT 1 FROM campaigns campaign
+                    WHERE campaign.merchant_pubkey_hex=link.merchant_pubkey_hex
+                  )
+                ORDER BY link.merchant_pubkey_hex
+                """
+            ),
+            {"account_id": session["account_id"], "owner_hex": session["nostr_pubkey_hex"]},
+        ).fetchall()
+    bootstrap_tenants = [
+        {
+            "merchant_pubkey": PublicKey.parse(row._mapping["merchant_pubkey_hex"]).to_bech32(),
+            "merchant_short": workspace_short(PublicKey.parse(row._mapping["merchant_pubkey_hex"]).to_bech32()),
+        }
+        for row in bootstrap_rows
+    ]
+    if not bootstrap_tenants:
+        return RedirectResponse("/app/merchant?view=settings", status_code=303)
+    return templates.TemplateResponse(
+        request=request,
+        name="merchant_onboarding.html",
+        context={
+            "bootstrap_tenants": bootstrap_tenants,
+            "program_defaults": _merchant_default_program(),
+            "account": _account_shell(session, "merchant"),
+            "role_label": "Merchant onboarding",
+            "nav": [{"label": "Onboarding", "href": "/app/merchant/onboarding", "active": True}],
         },
     )
 
@@ -5085,17 +5160,13 @@ def _merchant_profile_target(c: Any, session: dict[str, Any], merchant_hex: str)
         c.execute(
             text(
                 """
-                SELECT 1 FROM campaigns campaign
-                WHERE campaign.merchant_pubkey_hex=:merchant_hex
-                  AND (
-                    campaign.merchant_pubkey_hex=:owner_hex
-                    OR EXISTS (
-                      SELECT 1 FROM merchant_account_links link
-                      WHERE link.account_id=:account_id
-                        AND link.merchant_pubkey_hex=campaign.merchant_pubkey_hex
-                    )
-                  )
-                LIMIT 1
+                SELECT 1
+                WHERE :merchant_hex=:owner_hex
+                   OR EXISTS (
+                     SELECT 1 FROM merchant_account_links link
+                     WHERE link.account_id=:account_id
+                       AND link.merchant_pubkey_hex=:merchant_hex
+                   )
                 """
             ),
             {
@@ -5151,6 +5222,48 @@ def merchant_update_profile(body: MerchantProfileIn, request: Request) -> dict[s
     }
 
 
+def _persist_merchant_campaign_invite(
+    c: Any,
+    session: dict[str, Any],
+    campaign_id: str,
+    invite_eyebrow: str,
+    invite_headline: str,
+    invite_description: str,
+) -> dict[str, Any]:
+    campaign = asdict(
+        c.execute(
+            text("SELECT id, merchant_pubkey_hex FROM campaigns WHERE id=:id LIMIT 1"),
+            {"id": campaign_id},
+        ).fetchone()
+    )
+    if not campaign or not _merchant_profile_target(c, session, campaign["merchant_pubkey_hex"]):
+        raise HTTPException(404, "campaign not found")
+    c.execute(
+        text(
+            """
+            UPDATE campaigns
+            SET invite_eyebrow=:invite_eyebrow,
+                invite_headline=:invite_headline,
+                invite_description=:invite_description
+            WHERE id=:id
+            """
+        ),
+        {
+            "id": campaign_id,
+            "invite_eyebrow": invite_eyebrow or None,
+            "invite_headline": invite_headline or None,
+            "invite_description": invite_description or None,
+        },
+    )
+    return {
+        "ok": True,
+        "campaign_id": campaign_id,
+        "invite_eyebrow": invite_eyebrow or None,
+        "invite_headline": invite_headline or None,
+        "invite_description": invite_description or None,
+    }
+
+
 @app.put("/app/merchant/campaign-invite", tags=["Accounts"])
 def merchant_update_campaign_invite(body: CampaignInviteBrandingIn, request: Request) -> dict[str, Any]:
     session = require_account_session(request, "merchant")
@@ -5160,38 +5273,9 @@ def merchant_update_campaign_invite(body: CampaignInviteBrandingIn, request: Req
     invite_description = safe_text(body.invite_description, 360)
     init_db()
     with engine().begin() as c:
-        campaign = asdict(
-            c.execute(
-                text("SELECT id, merchant_pubkey_hex FROM campaigns WHERE id=:id LIMIT 1"),
-                {"id": body.campaign_id},
-            ).fetchone()
+        return _persist_merchant_campaign_invite(
+            c, session, body.campaign_id, invite_eyebrow, invite_headline, invite_description
         )
-        if not campaign or not _merchant_profile_target(c, session, campaign["merchant_pubkey_hex"]):
-            raise HTTPException(404, "campaign not found")
-        c.execute(
-            text(
-                """
-                UPDATE campaigns
-                SET invite_eyebrow=:invite_eyebrow,
-                    invite_headline=:invite_headline,
-                    invite_description=:invite_description
-                WHERE id=:id
-                """
-            ),
-            {
-                "id": body.campaign_id,
-                "invite_eyebrow": invite_eyebrow or None,
-                "invite_headline": invite_headline or None,
-                "invite_description": invite_description or None,
-            },
-        )
-    return {
-        "ok": True,
-        "campaign_id": body.campaign_id,
-        "invite_eyebrow": invite_eyebrow or None,
-        "invite_headline": invite_headline or None,
-        "invite_description": invite_description or None,
-    }
 
 
 @app.post("/app/merchant/bootstrap", tags=["Accounts"])
@@ -5207,7 +5291,8 @@ def merchant_bootstrap(body: MerchantBootstrapIn, request: Request) -> dict[str,
     relay_results: list[dict[str, str]] = []
     status = "active"
 
-    with _MERCHANT_BOOTSTRAP_LOCK:
+    lock = _MERCHANT_BOOTSTRAP_LOCKS[int(merchant["hex"][:8], 16) % len(_MERCHANT_BOOTSTRAP_LOCKS)]
+    with lock:
         with engine().begin() as c:
             if c.engine.dialect.name == "postgresql":
                 c.execute(
@@ -5329,6 +5414,146 @@ def merchant_bootstrap(body: MerchantBootstrapIn, request: Request) -> dict[str,
         "merchant_pubkey": merchant["npub"],
         "nostr_event_id": event["id"],
         "relay_results": relay_results,
+    }
+
+
+@app.post("/app/merchant/onboarding", tags=["Accounts"])
+def merchant_complete_onboarding(body: MerchantOnboardingIn, request: Request) -> dict[str, Any]:
+    """Atomically complete the three onboarding persistence steps."""
+    session = require_account_session(request, "merchant")
+    _require_same_origin(request)
+    merchant = normalize_pubkey(body.merchant_pubkey, "merchant_pubkey")
+    program = _merchant_requested_program(body)
+    campaign_id = f"camp_default_{merchant['hex']}"
+    display_name = safe_text(body.display_name, 120)
+    tagline = safe_text(body.tagline, 180)
+    raw_logo_url = safe_text(body.logo_url, 2048)
+    logo_url = _normalized_merchant_url(raw_logo_url, "logo_url", logo=True) if raw_logo_url else None
+    invite_eyebrow = safe_text(body.invite_eyebrow, 100)
+    invite_headline = safe_text(body.invite_headline, 120)
+    invite_description = safe_text(body.invite_description, 360)
+    duplicate = False
+    publish_needed = True
+    relay_results: list[dict[str, str]] = []
+    status = "active"
+    event: dict[str, Any] | None = None
+    lock = _MERCHANT_BOOTSTRAP_LOCKS[int(merchant["hex"][:8], 16) % len(_MERCHANT_BOOTSTRAP_LOCKS)]
+    init_db()
+
+    with lock:
+        with engine().begin() as c:
+            if c.engine.dialect.name == "postgresql":
+                c.execute(
+                    text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+                    {"lock_key": f"merchant-bootstrap:{merchant['hex']}"},
+                )
+            elif c.engine.dialect.name == "sqlite":
+                c.exec_driver_sql("BEGIN IMMEDIATE")
+            linked = c.execute(
+                text(
+                    """
+                    SELECT 1 FROM merchant_account_links
+                    WHERE account_id=:account_id AND merchant_pubkey_hex=:merchant_hex
+                      AND source='environment_binding'
+                    LIMIT 1
+                    """
+                ),
+                {"account_id": session["account_id"], "merchant_hex": merchant["hex"]},
+            ).fetchone()
+            if not linked or merchant["hex"] == session["nostr_pubkey_hex"]:
+                raise HTTPException(404, "merchant bootstrap target not found")
+
+            existing = asdict(c.execute(text("SELECT * FROM campaigns WHERE id=:id"), {"id": campaign_id}).fetchone())
+            if existing:
+                conflicts = (
+                    (body.program_name is not None and existing["name"] != program["name"])
+                    or (body.commission_percent is not None and int(existing["commission_bps"]) != program["commission_bps"])
+                    or (body.attribution_window_days is not None and int(existing["window_days"]) != program["window_days"])
+                    or (body.destination_url is not None and existing["destination_url"] != program["destination_url"])
+                    or (body.terms_url is not None and existing.get("terms_url") != program["terms_url"])
+                )
+                if existing.get("merchant_pubkey_hex") != merchant["hex"]:
+                    raise HTTPException(409, "default program identity conflict")
+                if conflicts:
+                    raise HTTPException(409, "program already exists with different settings")
+                event = json.loads(existing["nostr_event_json"])
+                duplicate = True
+                status = existing["status"]
+                relay_results = event.get("relay_results", [])
+                publish_needed = _merchant_campaign_publication_needed(event)
+            else:
+                campaign = {
+                    "id": campaign_id,
+                    "merchant_pubkey": merchant["npub"],
+                    "merchant_pubkey_hex": merchant["hex"],
+                    "name": program["name"],
+                    "commission_bps": program["commission_bps"],
+                    "window_days": program["window_days"],
+                    "destination_url": program["destination_url"],
+                    "terms_url": program["terms_url"],
+                    "terms_hash": sha(program["terms_url"]),
+                    "status": "active",
+                }
+                event = build_campaign_event(campaign, program["terms_url"])
+                c.execute(
+                    text(
+                        """
+                        INSERT INTO campaigns
+                          (id, merchant_pubkey, merchant_pubkey_hex, name, commission_bps, window_days,
+                           destination_url, terms_url, terms_hash, status, nostr_event_id, nostr_event_json, created_at)
+                        VALUES
+                          (:id, :merchant_pubkey, :merchant_pubkey_hex, :name, :commission_bps, :window_days,
+                           :destination_url, :terms_url, :terms_hash, :status, :nostr_event_id, :nostr_event_json, :created_at)
+                        """
+                    ),
+                    {
+                        **campaign,
+                        "nostr_event_id": event["id"],
+                        "nostr_event_json": json.dumps(event),
+                        "created_at": now(),
+                    },
+                )
+                ensure_campaign_budget(c, campaign_id)
+                persist_nostr_event(c, event, "campaign", campaign_id, [])
+
+            timestamp = now()
+            c.execute(
+                text(
+                    """
+                    INSERT INTO merchant_profiles
+                      (merchant_pubkey_hex, merchant_pubkey, display_name, tagline, logo_url, created_at, updated_at)
+                    VALUES (:hex, :npub, :display_name, :tagline, :logo_url, :created_at, :updated_at)
+                    ON CONFLICT(merchant_pubkey_hex) DO UPDATE SET
+                      merchant_pubkey=:npub, display_name=:display_name, tagline=:tagline,
+                      logo_url=:logo_url, updated_at=:updated_at
+                    """
+                ),
+                {
+                    "hex": merchant["hex"], "npub": merchant["npub"],
+                    "display_name": display_name, "tagline": tagline or None, "logo_url": logo_url,
+                    "created_at": timestamp, "updated_at": timestamp,
+                },
+            )
+            invitation = _persist_merchant_campaign_invite(
+                c, session, campaign_id, invite_eyebrow, invite_headline, invite_description
+            )
+
+    assert event is not None
+    if publish_needed:
+        relay_results = finalize_committed_nostr_event(event, "campaign", campaign_id)
+    profile = {
+        "ok": True,
+        "merchant_pubkey": merchant["npub"],
+        "display_name": display_name,
+        "tagline": tagline or None,
+        "logo_url": logo_url,
+    }
+    return {
+        "ok": True,
+        "duplicate": duplicate,
+        "campaign_id": campaign_id,
+        "profile": profile,
+        "invitation": invitation,
     }
 
 

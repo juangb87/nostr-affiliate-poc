@@ -288,10 +288,10 @@ def test_malformed_bindings_remove_stale_delegation_for_direct_owner(tmp_path, m
         f"{direct_owner.public_key().to_bech32()}:{delegated_tenant.public_key().to_bech32()}",
     )
     login(client, direct_owner, "merchant")
-    assert "Delegated tenant campaign" in client.get("/app/merchant").text
+    assert "Delegated tenant campaign" in client.get("/app/merchant?view=campaigns").text
 
     monkeypatch.setenv("MERCHANT_ACCOUNT_BINDINGS", "malformed-binding")
-    page = client.get("/app/merchant")
+    page = client.get("/app/merchant?view=campaigns")
 
     assert page.status_code == 200
     assert "Direct owner campaign" in page.text
@@ -388,7 +388,7 @@ def test_merchant_and_affiliate_workspaces_are_role_scoped(tmp_path, monkeypatch
     create_enrollment(merchant_client, campaign["campaign_id"], affiliate)
 
     login(merchant_client, merchant, "merchant")
-    merchant_page = merchant_client.get("/app/merchant")
+    merchant_page = merchant_client.get("/app/merchant?view=campaigns")
     assert merchant_page.status_code == 200
     assert "Merchant account" in merchant_page.text
     assert "Private merchant campaign" in merchant_page.text
@@ -734,12 +734,44 @@ def test_human_owner_can_be_bound_to_merchant_identity(tmp_path, monkeypatch):
     )
 
     login(client, human_owner, "merchant")
-    page = client.get("/app/merchant")
+    page = client.get("/app/merchant?view=affiliates")
     assert page.status_code == 200
     assert "Bound merchant campaign" in page.text
     assert 'data-merchant-invitation' in page.text
     assert 'name="affiliate_pubkey"' not in page.text
     assert 'value="' + campaign["campaign_id"] + '"' in page.text
+
+
+def test_merchant_workspace_separates_operational_views_and_settings(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    merchant = Keys.generate()
+    create_campaign(client, merchant, name="Navigation campaign")
+    login(client, merchant, "merchant")
+
+    overview = client.get("/app/merchant")
+    assert overview.status_code == 200
+    assert "Tu programa, bajo control." in overview.text
+    assert 'data-merchant-profile' not in overview.text
+    assert 'data-merchant-invitation' not in overview.text
+
+    affiliates = client.get("/app/merchant?view=affiliates")
+    assert affiliates.status_code == 200
+    assert 'data-merchant-invitation' in affiliates.text
+    assert "Afiliados enrolados" in affiliates.text
+    assert 'href="/app/merchant?view=affiliates" aria-current="page"' in affiliates.text
+
+    settings = client.get("/app/merchant?view=settings")
+    assert settings.status_code == 200
+    assert "Marca e invitación" in settings.text
+    assert 'data-merchant-profile' in settings.text
+    assert 'class="merchant-settings-card' in settings.text
+    assert 'href="/app/merchant?view=settings" aria-current="page"' in settings.text
+    onboarding = client.get("/app/merchant/onboarding", follow_redirects=False)
+    assert onboarding.status_code == 303
+    assert onboarding.headers["location"] == "/app/merchant?view=settings"
+
+    invalid = client.get("/app/merchant?view=unknown")
+    assert invalid.status_code == 404
 
 
 def test_bound_owner_can_sign_in_before_tenant_has_a_campaign(tmp_path, monkeypatch):
@@ -762,14 +794,198 @@ def test_bound_owner_can_sign_in_before_tenant_has_a_campaign(tmp_path, monkeypa
     assert link["merchant_pubkey_hex"] == merchant_identity.public_key().to_hex()
     assert link["source"] == "environment_binding"
     assert campaign_count == 0
-    page = client.get("/app/merchant")
+    profile = client.put(
+        "/app/merchant/profile",
+        headers={"origin": "https://testserver"},
+        json={
+            "merchant_pubkey": merchant_identity.public_key().to_bech32(),
+            "display_name": "Onboarding Merchant",
+            "tagline": "Bitcoin commerce",
+            "logo_url": None,
+        },
+    )
+    assert profile.status_code == 200
+    unrelated = client.put(
+        "/app/merchant/profile",
+        headers={"origin": "https://testserver"},
+        json={"merchant_pubkey": Keys.generate().public_key().to_bech32(), "display_name": "Nope"},
+    )
+    assert unrelated.status_code == 404
+    redirect = client.get("/app/merchant", follow_redirects=False)
+    assert redirect.status_code == 303
+    assert redirect.headers["location"] == "/app/merchant/onboarding"
+
+    page = client.get("/app/merchant/onboarding")
     assert page.status_code == 200
-    assert "Crear tu Programa de Afiliados" in page.text
+    assert "Configurá tu programa" in page.text
+    assert 'data-merchant-onboarding-wizard' in page.text
+    assert 'data-onboarding-step="1"' in page.text
+    assert 'data-onboarding-step="2"' in page.text
+    assert 'data-onboarding-step="3"' in page.text
     assert 'data-merchant-bootstrap' in page.text
     assert f'value="{merchant_identity.public_key().to_bech32()}"' in page.text
-    assert "Crear programa activo" in page.text
-    assert "una vez publicado, el evento Nostr deja prueba" in page.text
+    assert "Crear programa y terminar" in page.text
     assert "Shopify conectado" not in page.text
+
+
+def test_merchant_onboarding_endpoint_is_idempotent_and_persists_all_steps(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    owner = Keys.generate()
+    merchant = Keys.generate()
+    monkeypatch.setenv(
+        "MERCHANT_ACCOUNT_BINDINGS",
+        f"{owner.public_key().to_bech32()}:{merchant.public_key().to_bech32()}",
+    )
+    login(client, owner, "merchant")
+    payload = {
+        "merchant_pubkey": merchant.public_key().to_bech32(),
+        "display_name": "Lightning Koffee",
+        "tagline": "Café, Bitcoin y comunidad",
+        "logo_url": None,
+        "program_name": "Lightning Koffee Affiliate Program",
+        "commission_percent": "8",
+        "attribution_window_days": 30,
+        "destination_url": "https://lightningkoffee.io",
+        "terms_url": "https://lightningkoffee.io/terms",
+        "invite_eyebrow": "Programa de afiliados · Value for value",
+        "invite_headline": "Recomendá café. Ganá sats.",
+        "invite_description": "Compartí la marca con tu comunidad.",
+    }
+    created = client.post(
+        "/app/merchant/onboarding",
+        headers={"origin": "https://testserver"},
+        json=payload,
+    )
+    assert created.status_code == 200
+    assert created.json()["duplicate"] is False
+    retried = client.post(
+        "/app/merchant/onboarding",
+        headers={"origin": "https://testserver"},
+        json=payload,
+    )
+    assert retried.status_code == 200
+    assert retried.json()["duplicate"] is True
+    with main.engine().connect() as connection:
+        row = connection.execute(
+            text(
+                """
+                SELECT c.name, c.commission_bps, c.invite_headline,
+                       p.display_name, p.tagline
+                FROM campaigns c JOIN merchant_profiles p
+                  ON p.merchant_pubkey_hex=c.merchant_pubkey_hex
+                WHERE c.id=:id
+                """
+            ),
+            {"id": created.json()["campaign_id"]},
+        ).mappings().one()
+    assert row == {
+        "name": "Lightning Koffee Affiliate Program",
+        "commission_bps": 800,
+        "invite_headline": "Recomendá café. Ganá sats.",
+        "display_name": "Lightning Koffee",
+        "tagline": "Café, Bitcoin y comunidad",
+    }
+
+
+def test_merchant_onboarding_page_keeps_campaignless_bound_tenant_eligible(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    owner = Keys.generate()
+    configured = Keys.generate()
+    campaignless = Keys.generate()
+    create_campaign(client, configured, name="Configured tenant")
+    monkeypatch.setenv(
+        "MERCHANT_ACCOUNT_BINDINGS",
+        ",".join(
+            [
+                f"{owner.public_key().to_bech32()}:{configured.public_key().to_bech32()}",
+                f"{owner.public_key().to_bech32()}:{campaignless.public_key().to_bech32()}",
+            ]
+        ),
+    )
+    login(client, owner, "merchant")
+
+    page = client.get("/app/merchant/onboarding", follow_redirects=False)
+
+    assert page.status_code == 200
+    assert f'value="{campaignless.public_key().to_bech32()}"' in page.text
+    assert f'value="{configured.public_key().to_bech32()}"' not in page.text
+
+
+def test_merchant_onboarding_conflict_does_not_modify_profile(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    owner = Keys.generate()
+    merchant = Keys.generate()
+    monkeypatch.setenv(
+        "MERCHANT_ACCOUNT_BINDINGS",
+        f"{owner.public_key().to_bech32()}:{merchant.public_key().to_bech32()}",
+    )
+    login(client, owner, "merchant")
+    payload = {
+        "merchant_pubkey": merchant.public_key().to_bech32(),
+        "display_name": "Original profile",
+        "program_name": "Original program",
+        "commission_percent": "8",
+        "attribution_window_days": 30,
+        "destination_url": "https://merchant.example/shop",
+        "terms_url": "https://merchant.example/terms",
+    }
+    assert client.post(
+        "/app/merchant/onboarding", headers={"origin": "https://testserver"}, json=payload
+    ).status_code == 200
+
+    conflict = client.post(
+        "/app/merchant/onboarding",
+        headers={"origin": "https://testserver"},
+        json={**payload, "display_name": "Must roll back", "program_name": "Conflicting program"},
+    )
+
+    assert conflict.status_code == 409
+    with main.engine().connect() as connection:
+        display_name = connection.execute(
+            text("SELECT display_name FROM merchant_profiles WHERE merchant_pubkey_hex=:hex"),
+            {"hex": merchant.public_key().to_hex()},
+        ).scalar_one()
+    assert display_name == "Original profile"
+
+
+def test_merchant_onboarding_final_failure_rolls_back_campaign_and_profile(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    owner = Keys.generate()
+    merchant = Keys.generate()
+    monkeypatch.setenv(
+        "MERCHANT_ACCOUNT_BINDINGS",
+        f"{owner.public_key().to_bech32()}:{merchant.public_key().to_bech32()}",
+    )
+    login(client, owner, "merchant")
+
+    def fail_invitation(*args, **kwargs):
+        raise RuntimeError("final onboarding persistence failed")
+
+    monkeypatch.setattr(main, "_persist_merchant_campaign_invite", fail_invitation)
+    with pytest.raises(RuntimeError, match="final onboarding persistence failed"):
+        client.post(
+            "/app/merchant/onboarding",
+            headers={"origin": "https://testserver"},
+            json={
+                "merchant_pubkey": merchant.public_key().to_bech32(),
+                "display_name": "Must not persist",
+                "program_name": "Must not persist",
+                "destination_url": "https://merchant.example/shop",
+                "terms_url": "https://merchant.example/terms",
+            },
+        )
+
+    with main.engine().connect() as connection:
+        campaign_count = connection.execute(
+            text("SELECT COUNT(*) FROM campaigns WHERE merchant_pubkey_hex=:hex"),
+            {"hex": merchant.public_key().to_hex()},
+        ).scalar_one()
+        profile_count = connection.execute(
+            text("SELECT COUNT(*) FROM merchant_profiles WHERE merchant_pubkey_hex=:hex"),
+            {"hex": merchant.public_key().to_hex()},
+        ).scalar_one()
+    assert campaign_count == 0
+    assert profile_count == 0
 
 
 def test_merchant_bootstrap_browser_contract_is_same_origin_json(tmp_path, monkeypatch):
@@ -782,7 +998,7 @@ def test_merchant_bootstrap_browser_contract_is_same_origin_json(tmp_path, monke
     )
     login(client, human_owner, "merchant")
 
-    page = client.get("/app/merchant")
+    page = client.get("/app/merchant/onboarding")
     script = client.get("/static/app.js")
 
     assert page.status_code == 200
@@ -793,11 +1009,18 @@ def test_merchant_bootstrap_browser_contract_is_same_origin_json(tmp_path, monke
     assert 'name="destination_url"' in page.text
     assert 'name="terms_url"' in page.text
     assert 'name="logo_url"' in page.text
+    assert 'name="display_name"' in page.text
+    assert 'name="tagline"' in page.text
+    assert 'name="invite_eyebrow"' in page.text
+    assert 'name="invite_headline"' in page.text
+    assert 'name="invite_description"' in page.text
     assert 'data-bootstrap-status' in page.text
     assert script.status_code == 200
     assert 'event.target.closest("[data-merchant-bootstrap]")' in script.text
-    assert 'jsonFetch("/app/merchant/bootstrap"' in script.text
-    assert 'merchant_pubkey: String(fields.get("merchant_pubkey")' in script.text
+    assert 'await jsonFetch("/app/merchant/bootstrap"' in script.text
+    assert 'await jsonFetch("/app/merchant/onboarding"' in script.text
+    assert "currentStep < 3" in script.text
+    assert 'method: "POST", body: JSON.stringify(payload)' in script.text
     assert 'program_name: String(fields.get("program_name")' in script.text
     assert 'commission_percent: String(fields.get("commission_percent")' in script.text
     assert 'logo_url: String(fields.get("logo_url")' in script.text
@@ -908,7 +1131,7 @@ def test_merchant_bootstrap_creates_configurable_active_program_and_reusable_log
         json={**payload, "commission_percent": "9"},
     )
     assert conflict.status_code == 409
-    workspace = client.get("/app/merchant")
+    workspace = client.get("/app/merchant?view=settings")
     assert 'data-merchant-profile' in workspace.text
     assert f'value="{payload["logo_url"]}"' in workspace.text
     updated_logo = "https://images.example.com/brands/shapersfit.png"
@@ -1288,13 +1511,13 @@ def test_merchants_cannot_see_each_others_campaigns(tmp_path, monkeypatch):
     create_campaign(client, merchant_b, name="Only Merchant Beta")
 
     login(client, merchant_a, "merchant")
-    alpha_page = client.get("/app/merchant")
+    alpha_page = client.get("/app/merchant?view=campaigns")
     assert "Only Merchant Alpha" in alpha_page.text
     assert "Only Merchant Beta" not in alpha_page.text
 
     client.post("/auth/logout")
     login(client, merchant_b, "merchant")
-    beta_page = client.get("/app/merchant")
+    beta_page = client.get("/app/merchant?view=campaigns")
     assert "Only Merchant Beta" in beta_page.text
     assert "Only Merchant Alpha" not in beta_page.text
 
@@ -1498,23 +1721,26 @@ def test_merchant_dashboard_exposes_clicks_affiliate_npubs_shopify_sales_and_cop
         )
 
     login(client, merchant, "merchant")
-    page = client.get("/app/merchant")
+    overview = client.get("/app/merchant")
+    affiliates_page = client.get("/app/merchant?view=affiliates")
+    activity_page = client.get("/app/merchant?view=activity")
+    integration_page = client.get("/app/merchant?view=integration")
 
-    assert page.status_code == 200
-    assert "Clicks" in page.text
-    assert "Compras Shopify" in page.text
-    assert "$149.50" in page.text
-    assert affiliate_a.public_key().to_bech32() in page.text
-    assert affiliate_b.public_key().to_bech32() in page.text
-    assert other_affiliate.public_key().to_bech32() not in page.text
-    assert "Shopify Theme Script" in page.text
-    assert "Shopify Custom Pixel" in page.text
-    assert "https://testserver/v1/events" in page.text
-    assert "https://testserver/v1/conversions" in page.text
-    assert "pilot-shop.myshopify.com" in page.text
-    assert "/cart/update.js" in page.text
-    assert 'data-copy-target="#shopify-theme-script"' in page.text
-    assert 'data-copy-target="#shopify-custom-pixel"' in page.text
+    assert overview.status_code == affiliates_page.status_code == activity_page.status_code == integration_page.status_code == 200
+    assert "Clicks" in activity_page.text
+    assert "Compras Shopify" in overview.text
+    assert "$149.50" in overview.text
+    assert affiliate_a.public_key().to_bech32() in affiliates_page.text
+    assert affiliate_b.public_key().to_bech32() in affiliates_page.text
+    assert other_affiliate.public_key().to_bech32() not in affiliates_page.text
+    assert "Shopify Theme Script" in integration_page.text
+    assert "Shopify Custom Pixel" in integration_page.text
+    assert "https://testserver/v1/events" in integration_page.text
+    assert "https://testserver/v1/conversions" in integration_page.text
+    assert "pilot-shop.myshopify.com" in integration_page.text
+    assert "/cart/update.js" in integration_page.text
+    assert 'data-copy-target="#shopify-theme-script"' in integration_page.text
+    assert 'data-copy-target="#shopify-custom-pixel"' in integration_page.text
 
 
 def test_affiliate_updates_lightning_address_and_only_safe_pending_payouts(tmp_path, monkeypatch):
@@ -1690,7 +1916,7 @@ def test_merchant_manual_settlement_is_owned_idempotent_and_attested(tmp_path, m
 
     client.post("/auth/logout")
     login(client, merchant, "merchant")
-    merchant_page = client.get("/app/merchant")
+    merchant_page = client.get("/app/merchant?view=payouts")
     assert "old@example.com" in merchant_page.text
     assert f'data-manual-payout="{payout_id}"' in merchant_page.text
     assert 'class="record payout-record"' in merchant_page.text

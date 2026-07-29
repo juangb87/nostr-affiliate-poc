@@ -1,28 +1,8 @@
 {% extends "base.html" %}
 {% block title %}Merchant · Meerat{% endblock %}
 {% block content %}
-<header class="page-header"><div><p class="eyebrow">Merchant account</p><h1>Tu programa, bajo control.</h1><p class="lede">Campañas, atribución y obligaciones de pago de tus comercios, sin mezclar datos de otros merchants.</p></div><div class="header-actions"><a class="button secondary" href="#integration">Ver integración</a></div></header>
-{% if not totals.campaigns and bootstrap_tenants %}
-<section class="section" id="onboarding" data-merchant-onboarding>
-  <div class="section-head"><div><p class="eyebrow">Primer paso</p><h2>Crear tu Programa de Afiliados</h2><p>Definí las condiciones públicas del programa. La campaña queda activa y lista para invitar Affiliates.</p></div></div>
-  <form class="panel form-panel" data-merchant-bootstrap>
-    {% if bootstrap_tenants|length == 1 %}
-      <input type="hidden" name="merchant_pubkey" value="{{ bootstrap_tenants[0].merchant_pubkey }}">
-      <label><span>Identidad Merchant</span><code>{{ bootstrap_tenants[0].merchant_short }}</code></label>
-    {% else %}
-      <label><span>Identidad Merchant</span><select name="merchant_pubkey" required>{% for tenant in bootstrap_tenants %}<option value="{{ tenant.merchant_pubkey }}">{{ tenant.merchant_short }}</option>{% endfor %}</select></label>
-    {% endif %}
-    <label><span>Nombre del programa</span><input name="program_name" maxlength="160" value="{{ program_defaults.name }}" required autocomplete="organization"></label>
-    <label><span>Comisión por venta (%)</span><input name="commission_percent" type="number" min="0.01" max="100" step="0.01" value="{{ program_defaults.commission_bps / 100 }}" required inputmode="decimal"><small>Ejemplo: 8 equivale al 8%.</small></label>
-    <label><span>Ventana de atribución (días)</span><input name="attribution_window_days" type="number" min="1" max="365" step="1" value="{{ program_defaults.window_days }}" required inputmode="numeric"></label>
-    <label><span>URL de destino</span><input name="destination_url" type="url" maxlength="3000" value="{{ program_defaults.destination_url }}" required placeholder="https://tienda.example/"></label>
-    <label><span>URL de términos</span><input name="terms_url" type="url" maxlength="3000" value="{{ program_defaults.terms_url }}" required placeholder="https://tienda.example/terminos-afiliados"></label>
-    <label><span>Logo del Merchant (URL HTTPS)</span><input name="logo_url" type="url" maxlength="2048" placeholder="https://cdn.example.com/logo.png"><small>PNG, JPG o WebP público. Se reutiliza en la página pública.</small></label>
-    <button class="button" type="submit">Crear programa activo</button>
-    <p class="form-status" role="status" aria-live="polite" data-bootstrap-status>Revisá los datos: una vez publicado, el evento Nostr deja prueba de estas condiciones.</p>
-  </form>
-</section>
-{% endif %}
+<header class="page-header"><div><p class="eyebrow">{{ view_meta.eyebrow }}</p><h1>{{ view_meta.title }}</h1><p class="lede">{{ view_meta.lede }}</p></div>{% if view == 'overview' %}<div class="header-actions"><a class="button secondary" href="/app/merchant?view=integration">Ver integración</a></div>{% endif %}</header>
+{% if view == 'overview' %}
 <section class="metrics merchant-metrics" aria-label="Métricas merchant">
   <article class="metric"><span>Campañas activas</span><strong>{{ totals.active_campaigns }}</strong><small>de {{ totals.campaigns }} programas</small></article>
   <article class="metric"><span>Afiliados</span><strong>{{ totals.affiliates }}</strong><small>npubs enrolados</small></article>
@@ -32,6 +12,13 @@
   <article class="metric"><span>Comisiones</span><strong>{{ totals.commission_sats }}</strong><small>sats generados</small></article>
 </section>
 {% if totals.actionable_payouts %}<aside class="notice"><div><strong>{{ totals.actionable_payouts }} pago{% if totals.actionable_payouts != 1 %}s{% endif %} requiere{% if totals.actionable_payouts == 1 %}{% else %}n{% endif %} atención.</strong><p>Revisá destino y monto, pagá desde tu wallet y registrá la evidencia sin ceder custodia a Meerat.</p></div></aside>{% endif %}
+<section class="section"><div class="section-head"><div><h2>Próximas acciones</h2><p>Entrá directo al flujo que necesitás operar.</p></div></div><div class="workspace-actions">
+  <a href="/app/merchant?view=affiliates"><span>01</span><strong>Invitar Affiliates</strong><small>Generá un enlace privado de inscripción.</small></a>
+  <a href="/app/merchant?view=activity"><span>02</span><strong>Revisar actividad</strong><small>Clicks, conversiones y comisiones.</small></a>
+  <a href="/app/merchant?view=settings"><span>03</span><strong>Actualizar marca</strong><small>Editá la identidad y el copy del invite.</small></a>
+</div></section>
+{% endif %}
+{% if view == 'affiliates' %}
 <section class="section" id="invite-affiliate"><div class="section-head"><div><h2>Invitar Affiliate</h2><p>Generá un enlace privado. La identidad queda asociada recién cuando el Affiliate acepta y firma.</p></div></div>
   <form class="panel form-panel" data-merchant-invitation>
     <label><span>Campaña</span><select name="campaign_id" required>{% for campaign in campaigns if campaign.status == 'active' %}<option value="{{ campaign.id }}">{{ campaign.name }}</option>{% else %}<option value="" disabled>No hay campañas activas</option>{% endfor %}</select></label>
@@ -44,31 +31,37 @@
     </div>
   </form>
 </section>
-{% if campaigns %}
-<section class="section" id="merchant-profile"><div class="section-head"><div><h2>Marca e invitación Affiliate</h2><p>Personalizá la identidad del Merchant y el copy de cada campaña sin cambiar el flujo seguro.</p></div></div><div class="integration">
-{% for campaign in campaigns %}<form class="integration-card form-panel" data-merchant-profile>
+{% endif %}
+{% if view == 'settings' and campaigns %}
+<section class="section" id="merchant-profile"><div class="section-head"><div><h2>Marca e invitación Affiliate</h2><p>Personalizá la identidad del Merchant y el copy de cada campaña. Estos valores se definieron en onboarding y podés actualizarlos cuando quieras.</p></div></div><div class="merchant-settings-list">
+{% for campaign in campaigns %}<form class="merchant-settings-card panel" data-merchant-profile>
   <input type="hidden" name="merchant_pubkey" value="{{ campaign.merchant_pubkey }}"><input type="hidden" name="campaign_id" value="{{ campaign.id }}">
-  <h3>{{ campaign.name }}</h3>
-  {% if campaign.logo_url %}<img class="merchant-logo-preview" src="{{ campaign.logo_url }}" alt="Logo de {{ campaign.display_name or campaign.name }}" referrerpolicy="no-referrer">{% else %}<span class="merchant-logo-placeholder" aria-hidden="true">{{ (campaign.display_name or campaign.name)[:1] }}</span>{% endif %}
-  <label><span>Nombre visible del Merchant</span><input name="display_name" maxlength="120" value="{{ campaign.display_name or '' }}" placeholder="Lightning Koffee"><small>Es la marca protagonista del lander.</small></label>
-  <label><span>Tagline</span><input name="tagline" maxlength="180" value="{{ campaign.tagline or '' }}" placeholder="Café, Bitcoin y comunidad"></label>
-  <label><span>Logo (URL HTTPS)</span><input name="logo_url" type="url" maxlength="2048" value="{{ campaign.logo_url or '' }}" placeholder="https://cdn.example.com/logo.png"><small>PNG, JPG o WebP público. Si falta, usamos las iniciales.</small></label>
-  <label><span>Eyebrow de invitación</span><input name="invite_eyebrow" maxlength="100" value="{{ campaign.invite_eyebrow or '' }}" placeholder="Programa de afiliados · Value for value"></label>
-  <label><span>Headline</span><input name="invite_headline" maxlength="120" value="{{ campaign.invite_headline or '' }}" placeholder="Recomendá café. Ganá sats."></label>
-  <label><span>Descripción</span><textarea name="invite_description" maxlength="360" rows="4" placeholder="Sumate al programa de afiliados…">{{ campaign.invite_description or '' }}</textarea><small>Dejá los campos de copy vacíos para usar el fallback automático.</small></label>
-  <button class="button secondary" type="submit">Guardar marca e invitación</button>
-  <p class="form-status" role="status" aria-live="polite" data-profile-status>Estos datos se aplican a futuras resoluciones de invitaciones existentes y nuevas.</p>
+  <div class="settings-card-head"><div><p class="eyebrow">Campaña</p><h3>{{ campaign.name }}</h3></div><a class="action" href="/campaigns/{{ campaign.id }}/page" target="_blank" rel="noopener">Ver página pública ↗</a></div>
+  <div class="settings-logo-cell">{% if campaign.logo_url %}<img class="merchant-logo-preview" src="{{ campaign.logo_url }}" alt="Logo de {{ campaign.display_name or campaign.name }}" referrerpolicy="no-referrer">{% else %}<span class="merchant-logo-placeholder" aria-hidden="true">{{ (campaign.display_name or campaign.name)[:1] }}</span>{% endif %}<small>Vista previa</small></div>
+  <label><span>Nombre visible del Merchant</span><input name="display_name" maxlength="120" value="{{ campaign.display_name or '' }}" placeholder="Lightning Koffee"><small>La marca protagonista del lander.</small></label>
+  <label><span>Tagline</span><input name="tagline" maxlength="180" value="{{ campaign.tagline or '' }}" placeholder="Café, Bitcoin y comunidad"><small>Una frase corta sobre tu marca.</small></label>
+  <label class="field-wide"><span>Logo (URL HTTPS)</span><input name="logo_url" type="url" maxlength="2048" value="{{ campaign.logo_url or '' }}" placeholder="https://cdn.example.com/logo.png"><small>PNG, JPG o WebP público. Si falta, usamos las iniciales.</small></label>
+  <div class="settings-divider"><span>Copy de invitación</span><small>Lo que verá el Affiliate antes de firmar.</small></div>
+  <label class="invite-eyebrow-field"><span>Eyebrow de invitación</span><input name="invite_eyebrow" maxlength="100" value="{{ campaign.invite_eyebrow or '' }}" placeholder="Programa de afiliados · Value for value"></label>
+  <label class="invite-headline-field"><span>Headline</span><input name="invite_headline" maxlength="120" value="{{ campaign.invite_headline or '' }}" placeholder="Recomendá café. Ganá sats."></label>
+  <label class="field-wide"><span>Descripción</span><textarea name="invite_description" maxlength="360" rows="4" placeholder="Sumate al programa de afiliados…">{{ campaign.invite_description or '' }}</textarea><small>Dejá los campos de copy vacíos para usar el fallback automático.</small></label>
+  <div class="settings-actions"><button class="button" type="submit">Guardar cambios</button><p class="form-status" role="status" aria-live="polite" data-profile-status>Los cambios se aplican también a invitaciones existentes.</p></div>
 </form>{% endfor %}
 </div></section>
 {% endif %}
+{% if view == 'campaigns' %}
 <section class="section" id="campaigns"><div class="section-head"><div><h2>Campañas</h2><p>Actividad y condiciones del programa.</p></div></div><div class="panel record-list">
 {% for campaign in campaigns %}<article class="record"><div class="record-main"><strong>{{ campaign.name }}</strong><span>{{ campaign.commission_percent }}% · ventana {{ campaign.window_days }} días</span></div><div><span class="label-mobile">Afiliados</span><strong>{{ campaign.affiliates }}</strong><div class="record-meta">afiliados</div></div><div><span class="label-mobile">Conversiones</span><strong>{{ campaign.conversions }}</strong><div class="record-meta">conversiones</div></div><div><span class="badge {% if campaign.status == 'active' %}success{% endif %}">{{ campaign.status }}</span></div><a class="action" href="/campaigns/{{ campaign.id }}/page">Página pública</a></article>
 {% else %}<div class="empty">No hay campañas asociadas a esta cuenta merchant.</div>{% endfor %}
 </div></section>
+{% endif %}
+{% if view == 'affiliates' %}
 <section class="section" id="affiliates"><div class="section-head"><div><h2>Afiliados enrolados</h2><p>Todos los npubs vinculados a tus programas.</p></div><span class="section-count">{{ totals.affiliates }} total</span></div><div class="panel record-list compact-records">
 {% for enrollment in enrollments %}<article class="record identity-record"><div class="record-main"><strong class="identity-code" title="{{ enrollment.affiliate_npub }}">{{ enrollment.affiliate_npub }}</strong><span>{{ enrollment.campaign_name }} · {{ enrollment.created_at }}</span></div><div><span class="label-mobile">Ref code</span><code>{{ enrollment.ref_code }}</code></div><div><span class="badge {% if enrollment.status == 'approved' %}success{% endif %}">{{ enrollment.status }}</span></div><button class="action copy-action" type="button" data-copy="{{ enrollment.affiliate_npub }}">Copiar npub</button></article>
 {% else %}<div class="empty">Todavía no hay npubs enrolados.</div>{% endfor %}
 </div></section>
+{% endif %}
+{% if view == 'activity' %}
 <section class="section" id="clicks"><div class="section-head"><div><h2>Clicks</h2><p>Últimas redirecciones registradas desde enlaces de afiliados.</p></div><span class="section-count">{{ totals.clicks }} total</span></div><div class="panel record-list compact-records">
 {% for click in clicks %}<article class="record click-record"><div class="record-main"><strong>{{ click.campaign_name }}</strong><span>{{ click.created_at }}</span></div><div><span class="label-mobile">Click ID</span><code title="{{ click.id }}">{{ click.id_short }}</code></div><div><span class="label-mobile">Affiliate</span><code title="{{ click.affiliate_pubkey }}">{{ click.affiliate_short }}</code></div><div class="record-meta landing-url" title="{{ click.landing_url or '' }}">{{ click.landing_url or 'Destino no informado' }}</div></article>
 {% else %}<div class="empty">Todavía no hay clicks registrados.</div>{% endfor %}
@@ -77,10 +70,14 @@
 {% for conversion in conversions %}<article class="record"><div class="record-main"><strong>{{ conversion.campaign_name }}</strong><span>{{ conversion.created_at }}</span></div><div><span class="label-mobile">Venta</span><strong>{{ conversion.order_total }} {{ conversion.currency }}</strong></div><div><span class="label-mobile">Comisión</span><strong>{{ conversion.commission_sats }} sats</strong></div><div><span class="badge {% if conversion.status == 'approved' %}success{% endif %}">{{ conversion.status }}</span></div><a class="action" href="/flows/{{ conversion.id }}/receipt">Receipt</a></article>
 {% else %}<div class="empty">Todavía no hay conversiones atribuidas.</div>{% endfor %}
 </div></section>
+{% endif %}
+{% if view == 'payouts' %}
 <section class="section" id="payouts"><div class="section-head"><div><h2>Obligaciones de pago</h2><p>Estado financiero; no implica que Meerat custodie fondos.</p></div></div><div class="panel record-list">
 {% for payout in payouts %}<article class="record payout-record"><div class="record-main"><strong>{{ payout.amount_sats }} sats</strong><span>{{ payout.campaign_name }}</span>{% if payout.lightning_address %}<code>{{ payout.lightning_address }}</code>{% else %}<small>El Affiliate debe configurar su Lightning Address.</small>{% endif %}</div><div><span class="label-mobile">Afiliado</span><code>{{ payout.affiliate_short }}</code></div><div><span class="label-mobile">Estado</span><span class="badge {% if payout.state in ['SETTLED','PUBLISHED'] %}success{% elif payout.state in ['FAILED','UNKNOWN'] %}danger{% endif %}">{{ payout.user_state }}</span></div><div class="record-meta"><span class="label-mobile">Creado</span>{{ payout.created_at }}</div><div class="payout-actions">{% if payout.return_window_pending %}<small>Liquidable después de {{ payout.return_window_ends_at }}</small>{% elif payout.manual_payable %}<details class="payout-details"><summary class="action">Pagar / registrar</summary><form class="form-panel payout-form" data-manual-payout="{{ payout.id }}"><div class="invoice-preparation"><button class="button secondary" type="button" data-prepare-invoice>Generar invoice y QR</button><p class="form-status" role="status" aria-live="polite" data-invoice-status>El invoice se genera directamente desde {{ payout.lightning_address }}.</p></div><div class="invoice-panel" data-invoice-panel hidden><div class="invoice-qr-frame"><img data-invoice-qr alt="QR del invoice Lightning para {{ payout.amount_sats }} sats"></div><div class="invoice-details"><span class="eyebrow">Invoice Lightning</span><strong><span data-invoice-amount>{{ payout.amount_sats }}</span> sats</strong><span data-invoice-destination>{{ payout.lightning_address }}</span><code data-invoice-text></code><button class="button secondary" type="button" data-invoice-copy>Copiar BOLT11</button><button class="button" type="button" data-use-invoice-hash>Ya pagué · usar este hash</button><small data-invoice-expiry></small><small class="invoice-warning">Generar el invoice no realiza ni verifica el pago. Pagalo desde tu wallet antes de usar el hash.</small></div></div><label><span>Tipo de evidencia</span><select name="evidence_type"><option value="payment_hash">Payment hash / ID</option><option value="preimage">Preimage (se hashea localmente)</option></select></label><label><span>Valor hexadecimal</span><input name="evidence" pattern="[0-9a-fA-F]{64}" minlength="64" maxlength="64" autocomplete="off" required></label><label class="payout-confirmation"><input name="confirmed" type="checkbox" required><span>Confirmo que pagué {{ payout.amount_sats }} sats a {{ payout.lightning_address }}</span></label><button class="button" type="submit">Confirmar liquidación</button><p class="form-status" role="status" aria-live="polite" data-manual-status>Esto registra una atestación del Merchant.</p></form></details>{% endif %}<a class="action" href="/payouts/{{ payout.id }}/receipt">Receipt</a></div></article>
 {% else %}<div class="empty">No hay obligaciones de pago registradas.</div>{% endfor %}
 </div></section>
+{% endif %}
+{% if view == 'integration' %}
 <section class="section" id="integration"><div class="section-head"><div><h2>Integración Shopify</h2><p>Scripts listos para copiar, pegar y conectar Lightning Koffee.</p></div></div><div class="integration integration-status-grid">
 <article class="integration-card"><h3>Shopify orders/paid</h3><p>{{ integration.shopify_detail }}</p><span class="badge {% if integration.shopify_ready %}success{% endif %}">{{ 'Conectado' if integration.shopify_ready else 'Requiere atención' }}</span></article>
 <article class="integration-card"><h3>Tracking del sitio</h3><p>{{ integration.tracking_events }} eventos asociados a tus campañas.</p><span class="badge {% if integration.tracking_events > 0 %}success{% endif %}">{{ 'Recibiendo eventos' if integration.tracking_events > 0 else 'Esperando primer evento' }}</span></article>
@@ -91,4 +88,5 @@
 <article class="installation-card webhook-card"><div class="installation-head"><div><span class="step-number">03</span><div><h3>Webhook orders/paid</h3><p>Configurá este endpoint para el evento <code>orders/paid</code>. Shopify debe firmarlo con el secret configurado en Railway.</p></div></div><button class="button secondary" type="button" data-copy="{{ shopify_installation.webhook_url }}">Copiar URL</button></div><code class="endpoint-code">{{ shopify_installation.webhook_url }}</code><small>Tienda configurada: <code>{{ shopify_installation.shop_domain }}</code></small></article>
 </div>{% else %}<aside class="notice"><div><strong>Instalación no disponible para esta identidad.</strong><p>Solo la cuenta Merchant vinculada a la tienda Shopify puede ver y copiar estos snippets.</p></div></aside>{% endif %}
 </section>
+{% endif %}
 {% endblock %}
