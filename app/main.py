@@ -1317,13 +1317,19 @@ def archive_campaign_preserving_history(
     return True
 
 
-def apply_requested_campaign_archives() -> None:
-    """One-shot production cleanup approved by the Lightning Koffee merchant."""
-    archive_campaign_preserving_history(
+@app.post("/internal/migrations/archive-lightning-koffee-canary")
+def apply_requested_campaign_archive(
+    x_migration_token: Optional[str] = Header(None),
+) -> dict[str, Any]:
+    token_hash = hashlib.sha256((x_migration_token or "").encode()).hexdigest()
+    if not hmac.compare_digest(token_hash, "00aabb8156fe02de4986412704b3347a28d1406233850a2657da13d54e5d8434"):
+        raise HTTPException(404, "not found")
+    changed = archive_campaign_preserving_history(
         "camp_aowrZDPrmp",
         expected_merchant_hex="c19621bcad2c9d502618dfaf25a6be0fde23bd730e51889dc883376c91cca6c4",
         expected_name="Meerat NWC Canary 21 sats",
     )
+    return {"ok": True, "changed": changed, "campaign_id": "camp_aowrZDPrmp"}
 
 
 def record_ledger_transaction(
@@ -1484,7 +1490,6 @@ def release_campaign_budget(
 def startup() -> None:
     validate_runtime_security()
     init_db()
-    apply_requested_campaign_archives()
 
 
 class CampaignIn(BaseModel):
