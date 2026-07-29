@@ -39,7 +39,7 @@ def merchant_workspace_data(connection: Any, session: dict[str, Any], *, base_ur
     identity_list = sorted(identities)
     campaign_stmt = text(
         """
-        SELECT c.*, mp.logo_url,
+        SELECT c.*, mp.logo_url, mp.display_name, mp.tagline,
           (SELECT COUNT(*) FROM enrollments e WHERE e.campaign_id=c.id) AS affiliates,
           (SELECT COUNT(*) FROM conversions v WHERE v.campaign_id=c.id) AS conversions
         FROM campaigns c

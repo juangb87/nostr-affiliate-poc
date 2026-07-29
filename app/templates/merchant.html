@@ -45,14 +45,19 @@
   </form>
 </section>
 {% if campaigns %}
-<section class="section" id="merchant-profile"><div class="section-head"><div><h2>Perfil público del Merchant</h2><p>El logo se comparte entre las campañas de esta identidad Merchant.</p></div></div><div class="integration">
+<section class="section" id="merchant-profile"><div class="section-head"><div><h2>Marca e invitación Affiliate</h2><p>Personalizá la identidad del Merchant y el copy de cada campaña sin cambiar el flujo seguro.</p></div></div><div class="integration">
 {% for campaign in campaigns %}<form class="integration-card form-panel" data-merchant-profile>
-  <input type="hidden" name="merchant_pubkey" value="{{ campaign.merchant_pubkey }}">
+  <input type="hidden" name="merchant_pubkey" value="{{ campaign.merchant_pubkey }}"><input type="hidden" name="campaign_id" value="{{ campaign.id }}">
   <h3>{{ campaign.name }}</h3>
-  {% if campaign.logo_url %}<img class="merchant-logo-preview" src="{{ campaign.logo_url }}" alt="Logo de {{ campaign.name }}" referrerpolicy="no-referrer">{% else %}<span class="merchant-logo-placeholder" aria-hidden="true">{{ campaign.name[:1] }}</span>{% endif %}
-  <label><span>Logo (URL HTTPS)</span><input name="logo_url" type="url" maxlength="2048" value="{{ campaign.logo_url or '' }}" placeholder="https://cdn.example.com/logo.png"><small>Dejalo vacío y guardá para eliminarlo.</small></label>
-  <button class="button secondary" type="submit">Guardar logo</button>
-  <p class="form-status" role="status" aria-live="polite" data-profile-status>PNG, JPG o WebP público.</p>
+  {% if campaign.logo_url %}<img class="merchant-logo-preview" src="{{ campaign.logo_url }}" alt="Logo de {{ campaign.display_name or campaign.name }}" referrerpolicy="no-referrer">{% else %}<span class="merchant-logo-placeholder" aria-hidden="true">{{ (campaign.display_name or campaign.name)[:1] }}</span>{% endif %}
+  <label><span>Nombre visible del Merchant</span><input name="display_name" maxlength="120" value="{{ campaign.display_name or '' }}" placeholder="Lightning Koffee"><small>Es la marca protagonista del lander.</small></label>
+  <label><span>Tagline</span><input name="tagline" maxlength="180" value="{{ campaign.tagline or '' }}" placeholder="Café, Bitcoin y comunidad"></label>
+  <label><span>Logo (URL HTTPS)</span><input name="logo_url" type="url" maxlength="2048" value="{{ campaign.logo_url or '' }}" placeholder="https://cdn.example.com/logo.png"><small>PNG, JPG o WebP público. Si falta, usamos las iniciales.</small></label>
+  <label><span>Eyebrow de invitación</span><input name="invite_eyebrow" maxlength="100" value="{{ campaign.invite_eyebrow or '' }}" placeholder="Programa de afiliados · Value for value"></label>
+  <label><span>Headline</span><input name="invite_headline" maxlength="120" value="{{ campaign.invite_headline or '' }}" placeholder="Recomendá café. Ganá sats."></label>
+  <label><span>Descripción</span><textarea name="invite_description" maxlength="360" rows="4" placeholder="Sumate al programa de afiliados…">{{ campaign.invite_description or '' }}</textarea><small>Dejá los campos de copy vacíos para usar el fallback automático.</small></label>
+  <button class="button secondary" type="submit">Guardar marca e invitación</button>
+  <p class="form-status" role="status" aria-live="polite" data-profile-status>Estos datos se aplican a futuras resoluciones de invitaciones existentes y nuevas.</p>
 </form>{% endfor %}
 </div></section>
 {% endif %}

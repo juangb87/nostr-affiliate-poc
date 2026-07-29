@@ -70,12 +70,23 @@ async function resolveAffiliateInvitation() {
   const page = document.querySelector("[data-invite-page]");
   if (!page) return;
   const status = page.querySelector("[data-invite-status]");
+  const errorStatus = page.querySelector("[data-invite-error-status]");
+  const fail = (message) => {
+    affiliateInvitationToken = null;
+    page.classList.remove("is-loading");
+    page.classList.add("is-error");
+    status.textContent = message;
+    status.classList.add("error");
+    if (errorStatus) errorStatus.textContent = message;
+  };
+  const setAllText = (selector, value) => {
+    page.querySelectorAll(selector).forEach((element) => { element.textContent = value; });
+  };
   const params = new URLSearchParams(window.location.hash.slice(1));
   const token = params.get("token");
   window.history.replaceState(null, "", "/invite");
   if (!token) {
-    status.textContent = "El enlace no contiene una invitación válida. Pedile al Merchant uno nuevo.";
-    status.classList.add("error");
+    fail("El enlace no contiene una invitación válida. Pedile al Merchant uno nuevo.");
     return;
   }
   affiliateInvitationToken = token;
@@ -83,18 +94,35 @@ async function resolveAffiliateInvitation() {
     const result = await jsonFetch("/invite/resolve", {
       method: "POST", body: JSON.stringify({token})
     });
-    page.querySelector("[data-invite-campaign]").textContent = result.campaign_name;
-    page.querySelector("[data-invite-commission]").textContent = result.commission_percent;
-    page.querySelector("[data-invite-window]").textContent = result.window_days;
-    page.querySelector(".lede").textContent = `El Merchant te invitó a ${result.campaign_name}. Confirmá con tu identidad Nostr para crear tu link único.`;
-    page.querySelector("[data-invite-details]").hidden = false;
+    const merchant = result.merchant || {};
+    const campaign = result.campaign || {};
+    const displayName = merchant.display_name || result.campaign_name || "Merchant";
+    const initials = merchant.initials || "₿";
+    setAllText("[data-invite-merchant-name]", displayName);
+    setAllText("[data-invite-initials]", initials);
+    setAllText("[data-invite-tagline]", merchant.tagline || "Comunidad, recomendaciones y sats");
+    setAllText("[data-invite-eyebrow]", campaign.invite_eyebrow || "Programa de afiliados · Value for value");
+    setAllText("[data-invite-headline]", campaign.invite_headline || `Recomendá ${displayName}. Ganá sats.`);
+    setAllText("[data-invite-description]", campaign.invite_description || `Sumate al programa de afiliados de ${displayName}.`);
+    setAllText("[data-invite-commission]", campaign.commission_percent || result.commission_percent);
+    if (merchant.logo_url) {
+      page.querySelectorAll("[data-invite-logo]").forEach((image) => {
+        image.alt = `Logo de ${displayName}`;
+        image.addEventListener("error", () => {
+          image.hidden = true;
+          page.querySelectorAll("[data-invite-initials]").forEach((mark) => { mark.hidden = false; });
+        }, {once: true});
+        image.src = merchant.logo_url;
+        image.hidden = false;
+      });
+      page.querySelectorAll("[data-invite-initials]").forEach((mark) => { mark.hidden = true; });
+    }
+    document.title = `${displayName} · Programa de afiliados`;
     page.querySelector("[data-invite-accept]").hidden = false;
-    status.textContent = "Usá la identidad Affiliate que querés asociar a esta campaña.";
+    page.classList.remove("is-loading");
+    status.textContent = "Usá la identidad Nostr que querés asociar a este programa.";
   } catch (error) {
-    affiliateInvitationToken = null;
-    status.textContent = readableError(error);
-    status.classList.add("error");
-    page.querySelector(".lede").textContent = "Esta invitación ya no está disponible.";
+    fail(readableError(error));
   }
 }
 
@@ -316,16 +344,28 @@ document.addEventListener("submit", async (event) => {
     const fields = new FormData(profileForm);
     button.disabled = true;
     status.classList.remove("error");
-    status.textContent = "Guardando logo…";
+    status.textContent = "Guardando identidad de marca…";
     try {
       await jsonFetch("/app/merchant/profile", {
         method: "PUT",
         body: JSON.stringify({
           merchant_pubkey: String(fields.get("merchant_pubkey") || "").trim(),
-          logo_url: String(fields.get("logo_url") || "").trim()
+          display_name: String(fields.get("display_name") || "").trim() || null,
+          tagline: String(fields.get("tagline") || "").trim() || null,
+          logo_url: String(fields.get("logo_url") || "").trim() || null
         })
       });
-      status.textContent = "Logo guardado. Actualizando el perfil público…";
+      status.textContent = "Guardando copy de invitación…";
+      await jsonFetch("/app/merchant/campaign-invite", {
+        method: "PUT",
+        body: JSON.stringify({
+          campaign_id: String(fields.get("campaign_id") || "").trim(),
+          invite_eyebrow: String(fields.get("invite_eyebrow") || "").trim() || null,
+          invite_headline: String(fields.get("invite_headline") || "").trim() || null,
+          invite_description: String(fields.get("invite_description") || "").trim() || null
+        })
+      });
+      status.textContent = "Marca e invitación guardadas. Actualizando la vista…";
       window.location.reload();
     } catch (error) {
       status.textContent = readableError(error);

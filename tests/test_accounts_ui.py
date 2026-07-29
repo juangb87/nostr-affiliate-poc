@@ -464,6 +464,57 @@ def test_merchant_creates_hashed_single_use_invitation_for_owned_campaign(tmp_pa
     assert row["campaign_id"] == campaign["campaign_id"]
 
 
+def test_invitation_resolve_uses_structured_merchant_brand_and_campaign_copy(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    merchant = Keys.generate()
+    campaign = create_campaign(client, merchant, name="Lightning Koffee Affiliate Program")
+    login(client, merchant, "merchant")
+
+    profile = client.put(
+        "/app/merchant/profile",
+        headers={"origin": "https://testserver"},
+        json={
+            "merchant_pubkey": merchant.public_key().to_bech32(),
+            "display_name": "Lightning Koffee",
+            "tagline": "Café, Bitcoin y comunidad",
+            "logo_url": "https://lightningkoffee.io/logo.png",
+        },
+    )
+    assert profile.status_code == 200, profile.text
+    branding = client.put(
+        "/app/merchant/campaign-invite",
+        headers={"origin": "https://testserver"},
+        json={
+            "campaign_id": campaign["campaign_id"],
+            "invite_eyebrow": "Programa de afiliados · Value for value",
+            "invite_headline": "Recomendá café. Ganá sats.",
+            "invite_description": "Compartí Lightning Koffee con tu comunidad y recibí sats cuando tu recomendación termina en una compra.",
+        },
+    )
+    assert branding.status_code == 200, branding.text
+    invitation = create_invitation(client, campaign["campaign_id"])
+    token = invitation["invite_url"].split("#token=", 1)[1]
+
+    resolved = client.post(
+        "/invite/resolve",
+        headers={"origin": "https://testserver"},
+        json={"token": token},
+    )
+    assert resolved.status_code == 200, resolved.text
+    payload = resolved.json()
+    assert payload["merchant"] == {
+        "display_name": "Lightning Koffee",
+        "tagline": "Café, Bitcoin y comunidad",
+        "logo_url": "https://lightningkoffee.io/logo.png",
+        "initials": "LK",
+    }
+    assert payload["campaign"]["name"] == "Lightning Koffee Affiliate Program"
+    assert payload["campaign"]["commission_percent"] == "8"
+    assert payload["campaign"]["invite_eyebrow"] == "Programa de afiliados · Value for value"
+    assert payload["campaign"]["invite_headline"] == "Recomendá café. Ganá sats."
+    assert payload["campaign"]["invite_description"].startswith("Compartí Lightning Koffee")
+
+
 def test_affiliate_accepts_invitation_with_nip07_and_gets_session(tmp_path, monkeypatch):
     client = configured_client(tmp_path, monkeypatch)
     merchant = Keys.generate()
@@ -477,6 +528,10 @@ def test_affiliate_accepts_invitation_with_nip07_and_gets_session(tmp_path, monk
     page = client.get("/invite")
     assert page.status_code == 200
     assert token not in page.text
+    assert "Meerat" not in page.text
+    assert "data-invite-window" not in page.text
+    assert "data-invite-merchant-name" in page.text
+    assert "Crear mi link de afiliado" in page.text
     assert page.headers["cache-control"] == "no-store"
     assert page.headers["referrer-policy"] == "no-referrer"
     resolved = client.post(

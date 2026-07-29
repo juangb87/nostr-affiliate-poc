@@ -1,20 +1,64 @@
 <!doctype html>
 <html lang="es">
 <head>
-  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#141914"><meta name="referrer" content="no-referrer">
-  <link rel="icon" href="/static/brand/favicon.svg?v=salvia-8a1" type="image/svg+xml">
-  <title>Invitación Affiliate · Meerat</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/app.css?v=20260728-salvia-concept1"><script src="/static/app.js?v=20260728-merchant-insights1" defer></script>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#141914">
+  <meta name="referrer" content="no-referrer">
+  <title>Programa de afiliados</title>
+  <link rel="stylesheet" href="/static/invite.css?v=20260729-dynamic1">
+  <script src="/static/app.js?v=20260729-dynamic-invite1" defer></script>
 </head>
-<body><main class="login-shell"><section class="login-card" aria-labelledby="invite-title" data-invite-page>
-  <a class="brand" href="/" aria-label="Meerat"><img src="/static/brand/wordmark-night.png?v=salvia-8a1" width="1428" height="648" alt="Meerat"></a>
-  <p class="eyebrow" style="margin-top:42px">Invitación privada de campaña</p>
-  <h1 id="invite-title">Sumate como Affiliate.</h1>
-  <p class="lede">Validando tu invitación segura…</p>
-  <div class="notice" data-invite-details hidden><div><strong><span data-invite-commission></span>% de comisión · ventana de <span data-invite-window></span> días</strong><p>El Merchant te invitó a <strong data-invite-campaign></strong>. La identidad que firme quedará asociada a esta campaña.</p></div></div>
-  <button class="role-card selected" type="button" data-invite-accept hidden><strong>Aceptar invitación con Nostr</strong><span>Tu extensión te pedirá una firma NIP-07. No mueve fondos ni autoriza pagos.</span></button>
-  <p class="login-status" data-invite-status aria-live="polite">Recuperando los datos de la campaña…</p>
-  <div class="notice"><div><strong>Meerat nunca solicita tu nsec.</strong><p>El secreto de esta invitación no se envía en la URL ni queda expuesto en los access logs.</p></div></div>
-</section></main></body></html>
+<body>
+<main class="invite-lander is-loading" data-invite-page>
+  <header class="invite-nav">
+    <div class="invite-brand">
+      <img class="invite-brand-logo" data-invite-logo alt="" referrerpolicy="no-referrer" decoding="async" hidden>
+      <span class="invite-brand-mark" data-invite-initials>₿</span>
+      <span class="invite-brand-name" data-invite-merchant-name>Programa de afiliados</span>
+    </div>
+    <div class="invite-nav-side">
+      <span class="invite-fine">PROGRAMA DE AFILIADOS</span>
+      <span class="invite-pill"><i class="invite-dot"></i> Invitación activa</span>
+    </div>
+  </header>
+
+  <section class="invite-error-shell" data-invite-error>
+    <p class="invite-eyebrow">Invitación no disponible</p>
+    <h1>No pudimos abrir este enlace.</h1>
+    <p>Pedile al Merchant una nueva invitación para participar en su programa de afiliados.</p>
+    <p class="invite-status error" data-invite-error-status aria-live="polite"></p>
+  </section>
+
+  <div class="invite-hero invite-dynamic">
+    <section class="invite-copy">
+      <p class="invite-eyebrow" data-invite-eyebrow>Programa de afiliados · Value for value</p>
+      <h1 class="invite-title" data-invite-headline>Recomendá valor. Ganá sats.</h1>
+      <p class="invite-lede" data-invite-description>Estamos recuperando los detalles de tu invitación segura.</p>
+      <div class="invite-value-row" aria-label="Cómo funciona">
+        <div class="invite-value"><strong>01 · Creá tu link</strong><span>Personal, corto y listo para compartir en Nostr.</span></div>
+        <div class="invite-value"><strong>02 · Recomendá</strong><span>Presentá la marca a las personas que confían en vos.</span></div>
+        <div class="invite-value"><strong>03 · Ganá sats</strong><span>Recibí una comisión cuando alguien compra.</span></div>
+      </div>
+    </section>
+
+    <aside class="invite-card">
+      <div class="invite-merchant">
+        <img class="invite-merchant-logo" data-invite-logo alt="" referrerpolicy="no-referrer" decoding="async" hidden>
+        <span class="invite-merchant-mark" data-invite-initials>₿</span>
+        <div><strong data-invite-merchant-name>Merchant</strong><small data-invite-tagline>Comunidad, recomendaciones y sats</small></div>
+      </div>
+      <h2>Convertí tus recomendaciones en sats.</h2>
+      <p>Creá tu link personal y compartí los productos de <strong data-invite-merchant-name>esta marca</strong> con las personas que confían en vos.</p>
+      <div class="invite-reward">
+        <small>Tu recompensa</small>
+        <div class="invite-reward-copy"><strong><span data-invite-commission>—</span>% por venta</strong><span>pagado en sats</span></div>
+      </div>
+      <button class="invite-button" type="button" data-invite-accept hidden>Crear mi link de afiliado <span aria-hidden="true">→</span></button>
+      <div class="invite-trust"><i></i><span>Firmás con tu identidad Nostr. Nunca compartís tus claves privadas.</span></div>
+      <p class="invite-status" data-invite-status aria-live="polite">Validando la invitación…</p>
+    </aside>
+  </div>
+</main>
+</body>
+</html>

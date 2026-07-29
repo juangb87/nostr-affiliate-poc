@@ -818,6 +818,9 @@ def _init_db_unlocked() -> None:
         destination_url TEXT NOT NULL,
         terms_url TEXT,
         terms_hash TEXT NOT NULL,
+        invite_eyebrow TEXT,
+        invite_headline TEXT,
+        invite_description TEXT,
         status TEXT NOT NULL DEFAULT 'active',
         nostr_event_id TEXT NOT NULL,
         nostr_event_json TEXT NOT NULL,
@@ -1059,6 +1062,8 @@ def _init_db_unlocked() -> None:
     CREATE TABLE IF NOT EXISTS merchant_profiles (
         merchant_pubkey_hex TEXT PRIMARY KEY,
         merchant_pubkey TEXT NOT NULL,
+        display_name TEXT,
+        tagline TEXT,
         logo_url TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
@@ -1089,6 +1094,11 @@ def _init_db_unlocked() -> None:
         if database_url().startswith("postgresql"):
             c.execute(text("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS merchant_pubkey_hex TEXT"))
             c.execute(text("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS terms_url TEXT"))
+            c.execute(text("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS invite_eyebrow TEXT"))
+            c.execute(text("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS invite_headline TEXT"))
+            c.execute(text("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS invite_description TEXT"))
+            c.execute(text("ALTER TABLE merchant_profiles ADD COLUMN IF NOT EXISTS display_name TEXT"))
+            c.execute(text("ALTER TABLE merchant_profiles ADD COLUMN IF NOT EXISTS tagline TEXT"))
             c.execute(text("ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS affiliate_pubkey_hex TEXT"))
             c.execute(text("ALTER TABLE conversions ADD COLUMN IF NOT EXISTS merchant_order_key TEXT"))
             c.execute(text("ALTER TABLE conversions ADD COLUMN IF NOT EXISTS idempotency_payload_hash TEXT"))
@@ -1128,6 +1138,13 @@ def _init_db_unlocked() -> None:
             payout_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(payouts)")).fetchall()}
             attempt_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(payment_attempts)")).fetchall()}
             challenge_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(auth_challenges)")).fetchall()}
+            merchant_profile_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(merchant_profiles)")).fetchall()}
+            for column in ("invite_eyebrow", "invite_headline", "invite_description"):
+                if column not in campaign_cols:
+                    c.execute(text(f"ALTER TABLE campaigns ADD COLUMN {column} TEXT"))
+            for column in ("display_name", "tagline"):
+                if column not in merchant_profile_cols:
+                    c.execute(text(f"ALTER TABLE merchant_profiles ADD COLUMN {column} TEXT"))
             if "merchant_pubkey_hex" not in campaign_cols:
                 c.execute(text("ALTER TABLE campaigns ADD COLUMN merchant_pubkey_hex TEXT"))
             if "terms_url" not in campaign_cols:
@@ -1436,7 +1453,18 @@ class MerchantProfileIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     merchant_pubkey: str = Field(..., min_length=32, max_length=128)
+    display_name: str | None = Field(default=None, max_length=120)
+    tagline: str | None = Field(default=None, max_length=180)
     logo_url: str | None = Field(default=None, max_length=2048)
+
+
+class CampaignInviteBrandingIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    campaign_id: str = Field(..., min_length=1, max_length=80)
+    invite_eyebrow: str | None = Field(default=None, max_length=100)
+    invite_headline: str | None = Field(default=None, max_length=120)
+    invite_description: str | None = Field(default=None, max_length=360)
 
 
 class EnrollmentIn(BaseModel):
@@ -5085,6 +5113,8 @@ def merchant_update_profile(body: MerchantProfileIn, request: Request) -> dict[s
     merchant = normalize_pubkey(body.merchant_pubkey, "merchant_pubkey")
     raw_logo_url = safe_text(body.logo_url, 2048)
     logo_url = _normalized_merchant_url(raw_logo_url, "logo_url", logo=True) if raw_logo_url else None
+    display_name = safe_text(body.display_name, 120)
+    tagline = safe_text(body.tagline, 180)
     init_db()
     timestamp = now()
     with engine().begin() as c:
@@ -5094,21 +5124,73 @@ def merchant_update_profile(body: MerchantProfileIn, request: Request) -> dict[s
             text(
                 """
                 INSERT INTO merchant_profiles
-                  (merchant_pubkey_hex, merchant_pubkey, logo_url, created_at, updated_at)
-                VALUES (:hex, :npub, :logo_url, :created_at, :updated_at)
+                  (merchant_pubkey_hex, merchant_pubkey, display_name, tagline, logo_url, created_at, updated_at)
+                VALUES (:hex, :npub, :display_name, :tagline, :logo_url, :created_at, :updated_at)
                 ON CONFLICT(merchant_pubkey_hex) DO UPDATE SET
-                  merchant_pubkey=:npub, logo_url=:logo_url, updated_at=:updated_at
+                  merchant_pubkey=:npub, display_name=:display_name, tagline=:tagline,
+                  logo_url=:logo_url, updated_at=:updated_at
                 """
             ),
             {
                 "hex": merchant["hex"],
                 "npub": merchant["npub"],
+                "display_name": display_name or None,
+                "tagline": tagline or None,
                 "logo_url": logo_url,
                 "created_at": timestamp,
                 "updated_at": timestamp,
             },
         )
-    return {"ok": True, "merchant_pubkey": merchant["npub"], "logo_url": logo_url}
+    return {
+        "ok": True,
+        "merchant_pubkey": merchant["npub"],
+        "display_name": display_name or None,
+        "tagline": tagline or None,
+        "logo_url": logo_url,
+    }
+
+
+@app.put("/app/merchant/campaign-invite", tags=["Accounts"])
+def merchant_update_campaign_invite(body: CampaignInviteBrandingIn, request: Request) -> dict[str, Any]:
+    session = require_account_session(request, "merchant")
+    _require_same_origin(request)
+    invite_eyebrow = safe_text(body.invite_eyebrow, 100)
+    invite_headline = safe_text(body.invite_headline, 120)
+    invite_description = safe_text(body.invite_description, 360)
+    init_db()
+    with engine().begin() as c:
+        campaign = asdict(
+            c.execute(
+                text("SELECT id, merchant_pubkey_hex FROM campaigns WHERE id=:id LIMIT 1"),
+                {"id": body.campaign_id},
+            ).fetchone()
+        )
+        if not campaign or not _merchant_profile_target(c, session, campaign["merchant_pubkey_hex"]):
+            raise HTTPException(404, "campaign not found")
+        c.execute(
+            text(
+                """
+                UPDATE campaigns
+                SET invite_eyebrow=:invite_eyebrow,
+                    invite_headline=:invite_headline,
+                    invite_description=:invite_description
+                WHERE id=:id
+                """
+            ),
+            {
+                "id": body.campaign_id,
+                "invite_eyebrow": invite_eyebrow or None,
+                "invite_headline": invite_headline or None,
+                "invite_description": invite_description or None,
+            },
+        )
+    return {
+        "ok": True,
+        "campaign_id": body.campaign_id,
+        "invite_eyebrow": invite_eyebrow or None,
+        "invite_headline": invite_headline or None,
+        "invite_description": invite_description or None,
+    }
 
 
 @app.post("/app/merchant/bootstrap", tags=["Accounts"])
@@ -5557,8 +5639,12 @@ def resolve_affiliate_invitation(request: Request, response: Response, body: Aff
             c.execute(
                 text(
                     """
-                    SELECT i.*, c.name AS campaign_name, c.commission_bps, c.window_days, c.status AS campaign_status
-                    FROM affiliate_invitations i JOIN campaigns c ON c.id=i.campaign_id
+                    SELECT i.*, c.name AS campaign_name, c.commission_bps, c.window_days,
+                           c.status AS campaign_status, c.invite_eyebrow, c.invite_headline,
+                           c.invite_description, mp.display_name, mp.tagline, mp.logo_url
+                    FROM affiliate_invitations i
+                    JOIN campaigns c ON c.id=i.campaign_id
+                    LEFT JOIN merchant_profiles mp ON mp.merchant_pubkey_hex=c.merchant_pubkey_hex
                     WHERE i.token_hash=:token_hash LIMIT 1
                     """
                 ),
@@ -5575,11 +5661,35 @@ def resolve_affiliate_invitation(request: Request, response: Response, body: Aff
         raise HTTPException(409, "invitation was already used or revoked")
     if invitation["campaign_status"] != "active":
         raise HTTPException(409, "campaign is not active")
+    display_name = safe_text(invitation.get("display_name"), 120) or invitation["campaign_name"]
+    tagline = safe_text(invitation.get("tagline"), 180) or "Comunidad, recomendaciones y sats"
+    words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]+", display_name)
+    initials = "".join(word[0] for word in words[:2]).upper() or "₿"
+    commission_percent = f"{int(invitation['commission_bps']) / 100:g}"
+    invite_eyebrow = safe_text(invitation.get("invite_eyebrow"), 100) or "Programa de afiliados · Value for value"
+    invite_headline = safe_text(invitation.get("invite_headline"), 120) or f"Recomendá {display_name}. Ganá sats."
+    invite_description = safe_text(invitation.get("invite_description"), 360) or (
+        f"Sumate al programa de afiliados de {display_name}. Compartí tu link con tu comunidad "
+        "y recibí sats cuando tu recomendación termina en una compra."
+    )
     return {
         "ok": True,
         "campaign_name": invitation["campaign_name"],
-        "commission_percent": f"{int(invitation['commission_bps']) / 100:g}",
+        "commission_percent": commission_percent,
         "window_days": invitation["window_days"],
+        "merchant": {
+            "display_name": display_name,
+            "tagline": tagline,
+            "logo_url": invitation.get("logo_url"),
+            "initials": initials,
+        },
+        "campaign": {
+            "name": invitation["campaign_name"],
+            "commission_percent": commission_percent,
+            "invite_eyebrow": invite_eyebrow,
+            "invite_headline": invite_headline,
+            "invite_description": invite_description,
+        },
         "expires_at": invitation["expires_at"],
     }
 
