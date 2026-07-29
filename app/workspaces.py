@@ -44,7 +44,8 @@ def merchant_workspace_data(connection: Any, session: dict[str, Any], *, base_ur
           (SELECT COUNT(*) FROM conversions v WHERE v.campaign_id=c.id) AS conversions
         FROM campaigns c
         LEFT JOIN merchant_profiles mp ON mp.merchant_pubkey_hex=c.merchant_pubkey_hex
-        WHERE c.merchant_pubkey_hex IN :identities OR c.merchant_pubkey IN :identities
+        WHERE c.archived_at IS NULL
+          AND (c.merchant_pubkey_hex IN :identities OR c.merchant_pubkey IN :identities)
         ORDER BY c.created_at DESC
         """
     ).bindparams(bindparam("identities", expanding=True))

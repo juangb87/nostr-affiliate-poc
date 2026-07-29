@@ -822,6 +822,7 @@ def _init_db_unlocked() -> None:
         invite_headline TEXT,
         invite_description TEXT,
         status TEXT NOT NULL DEFAULT 'active',
+        archived_at TEXT,
         nostr_event_id TEXT NOT NULL,
         nostr_event_json TEXT NOT NULL,
         created_at TEXT NOT NULL
@@ -1125,6 +1126,7 @@ def _init_db_unlocked() -> None:
             c.execute(text("ALTER TABLE payouts ADD COLUMN IF NOT EXISTS return_window_ends_at TEXT"))
             c.execute(text("ALTER TABLE payouts ADD COLUMN IF NOT EXISTS settled_at TEXT"))
             c.execute(text("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'"))
+            c.execute(text("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS archived_at TEXT"))
             c.execute(text("ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'approved'"))
             c.execute(text("ALTER TABLE payment_attempts ADD COLUMN IF NOT EXISTS provider_reference TEXT"))
             c.execute(text("ALTER TABLE payment_attempts ADD COLUMN IF NOT EXISTS error_code TEXT"))
@@ -1192,6 +1194,8 @@ def _init_db_unlocked() -> None:
                     c.execute(text(f"ALTER TABLE payment_attempts ADD COLUMN {column} {column_type}"))
             if "status" not in campaign_cols:
                 c.execute(text("ALTER TABLE campaigns ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"))
+            if "archived_at" not in campaign_cols:
+                c.execute(text("ALTER TABLE campaigns ADD COLUMN archived_at TEXT"))
             if "status" not in enrollment_cols:
                 c.execute(text("ALTER TABLE enrollments ADD COLUMN status TEXT NOT NULL DEFAULT 'approved'"))
             if "client_hash" not in challenge_cols:
@@ -1264,6 +1268,62 @@ def init_db() -> None:
     """Run idempotent schema initialization once at a time within this process."""
     with _INIT_DB_LOCK:
         _init_db_unlocked()
+
+
+def archive_campaign_preserving_history(
+    campaign_id: str,
+    *,
+    expected_merchant_hex: str,
+    expected_name: str,
+) -> bool:
+    """End and hide a campaign while retaining its immutable financial history."""
+    init_db()
+    with _INVITATION_ACCEPT_LOCK:
+        with engine().begin() as c:
+            if database_url().startswith("postgresql"):
+                c.execute(
+                    text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+                    {"lock_key": f"campaign-archive:{campaign_id}"},
+                )
+            campaign = asdict(
+                c.execute(text("SELECT * FROM campaigns WHERE id=:id"), {"id": campaign_id}).fetchone()
+            )
+            if not campaign:
+                return False
+            if campaign.get("merchant_pubkey_hex") != expected_merchant_hex or campaign.get("name") != expected_name:
+                raise RuntimeError(f"refusing to archive unexpected campaign {campaign_id}")
+            if campaign.get("archived_at"):
+                return False
+            campaign["status"] = "ended"
+            event = build_campaign_event(campaign)
+            relay_results = publish_event(event)
+            persist_nostr_event(c, event, "campaign", campaign_id, relay_results)
+            c.execute(
+                text(
+                    """
+                    UPDATE campaigns
+                    SET status='ended', archived_at=:archived_at,
+                        nostr_event_id=:event_id, nostr_event_json=:event_json
+                    WHERE id=:id
+                    """
+                ),
+                {
+                    "id": campaign_id,
+                    "archived_at": now(),
+                    "event_id": event["id"],
+                    "event_json": json.dumps(event),
+                },
+            )
+    return True
+
+
+def apply_requested_campaign_archives() -> None:
+    """One-shot production cleanup approved by the Lightning Koffee merchant."""
+    archive_campaign_preserving_history(
+        "camp_aowrZDPrmp",
+        expected_merchant_hex="c19621bcad2c9d502618dfaf25a6be0fde23bd730e51889dc883376c91cca6c4",
+        expected_name="Meerat NWC Canary 21 sats",
+    )
 
 
 def record_ledger_transaction(
@@ -1424,6 +1484,7 @@ def release_campaign_budget(
 def startup() -> None:
     validate_runtime_security()
     init_db()
+    apply_requested_campaign_archives()
 
 
 class CampaignIn(BaseModel):

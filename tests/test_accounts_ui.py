@@ -405,6 +405,54 @@ def test_merchant_and_affiliate_workspaces_are_role_scoped(tmp_path, monkeypatch
     assert affiliate_client.get("/app/merchant", follow_redirects=False).status_code in {302, 303, 307}
 
 
+def test_campaign_archive_hides_workspace_and_preserves_public_history(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    merchant = Keys.generate()
+    affiliate = Keys.generate()
+    keep = create_campaign(client, merchant, name="Lightning Koffee Affiliate Program")
+    canary = create_campaign(client, merchant, name="Meerat NWC Canary 21 sats")
+    enrollment = create_enrollment(client, canary["campaign_id"], affiliate)
+    login(client, merchant, "merchant")
+
+    assert main.archive_campaign_preserving_history(
+        canary["campaign_id"],
+        expected_merchant_hex=merchant.public_key().to_hex(),
+        expected_name="Meerat NWC Canary 21 sats",
+    ) is True
+    assert main.archive_campaign_preserving_history(
+        canary["campaign_id"],
+        expected_merchant_hex=merchant.public_key().to_hex(),
+        expected_name="Meerat NWC Canary 21 sats",
+    ) is False
+
+    merchant_page = client.get("/app/merchant?view=campaigns")
+    assert merchant_page.status_code == 200
+    assert "Lightning Koffee Affiliate Program" in merchant_page.text
+    assert "Meerat NWC Canary 21 sats" not in merchant_page.text
+
+    public_summary = client.get(f"/campaigns/{canary['campaign_id']}/summary")
+    assert public_summary.status_code == 200
+    payload = public_summary.json()
+    assert payload["campaign"]["status"] == "ended"
+    assert payload["campaign"]["archived_at"]
+    assert payload["totals"]["enrollments"] == 1
+    assert payload["enrollments"][0]["id"] == enrollment["enrollment_id"]
+    assert next(tag[1] for tag in payload["campaign"]["nostr_event"]["tags"] if tag[0] == "status") == "ended"
+
+    with main.engine().connect() as connection:
+        campaign_events = connection.execute(
+            text("SELECT COUNT(*) FROM nostr_events WHERE entity_type='campaign' AND entity_id=:id"),
+            {"id": canary["campaign_id"]},
+        ).scalar_one()
+        preserved_enrollment = connection.execute(
+            text("SELECT COUNT(*) FROM enrollments WHERE id=:id"),
+            {"id": enrollment["enrollment_id"]},
+        ).scalar_one()
+    assert campaign_events == 2
+    assert preserved_enrollment == 1
+    assert keep["campaign_id"] != canary["campaign_id"]
+
+
 def test_ops_is_allowlisted_and_dashboard_redirects(tmp_path, monkeypatch):
     client = configured_client(tmp_path, monkeypatch)
     operator = Keys.generate()
