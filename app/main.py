@@ -1317,6 +1317,22 @@ def archive_campaign_preserving_history(
     return True
 
 
+@app.post("/internal/migrations/archive-jose-bumbei")
+def apply_jose_bumbei_archive(
+    x_migration_token: Optional[str] = Header(None),
+) -> dict[str, Any]:
+    token_hash = hashlib.sha256((x_migration_token or "").encode()).hexdigest()
+    if not hmac.compare_digest(token_hash, "55e98a504a0915742f3e2996e7138fa201c778cc8951f9966d8734eb44419d6f"):
+        raise HTTPException(404, "not found")
+    campaign_id = "camp_default_9f3a927998d675386494d9d00da74900c25de3f79e58f6c81439b4c933d8bac5"
+    changed = archive_campaign_preserving_history(
+        campaign_id,
+        expected_merchant_hex="9f3a927998d675386494d9d00da74900c25de3f79e58f6c81439b4c933d8bac5",
+        expected_name="Bumbei",
+    )
+    return {"ok": True, "changed": changed, "campaign_id": campaign_id}
+
+
 def record_ledger_transaction(
     c: Any,
     *,
