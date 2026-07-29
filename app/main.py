@@ -4,7 +4,6 @@ import asyncio
 import base64
 import fcntl
 import hashlib
-import html as html_lib
 import hmac
 import io
 import ipaddress
@@ -3179,75 +3178,13 @@ def affiliate_public_data(affiliate_pubkey: str) -> dict[str, Any]:
 
 
 @app.get("/affiliates/{affiliate_pubkey}/profile", response_class=HTMLResponse)
-def affiliate_public_profile(affiliate_pubkey: str) -> str:
+def affiliate_public_profile(request: Request, affiliate_pubkey: str) -> Response:
     data = affiliate_public_data(affiliate_pubkey)
-    ident = data["identity"]
-    totals = data["totals"]
-    enrollment_rows = "".join(
-        f"<tr><td><code>{_esc(e['id'])}</code></td><td><a href='/campaigns/{_esc(e['campaign_id'])}/page'>{_esc(e.get('campaign_name'))}</a></td><td><code>{_esc(e['ref_code'])}</code></td><td>{_esc(e.get('commission_bps'))} bps</td></tr>"
-        for e in data["enrollments"][:20]
-    ) or "<tr><td colspan='4'>No campaign enrollments yet.</td></tr>"
-    conversion_rows = "".join(
-        f"<tr><td><code>{_esc(v['id'])}</code></td><td>{_esc(v.get('campaign_name'))}</td><td>{_esc(v['commission_sats'])} sats</td><td><a href='/flows/{_esc(v['id'])}/receipt'>receipt</a></td></tr>"
-        for v in data["conversions"][:20]
-    ) or "<tr><td colspan='4'>No conversions yet.</td></tr>"
-    payout_rows = "".join(
-        f"<tr><td><code>{_esc(p['id'])}</code></td><td><code>{_esc(p['conversion_id'])}</code></td><td>{_esc(p['amount_sats'])} sats</td><td>{_status_badge(p['status'])}</td></tr>"
-        for p in data["payouts"][:20]
-    ) or "<tr><td colspan='4'>No payouts yet.</td></tr>"
-    event_cards = "".join(
-        f"<article class='event-card'><div class='kind'>kind {_esc(ev['kind'])} · {_esc(ev['entity_type'])}</div><h3><a href='/nostr/events/{_esc(ev['event_id'])}'>{_esc(_short(ev['event_id']))}</a></h3><p><code>{_esc(ev['entity_id'])}</code> {_status_badge(ev['relay_status'])}</p></article>"
-        for ev in data["events"][:24]
-    ) or "<p class='label'>No affiliate proof events yet.</p>"
-    return f"""
-<!doctype html>
-<html lang='en'>
-<head>
-  <meta charset='utf-8' />
-  <meta name='viewport' content='width=device-width, initial-scale=1' />
-  <title>Affiliate public profile · {_esc(_short(ident['npub']))}</title>
-  <style>
-    :root {{ --black:#151615; --orange:#FC6A42; --gray:#E3E3D7; --blue:#6082DB; --yellow:#F9C441; --muted:#a8aa9e; --ok:#75d68a; --bad:#ff8585; }}
-    * {{ box-sizing:border-box; }} body {{ margin:0; font-family:Inter, ui-sans-serif, system-ui, sans-serif; color:#fff; background:radial-gradient(circle at top left, rgba(96,130,219,.25), transparent 32rem), var(--black); }}
-    header, main {{ width:min(1240px,100%); margin:0 auto; padding:30px clamp(16px,4vw,52px); }} header {{ border-bottom:1px solid rgba(227,227,215,.12); display:flex; justify-content:space-between; align-items:flex-start; gap:22px; }}
-    h1,h2,h3 {{ margin:0; letter-spacing:-.045em; }} h1 {{ font-size:clamp(38px,6vw,76px); line-height:.9; max-width:860px; }} p {{ color:var(--muted); line-height:1.6; }} a {{ color:var(--yellow); }}
-    code {{ background:rgba(227,227,215,.09); border-radius:7px; padding:2px 6px; word-break:break-all; }} .pill,.status {{ display:inline-flex; align-items:center; width:max-content; max-width:100%; height:auto; align-self:flex-start; padding:7px 10px; border-radius:999px; border:1px solid rgba(227,227,215,.15); background:rgba(227,227,215,.06); color:var(--gray); font-size:13px; line-height:1.2; white-space:nowrap; }}
-    .published {{ background:rgba(117,214,138,.18); color:var(--ok); }} .failed {{ background:rgba(255,133,133,.18); color:var(--bad); }} .skipped {{ background:rgba(249,196,65,.18); color:var(--yellow); }}
-    .grid {{ display:grid; grid-template-columns:repeat(12,minmax(0,1fr)); gap:18px; margin:22px 0; }} .card {{ min-width:0; overflow:hidden; border:1px solid rgba(227,227,215,.12); background:linear-gradient(180deg,rgba(255,255,255,.07),rgba(255,255,255,.035)); border-radius:24px; padding:22px; box-shadow:0 20px 60px rgba(0,0,0,.22); }}
-    .span-3{{grid-column:span 3 / span 3}} .span-4{{grid-column:span 4 / span 4}} .span-6{{grid-column:span 6 / span 6}} .span-12{{grid-column:1 / -1}} .metric{{font-size:36px;font-weight:900;line-height:1;margin-top:8px;overflow-wrap:anywhere}} .label{{color:var(--muted);font-size:13px}}
-    dl {{ display:grid; grid-template-columns:130px minmax(0,1fr); gap:10px 14px; }} dt {{ color:var(--muted); }} dd {{ margin:0; overflow-wrap:anywhere; }} .table-wrap{{overflow-x:auto}} table{{width:100%;min-width:650px;border-collapse:collapse;font-size:13px;table-layout:fixed}} th,td{{text-align:left;padding:10px 8px;border-bottom:1px solid rgba(227,227,215,.09);overflow-wrap:anywhere}}
-    .events{{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px}} .event-card{{border:1px solid rgba(227,227,215,.12);background:rgba(0,0,0,.17);border-radius:18px;padding:16px;min-width:0}} .kind{{color:var(--blue);font-size:13px;font-weight:800}}
-    .actions{{display:flex;gap:10px;flex-wrap:wrap}} .button{{display:inline-flex;padding:11px 14px;border-radius:14px;background:var(--orange);color:var(--black);text-decoration:none;font-weight:900}} .button.secondary{{background:rgba(227,227,215,.08);color:var(--gray)}}
-    @media(max-width:900px){{header{{display:block}} .span-3,.span-4,.span-6{{grid-column:1 / -1}} dl{{grid-template-columns:1fr}}}}
-  </style>
-</head>
-<body>
-<header>
-  <div><span class='pill'>Affiliate public profile</span><h1>{_esc(_short(ident['npub'], 20, 12))}</h1><p>Portable Nostr affiliate identity with campaign enrollments, attributed conversions, payout status and proof receipts.</p></div>
-  <div class='pill'>{_esc(totals['pending_sats'])} pending sats</div>
-</header>
-<main>
-  <section class='grid'>
-    <div class='card span-3'><div class='label'>Campaigns</div><div class='metric'>{_esc(totals['campaigns'])}</div></div>
-    <div class='card span-3'><div class='label'>Clicks</div><div class='metric'>{_esc(totals['clicks'])}</div></div>
-    <div class='card span-3'><div class='label'>Conversions</div><div class='metric'>{_esc(totals['conversions'])}</div></div>
-    <div class='card span-3'><div class='label'>Earned sats</div><div class='metric'>{_esc(totals['commission_sats'])}</div></div>
-  </section>
-  <section class='grid'>
-    <div class='card span-6'><h2>Identity</h2><dl><dt>npub</dt><dd><code>{_esc(ident['npub'])}</code></dd><dt>hex</dt><dd><code>{_esc(ident['hex'])}</code></dd><dt>JSON</dt><dd><a href='/affiliates/{_esc(ident['npub'])}/summary'>summary endpoint</a></dd></dl></div>
-    <div class='card span-6'><h2>Portable reputation</h2><p>This profile is backed by signed Nostr proof events and server-side attribution data. It is the start of affiliate reputation that can travel with the creator identity.</p><div class='actions'><a class='button' href='/dashboard'>Dashboard</a><a class='button secondary' href='/affiliates/{_esc(ident['hex'])}/profile'>Open via hex</a></div></div>
-  </section>
-  <section class='grid'>
-    <div class='card span-6'><h2>Campaign enrollments</h2><div class='table-wrap'><table><thead><tr><th>Enrollment</th><th>Campaign</th><th>Ref</th><th>Reward</th></tr></thead><tbody>{enrollment_rows}</tbody></table></div></div>
-    <div class='card span-6'><h2>Recent conversions</h2><div class='table-wrap'><table><thead><tr><th>Conversion</th><th>Campaign</th><th>Commission</th><th>Receipt</th></tr></thead><tbody>{conversion_rows}</tbody></table></div></div>
-  </section>
-  <section class='card span-12'><h2>Payouts</h2><div class='table-wrap'><table><thead><tr><th>Payout</th><th>Conversion</th><th>Amount</th><th>Status</th></tr></thead><tbody>{payout_rows}</tbody></table></div></section>
-  <section class='card span-12'><h2>Nostr proof events</h2><div class='events'>{event_cards}</div></section>
-</main>
-</body>
-</html>
-"""
-
+    return templates.TemplateResponse(
+        request=request,
+        name="affiliate_public.html",
+        context={**data, "short": _short, "status": _receipt_status},
+    )
 
 @app.get("/admin/campaigns/{campaign_id}/budget")
 def campaign_budget_detail(campaign_id: str, authorization: Optional[str] = Header(None)) -> dict[str, Any]:
@@ -4217,6 +4154,7 @@ def _receipt_status(status_value: Any) -> dict[str, str]:
     raw = str(status_value or "unknown").lower()
     classes = {
         "paid": "success", "settled": "success", "published": "success",
+        "active": "success", "approved": "success", "verified": "success",
         "pending": "pending", "paying": "pending", "sandbox_processing": "pending",
         "pending_publication": "pending", "retrying": "pending",
         "failed": "danger", "payment_unknown": "danger", "unknown": "danger",
@@ -4483,225 +4421,28 @@ def get_flow_receipt(conversion_id: str) -> dict[str, Any]:
     return flow_receipt_data(conversion_id)
 
 
-def _esc(value: Any) -> str:
-    return html_lib.escape("" if value is None else str(value))
-
-
 def _short(value: Any, front: int = 12, back: int = 8) -> str:
-    value = "" if value is None else str(value)
-    return value if len(value) <= front + back + 1 else f"{value[:front]}…{value[-back:]}"
-
-
-def _status_badge(status_value: str) -> str:
-    cls = "published" if status_value == "published" else "failed" if status_value == "failed" else "skipped"
-    return f'<span class="status {cls}">{_esc(status_value)}</span>'
+    raw = str(value or "")
+    return raw if len(raw) <= front + back + 1 else f"{raw[:front]}…{raw[-back:]}"
 
 
 @app.get("/campaigns/{campaign_id}/page", response_class=HTMLResponse)
-def campaign_public_page(campaign_id: str) -> str:
+def campaign_public_page(request: Request, campaign_id: str) -> Response:
     data = campaign_public_data(campaign_id)
-    c = data["campaign"]
-    totals = data["totals"]
-    enroll_rows = "".join(
-        f"<tr><td><code>{_esc(e['id'])}</code></td><td>{_esc(_short(e['affiliate_pubkey'], 12, 8))}</td><td><code>{_esc(e['ref_code'])}</code></td><td><a href='/nostr/events/{_esc(e['nostr_event_id'])}'>{_esc(_short(e['nostr_event_id']))}</a></td></tr>"
-        for e in data["enrollments"][:20]
-    ) or "<tr><td colspan='4'>No enrollments yet.</td></tr>"
-    conversion_rows = "".join(
-        f"<tr><td><code>{_esc(v['id'])}</code></td><td><code>{_esc(v['click_id'])}</code></td><td>{_esc(v['commission_sats'])} sats</td><td><a href='/flows/{_esc(v['id'])}/receipt'>receipt</a></td></tr>"
-        for v in data["conversions"][:20]
-    ) or "<tr><td colspan='4'>No conversions yet.</td></tr>"
-    event_cards = "".join(
-        f"""
-        <article class='event-card'>
-          <div class='kind'>kind {_esc(ev['kind'])} · {_esc(ev['entity_type'])}</div>
-          <h3><a href='/nostr/events/{_esc(ev['event_id'])}'>{_esc(_short(ev['event_id']))}</a></h3>
-          <p><code>{_esc(ev['entity_id'])}</code> {_status_badge(ev['relay_status'])}</p>
-        </article>
-        """
-        for ev in data["events"][:24]
-    ) or "<p class='label'>No proof events yet.</p>"
-    ref_url = f"{BASE_URL}/r/{data['enrollments'][0]['ref_code']}" if data["enrollments"] else ""
-    logo_url = data["merchant_profile"].get("logo_url")
-    logo_html = (
-        f'<img class="merchant-logo" src="{_esc(logo_url)}" alt="Logo de {_esc(c["name"])}" '
-        'referrerpolicy="no-referrer" decoding="async">'
-        if logo_url else ""
+    return templates.TemplateResponse(
+        request=request,
+        name="campaign_public.html",
+        context={**data, "short": _short, "status": _receipt_status},
     )
-    return f"""
-<!doctype html>
-<html lang='en'>
-<head>
-  <meta charset='utf-8' />
-  <meta name='viewport' content='width=device-width, initial-scale=1' />
-  <title>{_esc(c['name'])} · Campaign public page</title>
-  <style>
-    :root {{ --black:#151615; --orange:#FC6A42; --gray:#E3E3D7; --blue:#6082DB; --yellow:#F9C441; --muted:#a8aa9e; --ok:#75d68a; --bad:#ff8585; }}
-    * {{ box-sizing:border-box; }} body {{ margin:0; font-family:Inter, ui-sans-serif, system-ui, sans-serif; color:#fff; background:radial-gradient(circle at top left, rgba(252,106,66,.23), transparent 32rem), var(--black); }}
-    header, main {{ width:min(1240px,100%); margin:0 auto; padding:30px clamp(16px,4vw,52px); }} header {{ border-bottom:1px solid rgba(227,227,215,.12); display:flex; justify-content:space-between; align-items:flex-start; gap:22px; }}
-    h1,h2,h3 {{ margin:0; letter-spacing:-.045em; }} h1 {{ font-size:clamp(38px,6vw,76px); line-height:.9; max-width:820px; }} p {{ color:var(--muted); line-height:1.6; }} a {{ color:var(--yellow); }}
-    .merchant-logo {{ display:block; width:96px; height:96px; object-fit:contain; border-radius:22px; margin-bottom:18px; background:#fff; border:1px solid rgba(227,227,215,.18); }}
-    code {{ background:rgba(227,227,215,.09); border-radius:7px; padding:2px 6px; word-break:break-all; }} .pill,.status {{ display:inline-flex; align-items:center; width:max-content; max-width:100%; height:auto; align-self:flex-start; padding:7px 10px; border-radius:999px; border:1px solid rgba(227,227,215,.15); background:rgba(227,227,215,.06); color:var(--gray); font-size:13px; line-height:1.2; white-space:nowrap; }}
-    .published {{ background:rgba(117,214,138,.18); color:var(--ok); }} .failed {{ background:rgba(255,133,133,.18); color:var(--bad); }} .skipped {{ background:rgba(249,196,65,.18); color:var(--yellow); }}
-    .grid {{ display:grid; grid-template-columns:repeat(12,minmax(0,1fr)); gap:18px; margin:22px 0; }} .card {{ min-width:0; overflow:hidden; border:1px solid rgba(227,227,215,.12); background:linear-gradient(180deg,rgba(255,255,255,.07),rgba(255,255,255,.035)); border-radius:24px; padding:22px; box-shadow:0 20px 60px rgba(0,0,0,.22); }}
-    .span-3{{grid-column:span 3 / span 3}} .span-4{{grid-column:span 4 / span 4}} .span-6{{grid-column:span 6 / span 6}} .span-12{{grid-column:1 / -1}} .metric{{font-size:36px;font-weight:900;line-height:1;margin-top:8px;overflow-wrap:anywhere}} .label{{color:var(--muted);font-size:13px}}
-    dl {{ display:grid; grid-template-columns:170px minmax(0,1fr); gap:10px 14px; }} dt {{ color:var(--muted); }} dd {{ margin:0; overflow-wrap:anywhere; }} .table-wrap{{overflow-x:auto}} table{{width:100%;min-width:650px;border-collapse:collapse;font-size:13px;table-layout:fixed}} th,td{{text-align:left;padding:10px 8px;border-bottom:1px solid rgba(227,227,215,.09);overflow-wrap:anywhere}}
-    .events{{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px}} .event-card{{border:1px solid rgba(227,227,215,.12);background:rgba(0,0,0,.17);border-radius:18px;padding:16px;min-width:0}} .kind{{color:var(--blue);font-size:13px;font-weight:800}}
-    .actions{{display:flex;gap:10px;flex-wrap:wrap}} .button{{display:inline-flex;padding:11px 14px;border-radius:14px;background:var(--orange);color:var(--black);text-decoration:none;font-weight:900}} .button.secondary{{background:rgba(227,227,215,.08);color:var(--gray)}}
-    @media(max-width:900px){{header{{display:block}} .span-3,.span-4,.span-6{{grid-column:1 / -1}} dl{{grid-template-columns:1fr}}}}
-  </style>
-</head>
-<body>
-<header>
-  <div>{logo_html}<span class='pill'>Public campaign</span><h1>{_esc(c['name'])}</h1><p>Merchant campaign proof, enrollments, attribution activity and Nostr relay receipts.</p></div>
-  <div class='pill'>{_esc(c['commission_bps'])} bps · {_esc(c['window_days'])}d window</div>
-</header>
-<main>
-  <section class='grid'>
-    <div class='card span-3'><div class='label'>Enrollments</div><div class='metric'>{_esc(totals['enrollments'])}</div></div>
-    <div class='card span-3'><div class='label'>Clicks</div><div class='metric'>{_esc(totals['clicks'])}</div></div>
-    <div class='card span-3'><div class='label'>Conversions</div><div class='metric'>{_esc(totals['conversions'])}</div></div>
-    <div class='card span-3'><div class='label'>Pending sats</div><div class='metric'>{_esc(totals['pending_sats'])}</div></div>
-  </section>
-  <section class='grid'>
-    <div class='card span-6'><h2>Campaign terms</h2><dl>
-      <dt>Campaign ID</dt><dd><code>{_esc(c['id'])}</code></dd>
-      <dt>Merchant npub</dt><dd><code>{_esc(c['merchant_pubkey'])}</code></dd>
-      <dt>Merchant hex</dt><dd><code>{_esc(c.get('merchant_pubkey_hex'))}</code></dd>
-      <dt>Reward bps</dt><dd>{_esc(c['commission_bps'])} bps</dd>
-      <dt>Destination</dt><dd><a href='{_esc(c['destination_url'])}'>{_esc(c['destination_url'])}</a></dd>
-      <dt>Terms</dt><dd>{f"<a href='{_esc(c['terms_url'])}'>{_esc(c['terms_url'])}</a>" if c.get('terms_url') else f"<code>{_esc(c['terms_hash'])}</code>"}</dd>
-      <dt>Campaign event</dt><dd><a href='/nostr/events/{_esc(c['nostr_event_id'])}'>{_esc(_short(c['nostr_event_id']))}</a></dd>
-    </dl></div>
-    <div class='card span-6'><h2>Demo links</h2><p>Use a referral link to test redirect tracking, or open the JSON summary for integrations.</p><div class='actions'>
-      <a class='button' href='{_esc(ref_url) if ref_url else '#'}'>Open latest ref link</a>
-      <a class='button secondary' href='/campaigns/{_esc(campaign_id)}/summary'>JSON summary</a>
-      <a class='button secondary' href='/dashboard'>Dashboard</a>
-    </div></div>
-  </section>
-  <section class='grid'>
-    <div class='card span-6'><h2>Affiliates enrolled</h2><div class='table-wrap'><table><thead><tr><th>Enrollment</th><th>Affiliate</th><th>Ref</th><th>Event</th></tr></thead><tbody>{enroll_rows}</tbody></table></div></div>
-    <div class='card span-6'><h2>Recent conversions</h2><div class='table-wrap'><table><thead><tr><th>Conversion</th><th>Click</th><th>Commission</th><th>Receipt</th></tr></thead><tbody>{conversion_rows}</tbody></table></div></div>
-  </section>
-  <section class='card span-12'><h2>Nostr proof timeline</h2><div class='events'>{event_cards}</div></section>
-</main>
-</body>
-</html>
-"""
-
 
 @app.get("/flows/{conversion_id}/receipt", response_class=HTMLResponse)
-def flow_receipt_page(conversion_id: str) -> str:
+def flow_receipt_page(request: Request, conversion_id: str) -> Response:
     data = flow_receipt_data(conversion_id)
-    campaign = data["campaign"] or {}
-    enrollment = data["enrollment"] or {}
-    click = data["click"] or {}
-    conversion = data["conversion"] or {}
-    payout = data["payout"] or {}
-    event_cards = []
-    for ev in data["events"]:
-        relays = "".join(f"<li>{_status_badge(r['status'])} <code>{_esc(r['relay_url'])}</code></li>" for r in ev.get("relays", []))
-        event_cards.append(f"""
-        <article class="event-card">
-          <div class="kind">kind {_esc(ev['kind'])} · {_esc(ev['entity_type'])}</div>
-          <h3><a href="/nostr/events/{_esc(ev['event_id'])}">{_esc(_short(ev['event_id']))}</a></h3>
-          <p>Entity <code>{_esc(ev['entity_id'])}</code> · {_status_badge(ev['relay_status'])}</p>
-          <ul>{relays}</ul>
-        </article>
-        """)
-    event_cards_html = "\n".join(event_cards)
-    return f"""
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Flow receipt · {_esc(conversion_id)}</title>
-  <style>
-    :root {{ --black:#151615; --orange:#FC6A42; --gray:#E3E3D7; --blue:#6082DB; --yellow:#F9C441; --muted:#a8aa9e; --ok:#75d68a; --bad:#ff8585; }}
-    * {{ box-sizing:border-box; }}
-    body {{ margin:0; font-family:Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; background:radial-gradient(circle at top left, rgba(252,106,66,.22), transparent 30rem), var(--black); color:#fff; }}
-    main, header {{ width:min(1180px,100%); margin:0 auto; padding:28px clamp(16px,4vw,46px); }}
-    header {{ display:flex; justify-content:space-between; gap:24px; align-items:flex-start; border-bottom:1px solid rgba(227,227,215,.12); }}
-    h1,h2,h3 {{ font-family:Unbounded, Inter, system-ui, sans-serif; letter-spacing:-.04em; margin:0; }}
-    h1 {{ font-size:clamp(34px,5vw,62px); line-height:.95; max-width:760px; }}
-    p {{ color:var(--muted); line-height:1.55; }}
-    a {{ color:var(--yellow); }}
-    code {{ background:rgba(227,227,215,.09); border-radius:7px; padding:2px 6px; color:#fff; word-break:break-all; }}
-    .pill,.status {{ display:inline-flex; align-items:center; gap:7px; padding:7px 10px; border-radius:999px; font-size:13px; border:1px solid rgba(227,227,215,.15); background:rgba(227,227,215,.06); color:var(--gray); }}
-    .published {{ background:rgba(117,214,138,.18); color:var(--ok); }} .failed {{ background:rgba(255,133,133,.18); color:var(--bad); }} .skipped {{ background:rgba(249,196,65,.18); color:var(--yellow); }}
-    .grid {{ display:grid; grid-template-columns:repeat(12,minmax(0,1fr)); gap:18px; margin:22px 0; }}
-    .card {{ min-width:0; background:linear-gradient(180deg, rgba(255,255,255,.07), rgba(255,255,255,.035)); border:1px solid rgba(227,227,215,.12); border-radius:24px; padding:22px; box-shadow:0 20px 60px rgba(0,0,0,.22); overflow:hidden; }}
-    .span-4 {{ grid-column:span 4 / span 4; }} .span-6 {{ grid-column:span 6 / span 6; }} .span-8 {{ grid-column:span 8 / span 8; }} .span-12 {{ grid-column:1 / -1; }}
-    .metric {{ font-size:34px; font-weight:900; line-height:1; margin-top:8px; overflow-wrap:anywhere; }}
-    .label {{ color:var(--muted); font-size:13px; }}
-    .timeline {{ display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:12px; }}
-    .step {{ padding:14px; border:1px solid rgba(96,130,219,.28); background:rgba(96,130,219,.13); border-radius:16px; min-width:0; }}
-    .step b {{ display:block; margin-bottom:8px; }}
-    dl {{ display:grid; grid-template-columns:160px minmax(0,1fr); gap:10px 14px; }} dt {{ color:var(--muted); }} dd {{ margin:0; overflow-wrap:anywhere; }}
-    .events {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:16px; }}
-    .event-card {{ min-width:0; border:1px solid rgba(227,227,215,.12); background:rgba(0,0,0,.18); border-radius:18px; padding:16px; }}
-    .event-card ul {{ padding-left:18px; color:var(--muted); }} .kind {{ color:var(--blue); font-size:13px; font-weight:800; }}
-    .actions {{ display:flex; gap:10px; flex-wrap:wrap; }} .button {{ display:inline-flex; padding:11px 14px; border-radius:14px; background:var(--orange); color:var(--black); text-decoration:none; font-weight:900; }} .button.secondary {{ background:rgba(227,227,215,.08); color:var(--gray); }}
-    @media (max-width:900px){{ header{{display:block}} .span-4,.span-6,.span-8{{grid-column:1 / -1}} .timeline{{grid-template-columns:1fr}} dl{{grid-template-columns:1fr}} }}
-  </style>
-</head>
-<body>
-<header>
-  <div>
-    <div class="pill">✅ Flow receipt</div>
-    <h1>Bumbei affiliate conversion proof.</h1>
-    <p>Resumen end-to-end: merchant → campaign → affiliate enrollment → click → conversion → Nostr proof → pending sats.</p>
-  </div>
-  <div class="pill">{_esc(conversion.get('status'))} · {_esc(conversion.get('commission_sats'))} sats</div>
-</header>
-<main>
-  <section class="grid">
-    <div class="card span-4"><div class="label">Merchant</div><div class="metric">{_esc(_short(data['merchant_pubkey'], 10, 8))}</div><p><code>{_esc(data['merchant_pubkey'])}</code></p></div>
-    <div class="card span-4"><div class="label">Affiliate</div><div class="metric">{_esc(_short(data['affiliate_pubkey'], 10, 8))}</div><p><code>{_esc(data['affiliate_pubkey'])}</code></p></div>
-    <div class="card span-4"><div class="label">Reward</div><div class="metric">{_esc(conversion.get('commission_sats'))} sats</div><p>Status: {_status_badge(payout.get('status','pending'))}</p></div>
-  </section>
-  <section class="card span-12">
-    <h2>Proof timeline</h2>
-    <div class="timeline">
-      <div class="step"><b>Campaign</b><code>{_esc(campaign.get('id'))}</code></div>
-      <div class="step"><b>Enrollment</b><code>{_esc(enrollment.get('id'))}</code></div>
-      <div class="step"><b>Click</b><code>{_esc(click.get('id'))}</code></div>
-      <div class="step"><b>Conversion</b><code>{_esc(conversion.get('id'))}</code></div>
-      <div class="step"><b>Nostr proof</b><code>{_esc(_short(conversion.get('nostr_event_id')))}</code></div>
-    </div>
-  </section>
-  <section class="grid">
-    <div class="card span-6"><h2>Attribution details</h2><dl>
-      <dt>Campaign name</dt><dd>{_esc(campaign.get('name'))}</dd>
-      <dt>Ref code</dt><dd><code>{_esc(click.get('ref_code'))}</code></dd>
-      <dt>Click ID</dt><dd><code>{_esc(conversion.get('click_id'))}</code></dd>
-      <dt>Order hash</dt><dd><code>{_esc(conversion.get('order_id_hash'))}</code></dd>
-      <dt>Order total</dt><dd>{_esc(conversion.get('order_total'))} {_esc(conversion.get('currency'))}</dd>
-      <dt>Commission</dt><dd>{_esc(conversion.get('commission_sats'))} sats</dd>
-    </dl></div>
-    <div class="card span-6"><h2>Payout details</h2><dl>
-      <dt>Payout ID</dt><dd><code>{_esc(payout.get('id'))}</code></dd>
-      <dt>Status</dt><dd>{_status_badge(payout.get('status','pending'))}</dd>
-      <dt>Lightning address</dt><dd><code>{_esc(payout.get('lightning_address'))}</code></dd>
-      <dt>Amount</dt><dd>{_esc(payout.get('amount_sats'))} sats</dd>
-      <dt>Payment hash</dt><dd><code>{_esc(payout.get('payment_hash'))}</code></dd>
-      <dt>Payout receipt</dt><dd><a href='/payouts/{_esc(payout.get('id'))}/receipt'>open</a></dd>
-    </dl></div>
-  </section>
-  <section class="card span-12">
-    <h2>Nostr events & relay receipts</h2>
-    <div class="events">{event_cards_html}</div>
-  </section>
-  <section class="card span-12 actions">
-    <a class="button" href="/nostr/events/{_esc(conversion.get('nostr_event_id'))}">Open conversion event</a>
-    <a class="button secondary" href="/flows/{_esc(conversion_id)}">View JSON receipt</a>
-    <a class="button secondary" href="/dashboard">Back to dashboard</a>
-  </section>
-</main>
-</body>
-</html>
-"""
-
+    return templates.TemplateResponse(
+        request=request,
+        name="flow_receipt.html",
+        context={**data, "short": _short, "status": _receipt_status},
+    )
 
 @app.post("/demo")
 def demo() -> dict[str, Any]:

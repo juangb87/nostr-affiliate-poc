@@ -1,0 +1,53 @@
+{% extends "public_base.html" %}
+{% block title %}{{ campaign.name }} · Meerat{% endblock %}
+{% block title_es %}{{ campaign.name }} · Campaña pública{% endblock %}{% block title_en %}{{ campaign.name }} · Public campaign{% endblock %}
+{% block description %}Campaña pública de Meerat con atribución, payouts y evidencia Nostr.{% endblock %}
+{% block body_class %}campaign-page{% endblock %}
+{% block content %}
+<section class="public-hero">
+  <div class="hero-identity">
+    {% if merchant_profile.logo_url %}<img class="merchant-logo" src="{{ merchant_profile.logo_url }}" alt="Logo de {{ campaign.name }}" referrerpolicy="no-referrer" decoding="async">{% endif %}
+    <div>
+      <p class="eyebrow"><span data-copy-lang="es">Campaña pública</span><span data-copy-lang="en">Public campaign</span></p>
+      <h1>{{ campaign.name }}</h1>
+      <p class="lede"><span data-copy-lang="es">Performance atribuida y evidencia Nostr de una campaña abierta.</span><span data-copy-lang="en">Attributed performance and Nostr evidence for an open campaign.</span></p>
+      <div class="signature" aria-hidden="true"><span></span><span></span><span></span></div>
+    </div>
+  </div>
+  <div class="hero-actions">
+    <a class="button" href="{{ campaign.destination_url }}" rel="nofollow"><span data-copy-lang="es">Visitar tienda</span><span data-copy-lang="en">Visit store</span></a>
+    <a class="button secondary" href="/app?role=merchant"><span data-copy-lang="es">Gestionar como Merchant</span><span data-copy-lang="en">Manage as Merchant</span></a>
+    <a class="button secondary" href="/campaigns/{{ campaign.id }}/summary">JSON</a>
+  </div>
+</section>
+<section class="metrics" aria-label="Métricas de campaña">
+  <article class="metric"><span class="metric-label"><span data-copy-lang="es">Affiliates</span><span data-copy-lang="en">Affiliates</span></span><strong>{{ totals.enrollments }}</strong></article>
+  <article class="metric"><span class="metric-label">Clicks</span><strong>{{ totals.clicks }}</strong></article>
+  <article class="metric"><span class="metric-label"><span data-copy-lang="es">Conversiones</span><span data-copy-lang="en">Conversions</span></span><strong>{{ totals.conversions }}</strong></article>
+  <article class="metric"><span class="metric-label"><span data-copy-lang="es">Comisiones</span><span data-copy-lang="en">Commissions</span></span><strong>{{ totals.commission_sats }}</strong><small>sats</small></article>
+  <article class="metric"><span class="metric-label"><span data-copy-lang="es">Eventos publicados</span><span data-copy-lang="en">Published events</span></span><strong>{{ totals.published_events }}</strong></article>
+</section>
+<div class="content-grid">
+  <section class="card">
+    <div class="card-head"><h2><span data-copy-lang="es">Programa</span><span data-copy-lang="en">Program</span></h2><span class="badge {{ status(campaign.status).class }}">{{ campaign.status }}</span></div>
+    <dl><dt>ID</dt><dd><code>{{ campaign.id }}</code></dd><dt>Merchant</dt><dd><code>{{ short(campaign.merchant_pubkey, 18, 12) }}</code></dd><dt><span data-copy-lang="es">Comisión</span><span data-copy-lang="en">Commission</span></dt><dd>{{ campaign.commission_bps }} bps</dd><dt><span data-copy-lang="es">Ventana</span><span data-copy-lang="en">Window</span></dt><dd>{{ campaign.window_days }} <span data-copy-lang="es">días</span><span data-copy-lang="en">days</span></dd><dt>Destination</dt><dd><a href="{{ campaign.destination_url }}" rel="nofollow">{{ campaign.destination_url }}</a></dd><dt><span data-copy-lang="es">Términos</span><span data-copy-lang="en">Terms</span></dt><dd>{% if campaign.terms_url %}<a href="{{ campaign.terms_url }}" rel="nofollow">{{ campaign.terms_url }}</a>{% else %}<code>{{ campaign.terms_hash }}</code>{% endif %}</dd></dl>
+  </section>
+  <section class="card evidence">
+    <div class="card-head"><h2><span data-copy-lang="es">Registro público</span><span data-copy-lang="en">Public record</span></h2><span class="badge neutral">Nostr</span></div>
+    <p><span data-copy-lang="es">Cada enrollment, conversión y payout enlaza el evento Nostr almacenado y su estado de publicación. Esta vista no verifica criptográficamente cada evento.</span><span data-copy-lang="en">Every enrollment, conversion, and payout links the stored Nostr event and its publication status. This view does not cryptographically verify every event.</span></p>
+    <div class="actions"><a class="button secondary" href="/nostr/events/{{ campaign.nostr_event_id }}"><span data-copy-lang="es">Evento de campaña</span><span data-copy-lang="en">Campaign event</span></a></div>
+  </section>
+  <section class="card span-12">
+    <div class="card-head"><h2>Affiliates</h2><span class="badge neutral">{{ enrollments|length }}</span></div>
+    <div class="table-wrap"><table><thead><tr><th>Affiliate</th><th>Ref code</th><th>Status</th><th>Nostr</th></tr></thead><tbody>{% for enrollment in enrollments[:20] %}<tr><td><a class="table-link" href="/affiliates/{{ enrollment.affiliate_pubkey }}/profile"><code>{{ short(enrollment.affiliate_pubkey, 14, 8) }}</code></a></td><td><code>{{ enrollment.ref_code }}</code></td><td><span class="badge {{ status(enrollment.status).class }}">{{ enrollment.status }}</span></td><td><a class="table-link" href="/nostr/events/{{ enrollment.nostr_event_id }}">{{ short(enrollment.nostr_event_id) }}</a></td></tr>{% else %}<tr><td colspan="4">No enrollments yet.</td></tr>{% endfor %}</tbody></table></div>
+  </section>
+  <section class="card span-12">
+    <div class="card-head"><h2><span data-copy-lang="es">Conversiones y receipts</span><span data-copy-lang="en">Conversions and receipts</span></h2><span class="badge neutral">{{ conversions|length }}</span></div>
+    <div class="table-wrap"><table><thead><tr><th>Conversion</th><th>Click</th><th>Commission</th><th>Receipt</th></tr></thead><tbody>{% for conversion in conversions[:20] %}<tr><td><code>{{ conversion.id }}</code></td><td><code>{{ conversion.click_id }}</code></td><td>{{ conversion.commission_sats }} sats</td><td><a class="table-link" href="/flows/{{ conversion.id }}/receipt"><span data-copy-lang="es">Ver receipt</span><span data-copy-lang="en">View receipt</span></a></td></tr>{% else %}<tr><td colspan="4">No conversions yet.</td></tr>{% endfor %}</tbody></table></div>
+  </section>
+  <section class="card span-12">
+    <div class="card-head"><h2><span data-copy-lang="es">Eventos almacenados</span><span data-copy-lang="en">Stored events</span></h2><span class="badge neutral">{{ events|length }}</span></div>
+    <ul class="event-list">{% for event in events[:24] %}<li class="event-row"><span class="badge neutral">kind {{ event.kind }}</span><div class="event-meta"><a href="/nostr/events/{{ event.event_id }}">{{ short(event.event_id) }}</a><br><code>{{ event.entity_type }} · {{ event.entity_id }}</code></div><span class="badge {{ status(event.relay_status).class }}">{{ event.relay_status }}</span></li>{% else %}<li>No proof events yet.</li>{% endfor %}</ul>
+  </section>
+</div>
+{% endblock %}

@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="es" data-theme="night" data-lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="{% block description %}Evidencia pública de comercio afiliado en Meerat.{% endblock %}">
+  <meta name="theme-color" content="#141914">
+  <title>{% block title %}Meerat · Evidencia pública{% endblock %}</title>
+  <link rel="icon" href="/static/brand/favicon.svg?v=salvia-8a1" type="image/svg+xml">
+  <link rel="preload" href="/static/fonts/space-grotesk-latin.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="/static/fonts/dm-mono-regular-latin.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="/static/public.css?v=20260729-salvia-public1">
+  <script src="/static/public.js?v=20260729-salvia-public1" defer></script>
+</head>
+<body class="public-page {% block body_class %}{% endblock %}" {% block body_attrs %}{% endblock %} data-title-es="{% block title_es %}Meerat · Evidencia pública{% endblock %}" data-title-en="{% block title_en %}Meerat · Public evidence{% endblock %}">
+  <a class="skip-link" href="#main-content"><span data-copy-lang="es">Saltar al contenido</span><span data-copy-lang="en">Skip to content</span></a>
+  <header class="shell site-header">
+    <nav class="nav" aria-label="Navegación principal" data-label-es="Navegación principal" data-label-en="Main navigation">
+      <a class="brand" href="/" aria-label="Meerat inicio" data-label-es="Meerat inicio" data-label-en="Meerat home">
+        <img class="night-logo" src="/static/brand/wordmark-night.png?v=salvia-8a1" width="1428" height="648" alt="Meerat">
+        <img class="arena-logo" src="/static/brand/wordmark-arena.png?v=salvia-home1" width="1428" height="648" alt="Meerat">
+      </a>
+      <div class="nav-actions">
+        <div class="switch theme-switch" role="group" aria-label="Tema" data-label-es="Tema" data-label-en="Theme">
+          <button type="button" data-theme-button="night" data-text-es="Noche" data-text-en="Night" data-short="N" aria-pressed="true">Noche</button>
+          <button type="button" data-theme-button="arena" data-text-es="Arena" data-text-en="Arena" data-short="A" aria-pressed="false">Arena</button>
+        </div>
+        <div class="switch" role="group" aria-label="Idioma" data-label-es="Idioma" data-label-en="Language">
+          <button type="button" data-language="es" aria-pressed="true">ES</button>
+          <button type="button" data-language="en" aria-pressed="false">EN</button>
+        </div>
+        <a class="nav-login" href="/app"><span data-copy-lang="es">Entrar</span><span data-copy-lang="en">Sign in</span></a>
+      </div>
+    </nav>
+  </header>
+  <main id="main-content" class="shell public-main">{% block content %}{% endblock %}</main>
+  <footer class="public-footer">
+    <div class="shell footer-row">
+      <div class="footer-brand">
+        <a href="/" aria-label="Meerat inicio"><img class="night-logo" src="/static/brand/wordmark-night.png?v=salvia-8a1" width="1428" height="648" alt="Meerat"><img class="arena-logo" src="/static/brand/wordmark-arena.png?v=salvia-home1" width="1428" height="648" alt="Meerat"></a>
+        <p><span data-copy-lang="es">Atribución Nostr · Pagos Lightning · Evidencia declarada</span><span data-copy-lang="en">Nostr attribution · Lightning payments · Disclosed evidence</span></p>
+      </div>
+      <div class="footer-meta">PILOT POC · 2026<br>OPEN PROTOCOLS · NON-CUSTODIAL</div>
+    </div>
+  </footer>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

@@ -10,6 +10,19 @@ from app.nostr_kinds import CAMPAIGN_KIND, CONVERSION_KIND, ENROLLMENT_KIND, PAY
 app = main.app
 
 
+def assert_meerat_public_shell(response, expected_role_link: str) -> None:
+    assert response.status_code == 200
+    assert '/static/public.css?v=20260729-salvia-public1' in response.text
+    assert '/static/public.js?v=20260729-salvia-public1' in response.text
+    assert '/static/brand/wordmark-night.png' in response.text
+    assert '/static/brand/wordmark-arena.png' in response.text
+    assert expected_role_link in response.text
+    assert 'href="/dashboard"' not in response.text
+    assert "href='/dashboard'" not in response.text
+    assert '#FC6A42' not in response.text
+    assert 'Bumbei affiliate conversion proof' not in response.text
+
+
 def test_demo_flow_creates_conversion_and_proof(tmp_path, monkeypatch):
     monkeypatch.setenv('DATABASE_URL', f'sqlite:///{tmp_path}/test.db')
     monkeypatch.setenv('PAYOUT_ADMIN_KEY', 'test-payout-admin-key')
@@ -64,9 +77,11 @@ def test_demo_flow_creates_conversion_and_proof(tmp_path, monkeypatch):
     assert campaign_summary_json['totals']['enrollments'] >= 1
     assert campaign_summary_json['totals']['conversions'] >= 1
     campaign_page = client.get(f"/campaigns/{data['campaign']['campaign_id']}/page")
-    assert campaign_page.status_code == 200
+    assert_meerat_public_shell(campaign_page, '/app?role=merchant')
     assert 'Public campaign' in campaign_page.text
     assert data['campaign']['campaign_id'] in campaign_page.text
+    assert f'href="{campaign_summary_json["campaign"]["destination_url"]}"' in campaign_page.text
+    assert f'href="{data["enrollment"]["ref_url"]}"' not in campaign_page.text
     affiliate_summary = client.get(f"/affiliates/{data['enrollment']['affiliate_pubkey']}/summary")
     assert affiliate_summary.status_code == 200
     affiliate_summary_json = affiliate_summary.json()
@@ -74,7 +89,7 @@ def test_demo_flow_creates_conversion_and_proof(tmp_path, monkeypatch):
     assert affiliate_summary_json['totals']['enrollments'] >= 1
     assert affiliate_summary_json['totals']['conversions'] >= 1
     affiliate_profile = client.get(f"/affiliates/{data['enrollment']['affiliate_pubkey']}/profile")
-    assert affiliate_profile.status_code == 200
+    assert_meerat_public_shell(affiliate_profile, '/app?role=affiliate')
     assert 'Affiliate public profile' in affiliate_profile.text
     assert data['enrollment']['affiliate_pubkey'] in affiliate_profile.text
     affiliate_profile_hex = client.get(f"/affiliates/{data['enrollment']['affiliate_pubkey_hex']}/profile")
@@ -89,12 +104,15 @@ def test_demo_flow_creates_conversion_and_proof(tmp_path, monkeypatch):
     assert receipt_json['enrollment']['ref_code'] == data['enrollment']['ref_code']
     assert receipt_json['conversion']['id'] == data['conversion']['conversion_id']
     assert len(receipt_json['events']) >= 3
+    flow_receipt = client.get(f"/flows/{data['conversion']['conversion_id']}/receipt")
+    assert_meerat_public_shell(flow_receipt, '/app?role=affiliate')
+    assert 'Conversion receipt' in flow_receipt.text
     payout_id = receipt_json['payout']['id']
     payout_detail = client.get(f"/payouts/{payout_id}")
     assert payout_detail.status_code == 200
     assert payout_detail.json()['payout']['status'] == 'pending'
     pending_receipt = client.get(f"/payouts/{payout_id}/receipt")
-    assert pending_receipt.status_code == 200
+    assert_meerat_public_shell(pending_receipt, '/app?role=affiliate')
     assert '20000 sats · pending.' in pending_receipt.text
     assert 'Payment mode not established' in pending_receipt.text
     assert 'data-proof-sandbox="unknown"' in pending_receipt.text
