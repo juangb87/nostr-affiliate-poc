@@ -448,6 +448,11 @@ def test_merchant_creates_hashed_single_use_invitation_for_owned_campaign(tmp_pa
     campaign = create_campaign(client, merchant, name="Invite-only campaign")
     login(client, merchant, "merchant")
 
+    merchant_page = client.get("/app/merchant?view=affiliates")
+    assert merchant_page.status_code == 200
+    assert '/static/app.js?v=20260729-branded-invites1' in merchant_page.text
+    assert 'data-invite-origin="https://mrt.st"' in merchant_page.text
+
     invitation = create_invitation(client, campaign["campaign_id"])
 
     assert invitation["invite_url"].startswith("https://mrt.st/invite#token=")
