@@ -507,7 +507,11 @@ document.addEventListener("submit", async (event) => {
       body: JSON.stringify(payload)
     });
     const safeUrl = new URL(result.invite_url, window.location.origin);
-    if (safeUrl.origin !== window.location.origin) throw new Error("El servidor devolvió un enlace inválido");
+    const inviteOrigin = new URL(form.dataset.inviteOrigin || window.location.origin, window.location.origin).origin;
+    const allowedOrigin = safeUrl.origin === window.location.origin || safeUrl.origin === inviteOrigin;
+    if (!allowedOrigin || safeUrl.pathname !== "/invite" || !safeUrl.hash.startsWith("#token=")) {
+      throw new Error("El servidor devolvió un enlace inválido");
+    }
     link.href = safeUrl.href;
     link.textContent = safeUrl.href;
     copy.dataset.copy = safeUrl.href;

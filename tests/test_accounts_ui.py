@@ -450,7 +450,7 @@ def test_merchant_creates_hashed_single_use_invitation_for_owned_campaign(tmp_pa
 
     invitation = create_invitation(client, campaign["campaign_id"])
 
-    assert invitation["invite_url"].startswith("https://testserver/invite#token=")
+    assert invitation["invite_url"].startswith("https://mrt.st/invite#token=")
     assert invitation["status"] == "pending"
     token = invitation["invite_url"].split("#token=", 1)[1]
     assert token not in invitation["invitation_id"]
@@ -462,6 +462,19 @@ def test_merchant_creates_hashed_single_use_invitation_for_owned_campaign(tmp_pa
     assert row["token_hash"] == main.auth_digest(token)
     assert token not in row["token_hash"]
     assert row["campaign_id"] == campaign["campaign_id"]
+
+
+def test_mrt_short_domain_canonicalizes_invite_path_without_exposing_token(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+
+    response = client.get(
+        "/invite",
+        headers={"host": "mrt.st"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 308
+    assert response.headers["location"] == "https://testserver/invite"
 
 
 def test_invitation_resolve_derives_clean_merchant_name_from_campaign_fallback(tmp_path, monkeypatch):

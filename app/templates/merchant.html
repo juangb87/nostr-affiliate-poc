@@ -20,9 +20,9 @@
 {% endif %}
 {% if view == 'affiliates' %}
 <section class="section" id="invite-affiliate"><div class="section-head"><div><h2>Invitar Affiliate</h2><p>Generá un enlace privado. La identidad queda asociada recién cuando el Affiliate acepta y firma.</p></div></div>
-  <form class="panel form-panel" data-merchant-invitation>
+  <form class="panel form-panel" data-merchant-invitation data-invite-origin="{{ short_link_base_url }}">
     <label><span>Campaña</span><select name="campaign_id" required>{% for campaign in campaigns if campaign.status == 'active' %}<option value="{{ campaign.id }}">{{ campaign.name }}</option>{% else %}<option value="" disabled>No hay campañas activas</option>{% endfor %}</select></label>
-    <label><span>Validez del enlace</span><select name="expires_days"><option value="7" selected>7 días</option><option value="3">3 días</option><option value="14">14 días</option><option value="30">30 días</option></select></label>
+    <label><span>Validez del enlace</span><select name="expires_days"><option value="3">3 días</option><option value="7" selected>7 días</option><option value="14">14 días</option><option value="30">30 días</option></select></label>
     <button class="button" type="submit" {% if not totals.active_campaigns %}disabled{% endif %}>Generar invitación</button>
     <p class="form-status" role="status" aria-live="polite" data-invitation-status>Compartí el enlace únicamente con la persona que querés invitar. No hace falta pedirle su npub.</p>
     <div data-invitation-result hidden>

@@ -82,7 +82,7 @@ SHORT_LINK_BASE_URL = os.getenv("SHORT_LINK_BASE_URL", f"https://{SHORT_LINK_HOS
 SHORT_REF_PATH_RE = re.compile(r"^/([A-Za-z0-9][A-Za-z0-9_-]{0,127})/?$")
 SHORT_LINK_RESERVED_PATHS = {
     "app", "health", "static", "r", "v1", "shopify", "campaigns", "affiliates",
-    "flows", "payouts", "docs", "redoc", "openapi.json", "bb.js", "favicon.ico",
+    "flows", "payouts", "docs", "redoc", "openapi.json", "bb.js", "favicon.ico", "invite",
 }
 DEFAULT_DESTINATION = os.getenv("DEFAULT_DESTINATION_URL", "https://example.com/checkout")
 DEFAULT_RELAYS = "wss://nos.lol,wss://relay.damus.io,wss://relay.primal.net"
@@ -4974,6 +4974,7 @@ def merchant_account_page(request: Request, view: str = "overview") -> Response:
             "shopify_installation": shopify_installation_snippets(
                 BASE_URL, normalized_shopify_store_domain()
             ) if owns_shopify_store else None,
+            "short_link_base_url": SHORT_LINK_BASE_URL,
             "program_defaults": _merchant_default_program(),
             "account": _account_shell(session, "merchant"),
             "role_label": "Merchant account",
@@ -5842,7 +5843,7 @@ def merchant_create_invitation(request: Request, body: MerchantInvitationIn) -> 
         "campaign_name": campaign["name"],
         "status": "pending",
         "expires_at": expires_at.isoformat(),
-        "invite_url": f"{BASE_URL}/invite#token={token}",
+        "invite_url": f"{SHORT_LINK_BASE_URL}/invite#token={token}",
     }
 
 
