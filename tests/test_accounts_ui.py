@@ -186,6 +186,23 @@ def test_www_meerat_redirects_to_canonical_apex_and_preserves_path_and_query(tmp
     assert apex.status_code == 200
 
 
+def test_mrt_short_domain_redirects_root_slug_and_reserved_paths(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+
+    root = client.get("/?utm_source=launch", headers={"host": "mrt.st"}, follow_redirects=False)
+    short = client.get("/ref_ABC-123?utm_source=nostr", headers={"host": "mrt.st"}, follow_redirects=False)
+    reserved = client.get("/app?role=affiliate", headers={"host": "mrt.st"}, follow_redirects=False)
+    unrelated = client.get("/ref_ABC-123", headers={"host": "testserver"}, follow_redirects=False)
+
+    assert root.status_code == 308
+    assert root.headers["location"] == "https://testserver/?utm_source=launch"
+    assert short.status_code == 302
+    assert short.headers["location"] == "https://testserver/r/ref_ABC-123?utm_source=nostr"
+    assert reserved.status_code == 308
+    assert reserved.headers["location"] == "https://testserver/app?role=affiliate"
+    assert unrelated.status_code == 404
+
+
 def test_salvia_concept_brand_contract_is_served(tmp_path, monkeypatch):
     client = configured_client(tmp_path, monkeypatch)
 
@@ -384,7 +401,7 @@ def test_merchant_and_affiliate_workspaces_are_role_scoped(tmp_path, monkeypatch
     assert affiliate_page.status_code == 200
     assert "Affiliate account" in affiliate_page.text
     assert "Private merchant campaign" in affiliate_page.text
-    assert "/r/" in affiliate_page.text
+    assert "https://mrt.st/" in affiliate_page.text
     assert affiliate_client.get("/app/merchant", follow_redirects=False).status_code in {302, 303, 307}
 
 
@@ -479,7 +496,7 @@ def test_affiliate_accepts_invitation_with_nip07_and_gets_session(tmp_path, monk
     payload = accepted.json()
     assert payload["affiliate_pubkey"] == affiliate.public_key().to_bech32()
     assert payload["redirect"] == "/app/affiliate#links"
-    assert payload["ref_url"].startswith("https://testserver/r/")
+    assert payload["ref_url"].startswith("https://mrt.st/")
     assert main.SESSION_COOKIE.lower() in accepted.headers["set-cookie"].lower()
     workspace = client.get("/app/affiliate")
     assert workspace.status_code == 200

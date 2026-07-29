@@ -77,6 +77,13 @@ from sqlalchemy.engine import Engine
 APP_SECRET = os.getenv("APP_SECRET", "dev-secret-change-me")
 logger = logging.getLogger(__name__)
 BASE_URL = os.getenv("BASE_URL", "http://localhost:8000").rstrip("/")
+SHORT_LINK_HOST = os.getenv("SHORT_LINK_HOST", "mrt.st").strip().lower().rstrip(".")
+SHORT_LINK_BASE_URL = os.getenv("SHORT_LINK_BASE_URL", f"https://{SHORT_LINK_HOST}").rstrip("/")
+SHORT_REF_PATH_RE = re.compile(r"^/([A-Za-z0-9][A-Za-z0-9_-]{0,127})/?$")
+SHORT_LINK_RESERVED_PATHS = {
+    "app", "health", "static", "r", "v1", "shopify", "campaigns", "affiliates",
+    "flows", "payouts", "docs", "redoc", "openapi.json", "bb.js", "favicon.ico",
+}
 DEFAULT_DESTINATION = os.getenv("DEFAULT_DESTINATION_URL", "https://example.com/checkout")
 DEFAULT_RELAYS = "wss://nos.lol,wss://relay.damus.io,wss://relay.primal.net"
 DEFAULT_MERCHANT_NPUB = "npub1540rxhz9x7fpc73nu5q3qydykej7lceh5j4jej6mmpc6n3saw3cqv7s8js"
@@ -139,9 +146,37 @@ LEGACY_DEMO_MUTATION_PATHS = {
 }
 
 
+def referral_url(ref_code: str) -> str:
+    return f"{SHORT_LINK_BASE_URL}/{ref_code}"
+
+
 def legacy_demo_mutations_enabled() -> bool:
     explicit = os.getenv("ENABLE_LEGACY_DEMO_MUTATIONS")
     return bool(explicit and explicit.lower() in {"1", "true", "yes", "on"})
+
+
+@app.middleware("http")
+async def redirect_short_link_host(request: Request, call_next: Any) -> Response:
+    host = (request.url.hostname or "").lower().rstrip(".")
+    if host != SHORT_LINK_HOST:
+        return await call_next(request)
+
+    canonical = urlparse(BASE_URL)
+    scheme = canonical.scheme or "https"
+    netloc = canonical.netloc
+    match = SHORT_REF_PATH_RE.fullmatch(request.url.path)
+    if (
+        request.method in {"GET", "HEAD"}
+        and match
+        and match.group(1).lower() not in SHORT_LINK_RESERVED_PATHS
+    ):
+        target = request.url.replace(scheme=scheme, netloc=netloc, path=f"/r/{match.group(1)}")
+        response = RedirectResponse(str(target), status_code=302)
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    target = request.url.replace(scheme=scheme, netloc=netloc)
+    return RedirectResponse(str(target), status_code=308)
 
 
 @app.middleware("http")
@@ -1949,7 +1984,7 @@ def _create_enrollment_record(body: EnrollmentIn) -> dict[str, Any]:
                 "created_at": now(),
             },
         )
-    return {"enrollment_id": enrollment_id, "affiliate_pubkey": affiliate["npub"], "affiliate_pubkey_hex": affiliate["hex"], "ref_code": ref_code, "ref_url": f"{BASE_URL}/r/{ref_code}", "nostr_event_id": event["id"], "nostr_event": event, "relay_results": relay_results}
+    return {"enrollment_id": enrollment_id, "affiliate_pubkey": affiliate["npub"], "affiliate_pubkey_hex": affiliate["hex"], "ref_code": ref_code, "ref_url": referral_url(ref_code), "nostr_event_id": event["id"], "nostr_event": event, "relay_results": relay_results}
 
 
 @app.post("/enrollments/{enrollment_id}/status")
@@ -5672,7 +5707,7 @@ def accept_affiliate_invitation(request: Request, response: Response, body: Affi
                     "invitation_id": invitation["id"],
                     "enrollment_id": enrollment["id"],
                     "affiliate_pubkey": identity["npub"],
-                    "ref_url": f"{BASE_URL}/r/{enrollment['ref_code']}",
+                    "ref_url": referral_url(enrollment["ref_code"]),
                     "nostr_status": recovery_nostr_status,
                     "session_expires_at": session_expires_at,
                     "redirect": "/app/affiliate#links",
@@ -5779,7 +5814,7 @@ def accept_affiliate_invitation(request: Request, response: Response, body: Affi
         "invitation_id": invitation["id"],
         "enrollment_id": enrollment["id"],
         "affiliate_pubkey": identity["npub"],
-        "ref_url": f"{BASE_URL}/r/{enrollment['ref_code']}",
+        "ref_url": referral_url(enrollment["ref_code"]),
         "nostr_status": nostr_status,
         "session_expires_at": session_expires_at,
         "redirect": "/app/affiliate#links",
@@ -5800,7 +5835,7 @@ def _merchant_enrollment_result(
         "affiliate_pubkey": enrollment["affiliate_pubkey"],
         "affiliate_pubkey_hex": enrollment["affiliate_pubkey_hex"],
         "ref_code": enrollment["ref_code"],
-        "ref_url": f"{BASE_URL}/r/{enrollment['ref_code']}",
+        "ref_url": referral_url(enrollment["ref_code"]),
         "status": enrollment["status"],
         "nostr_event_id": enrollment["nostr_event_id"],
         "nostr_status": nostr_status,
@@ -5815,7 +5850,7 @@ def affiliate_account_page(request: Request) -> Response:
     if not session:
         return RedirectResponse("/app?role=affiliate", status_code=303)
     with engine().connect() as c:
-        data = affiliate_workspace_data(c, session, base_url=BASE_URL)
+        data = affiliate_workspace_data(c, session, base_url=BASE_URL, ref_base_url=SHORT_LINK_BASE_URL)
     return templates.TemplateResponse(
         request=request,
         name="affiliate.html",

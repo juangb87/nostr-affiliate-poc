@@ -126,6 +126,8 @@ uvicorn app.main:app --host 0.0.0.0 --port $PORT
 Recommended environment variables:
 
 - `BASE_URL`: canonical public URL (production: `https://meerat.com`)
+- `SHORT_LINK_HOST`: host that only serves branded redirects (production: `mrt.st`)
+- `SHORT_LINK_BASE_URL`: base URL emitted for referral links (production: `https://mrt.st`)
 - `DEFAULT_DESTINATION_URL`: merchant checkout URL used for redirect links
 - `DATABASE_URL`: defaults to `sqlite:///./data/poc.db`; supports Railway Postgres URLs (`postgres://...`) for persistence
 - `NOSTR_PRIVATE_KEY`: dedicated backend hex or `nsec...` private key used to sign events

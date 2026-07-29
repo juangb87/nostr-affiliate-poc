@@ -221,7 +221,13 @@ def payout_user_state(state: str | None) -> str:
     return states.get(str(state or "").upper(), str(state or "Pendiente"))
 
 
-def affiliate_workspace_data(connection: Any, session: dict[str, Any], *, base_url: str) -> dict[str, Any]:
+def affiliate_workspace_data(
+    connection: Any,
+    session: dict[str, Any],
+    *,
+    base_url: str,
+    ref_base_url: str | None = None,
+) -> dict[str, Any]:
     npub = session["npub"]
     pubkey_hex = session["nostr_pubkey_hex"]
     params = {"npub": npub, "hex": pubkey_hex}
@@ -268,9 +274,14 @@ def affiliate_workspace_data(connection: Any, session: dict[str, Any], *, base_u
         params,
     )
     clicks = int(connection.execute(text("SELECT COUNT(*) FROM clicks WHERE affiliate_pubkey=:npub OR affiliate_pubkey=:hex"), params).scalar_one())
+    link_base_url = ref_base_url.rstrip("/") if ref_base_url else None
     for link in links:
         link["commission_percent"] = f"{int(link['commission_bps']) / 100:g}"
-        link["ref_url"] = f"{base_url}/r/{link['ref_code']}"
+        link["ref_url"] = (
+            f"{link_base_url}/{link['ref_code']}"
+            if link_base_url
+            else f"{base_url.rstrip('/')}/r/{link['ref_code']}"
+        )
         link["merchant_short"] = short(link.get("merchant_pubkey"))
         link["available"] = bool(link.get("status") == "approved" and link.get("campaign_status") == "active")
         if link["available"]:
