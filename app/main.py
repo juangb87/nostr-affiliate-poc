@@ -1616,6 +1616,7 @@ def health() -> dict[str, Any]:
         "db": "postgres" if database_url().startswith("postgresql") else "sqlite",
         "nostr_pubkey": nostr_keys().public_key().to_hex(),
         "nostr_publish": nostr_publish_enabled(),
+        "dynamic_campaign_invites": True,
         "relays": nostr_relays(),
         "btc_usd_rates": {"mode": "live", "providers": ["coingecko", "yadio"]},
         "nostr_schema_version": SCHEMA_VERSION,
@@ -5661,7 +5662,14 @@ def resolve_affiliate_invitation(request: Request, response: Response, body: Aff
         raise HTTPException(409, "invitation was already used or revoked")
     if invitation["campaign_status"] != "active":
         raise HTTPException(409, "campaign is not active")
-    display_name = safe_text(invitation.get("display_name"), 120) or invitation["campaign_name"]
+    profile_name = safe_text(invitation.get("display_name"), 120)
+    fallback_name = re.sub(
+        r"\s+(?:affiliate\s+program|affiliate\s+programme|programa\s+de\s+afiliados|programa\s+affiliate)$",
+        "",
+        invitation["campaign_name"],
+        flags=re.IGNORECASE,
+    ).strip()
+    display_name = profile_name or fallback_name or invitation["campaign_name"]
     tagline = safe_text(invitation.get("tagline"), 180) or "Comunidad, recomendaciones y sats"
     words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]+", display_name)
     initials = "".join(word[0] for word in words[:2]).upper() or "₿"

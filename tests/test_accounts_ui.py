@@ -464,6 +464,26 @@ def test_merchant_creates_hashed_single_use_invitation_for_owned_campaign(tmp_pa
     assert row["campaign_id"] == campaign["campaign_id"]
 
 
+def test_invitation_resolve_derives_clean_merchant_name_from_campaign_fallback(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    merchant = Keys.generate()
+    campaign = create_campaign(client, merchant, name="Lightning Koffee Affiliate Program")
+    login(client, merchant, "merchant")
+    invitation = create_invitation(client, campaign["campaign_id"])
+    token = invitation["invite_url"].split("#token=", 1)[1]
+
+    resolved = client.post(
+        "/invite/resolve",
+        headers={"origin": "https://testserver"},
+        json={"token": token},
+    )
+    assert resolved.status_code == 200, resolved.text
+    payload = resolved.json()
+    assert payload["merchant"]["display_name"] == "Lightning Koffee"
+    assert payload["merchant"]["initials"] == "LK"
+    assert payload["campaign"]["invite_headline"] == "Recomendá Lightning Koffee. Ganá sats."
+
+
 def test_invitation_resolve_uses_structured_merchant_brand_and_campaign_copy(tmp_path, monkeypatch):
     client = configured_client(tmp_path, monkeypatch)
     merchant = Keys.generate()
