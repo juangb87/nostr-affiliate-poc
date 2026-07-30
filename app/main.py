@@ -2085,6 +2085,62 @@ def create_campaign(body: CampaignIn) -> dict[str, Any]:
     return {"campaign_id": campaign_id, "merchant_pubkey": merchant["npub"], "merchant_pubkey_hex": merchant["hex"], "nostr_event_id": event["id"], "nostr_event": event, "relay_results": relay_results}
 
 
+def public_campaign_directory_data() -> list[dict[str, Any]]:
+    """Return a narrow, aggregate-only projection for public discovery."""
+    init_db()
+    with engine().connect() as connection:
+        rows = connection.execute(
+            text(
+                """
+                SELECT
+                    c.id,
+                    c.name,
+                    c.commission_bps,
+                    c.window_days,
+                    c.invite_eyebrow,
+                    c.invite_headline,
+                    c.invite_description,
+                    c.created_at,
+                    mp.display_name,
+                    mp.tagline,
+                    mp.logo_url,
+                    (SELECT COUNT(DISTINCT COALESCE(e.affiliate_pubkey_hex, e.affiliate_pubkey))
+                       FROM enrollments e
+                      WHERE e.campaign_id=c.id AND e.status='approved') AS affiliates,
+                    (SELECT COUNT(*)
+                       FROM conversions v
+                      WHERE v.campaign_id=c.id AND v.status='approved') AS conversions,
+                    (SELECT COALESCE(SUM(v.commission_sats), 0)
+                       FROM conversions v
+                      WHERE v.campaign_id=c.id AND v.status='approved') AS commission_sats
+                FROM campaigns c
+                LEFT JOIN merchant_profiles mp
+                  ON mp.merchant_pubkey_hex=c.merchant_pubkey_hex
+                WHERE c.status='active' AND c.archived_at IS NULL
+                ORDER BY c.created_at DESC, c.id ASC
+                LIMIT 100
+                """
+            )
+        ).fetchall()
+    campaigns = [dict(row._mapping) for row in rows]
+    for campaign in campaigns:
+        percent = Decimal(int(campaign["commission_bps"])) / Decimal(100)
+        campaign["commission_percent"] = format(percent.normalize(), "f")
+        campaign["affiliates"] = int(campaign.get("affiliates") or 0)
+        campaign["conversions"] = int(campaign.get("conversions") or 0)
+        campaign["commission_sats"] = int(campaign.get("commission_sats") or 0)
+    return campaigns
+
+
+@app.get("/campaigns", response_class=HTMLResponse)
+def public_campaign_directory(request: Request) -> Response:
+    return templates.TemplateResponse(
+        request=request,
+        name="campaign_directory.html",
+        context={"campaigns": public_campaign_directory_data()},
+    )
+
+
 @app.get("/campaigns/{campaign_id}")
 def get_campaign(campaign_id: str) -> dict[str, Any]:
     with engine().connect() as c:

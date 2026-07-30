@@ -23,7 +23,7 @@
     document.querySelectorAll("[data-theme-button]").forEach((item) => item.setAttribute("aria-pressed", String(item.dataset.themeButton === next)));
     safeStorage.set("meerat-theme", next);
   };
-  applyLanguage(safeStorage.get("meerat-language") || "es");
+  applyLanguage(safeStorage.get("meerat-language") || root.dataset.lang || "es");
   applyTheme(safeStorage.get("meerat-theme") || "night");
   document.addEventListener("click", async (event) => {
     const language = event.target.closest("[data-language]");

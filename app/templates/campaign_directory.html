@@ -1,0 +1,75 @@
+{% extends "public_base.html" %}
+{% block title %}{{ "Active campaigns · Meerat" if language == "en" else "Campañas activas · Meerat" }}{% endblock %}
+{% block title_es %}Campañas activas · Meerat{% endblock %}{% block title_en %}Active campaigns · Meerat{% endblock %}
+{% block description %}{{ "Directory of active public Meerat campaigns, with terms and aggregate results." if language == "en" else "Directorio de campañas públicas activas en Meerat, con condiciones y resultados agregados." }}{% endblock %}
+{% block body_class %}campaign-directory-page{% endblock %}
+{% block content %}
+<section class="public-hero" aria-labelledby="directory-title">
+  <div>
+    <p class="eyebrow"><span data-copy-lang="es">Directorio público</span><span data-copy-lang="en">Public directory</span></p>
+    <h1 id="directory-title"><span data-copy-lang="es">Campañas activas</span><span data-copy-lang="en">Active campaigns</span></h1>
+    <p class="lede"><span data-copy-lang="es">Descubrí programas públicos, revisá sus condiciones y conocé cómo participar como Affiliate.</span><span data-copy-lang="en">Discover public programs, review their terms, and learn how to participate as an Affiliate.</span></p>
+    <div class="signature" aria-hidden="true"><span></span><span></span><span></span></div>
+  </div>
+  <div class="hero-actions">
+    <a class="button secondary" href="/app?role=affiliate"><span data-copy-lang="es">Entrar como Affiliate</span><span data-copy-lang="en">Enter as Affiliate</span></a>
+  </div>
+</section>
+
+<section class="directory-section" aria-labelledby="campaign-list-title" aria-label="Campañas públicas activas" data-label-es="Campañas públicas activas" data-label-en="Active public campaigns">
+  <div class="directory-heading">
+    <div>
+      <p class="eyebrow"><span data-copy-lang="es">Programas disponibles</span><span data-copy-lang="en">Available programs</span></p>
+      <h2 id="campaign-list-title"><span data-copy-lang="es">Elegí una campaña</span><span data-copy-lang="en">Choose a campaign</span></h2>
+    </div>
+    <span class="badge neutral directory-count"><strong>{{ campaigns|length }}</strong><span data-copy-lang="es">activa{% if campaigns|length != 1 %}s{% endif %}</span><span data-copy-lang="en">active</span></span>
+  </div>
+
+  {% if campaigns %}
+  <div class="directory-grid">
+    {% for campaign in campaigns %}
+    <article class="campaign-directory-card" aria-labelledby="campaign-{{ campaign.id }}-title">
+      <div class="card-head">
+        <div class="campaign-card-identity">
+          {% if campaign.logo_url %}
+          <img class="campaign-card-logo" src="{{ campaign.logo_url }}" alt="" referrerpolicy="no-referrer" decoding="async" loading="lazy">
+          {% else %}
+          <span class="campaign-card-placeholder" aria-hidden="true">{{ (campaign.display_name or campaign.name)[:1]|upper }}</span>
+          {% endif %}
+          <div>
+            <span class="label">{{ campaign.display_name or "Meerat Merchant" }}</span>
+            <h3 id="campaign-{{ campaign.id }}-title">{{ campaign.name }}</h3>
+          </div>
+        </div>
+        <span class="badge success"><span data-copy-lang="es">Activa</span><span data-copy-lang="en">Active</span></span>
+      </div>
+
+      {% if campaign.tagline or campaign.invite_description or campaign.invite_headline %}
+      <p class="lede">{{ campaign.tagline or campaign.invite_description or campaign.invite_headline }}</p>
+      {% endif %}
+
+      <dl>
+        <dt><span data-copy-lang="es">Comisión</span><span data-copy-lang="en">Commission</span></dt><dd><strong>{{ campaign.commission_percent }}%</strong></dd>
+        <dt><span data-copy-lang="es">Ventana</span><span data-copy-lang="en">Window</span></dt><dd>{{ campaign.window_days }} <span data-copy-lang="es">días</span><span data-copy-lang="en">days</span></dd>
+        <dt>Affiliates</dt><dd>{{ campaign.affiliates }}</dd>
+        <dt><span data-copy-lang="es">Conversiones</span><span data-copy-lang="en">Conversions</span></dt><dd>{{ campaign.conversions }}</dd>
+        <dt><span data-copy-lang="es">Comisiones generadas</span><span data-copy-lang="en">Commissions generated</span></dt><dd>{{ campaign.commission_sats }} sats</dd>
+      </dl>
+
+      <div class="actions">
+        <a class="button" href="/campaigns/{{ campaign.id }}/page" aria-label="Ver campaña {{ campaign.name }}" data-label-es="Ver campaña {{ campaign.name }}" data-label-en="View campaign {{ campaign.name }}"><span data-copy-lang="es">Ver campaña</span><span data-copy-lang="en">View campaign</span></a>
+        <a class="button secondary" href="/app?role=affiliate" aria-label="Entrar como Affiliate para {{ campaign.name }}" data-label-es="Entrar como Affiliate para {{ campaign.name }}" data-label-en="Enter as an Affiliate for {{ campaign.name }}"><span data-copy-lang="es">Soy Affiliate</span><span data-copy-lang="en">I'm an Affiliate</span></a>
+      </div>
+      <p class="notice"><span data-copy-lang="es">La inscripción requiere una invitación del Merchant y tu firma Nostr.</span><span data-copy-lang="en">Enrollment requires a Merchant invitation and your Nostr signature.</span></p>
+    </article>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="card span-12 evidence directory-empty">
+    <div class="card-head"><h2><span data-copy-lang="es">No hay campañas activas</span><span data-copy-lang="en">There are no active campaigns</span></h2><span class="badge neutral">Meerat</span></div>
+    <p><span data-copy-lang="es">Volvé más tarde o entrá como Affiliate para revisar tus invitaciones.</span><span data-copy-lang="en">Check back later or enter as an Affiliate to review your invitations.</span></p>
+    <div class="actions"><a class="button secondary" href="/app?role=affiliate"><span data-copy-lang="es">Entrar como Affiliate</span><span data-copy-lang="en">Enter as Affiliate</span></a></div>
+  </div>
+  {% endif %}
+</section>
+{% endblock %}
