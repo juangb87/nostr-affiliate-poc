@@ -29,7 +29,7 @@ def configured_client(tmp_path, monkeypatch) -> TestClient:
 
 def signed_login_event(keys: Keys, challenge: dict, *, role: str | None = None, relay: str | None = None) -> dict:
     event = (
-        EventBuilder(Kind(22242), "")
+        EventBuilder(Kind(challenge.get("kind", main.AUTH_EVENT_KIND)), "")
         .tags(
             [
                 Tag.parse(["challenge", challenge["challenge"]]),
@@ -148,7 +148,7 @@ def test_login_frontend_preserves_role_card_markup_and_formats_structured_signer
     login_page = client.get("/app?role=merchant")
 
     assert script.status_code == 200
-    assert '/static/app.js?v=20260730-nip46-2' in login_page.text
+    assert '/static/app.js?v=20260730-nip46-3' in login_page.text
     assert "function readableError(error" in script.text
     assert 'value === "[object Object]"' in script.text
     assert "new Error(readableError(data.detail" in script.text
@@ -239,7 +239,7 @@ def test_salvia_concept_brand_contract_is_served(tmp_path, monkeypatch):
     favicon = client.get("/static/brand/favicon.svg")
 
     assert login_page.status_code == 200
-    assert '/static/app.css?v=20260730-nip46-2' in login_page.text
+    assert '/static/app.css?v=20260730-nip46-3' in login_page.text
     assert '/static/brand/wordmark-night.png' in login_page.text
     assert stylesheet.status_code == 200
     assert "--sage: #9cc97e" in stylesheet.text.lower()
@@ -263,7 +263,7 @@ def test_login_frontend_rejects_empty_or_invalid_signer_responses_before_verify(
     assert "NostrKey no devolvió un evento firmado" in script.text
     assert "signWithNostr(unsignedEvent" in script.text
     assert 'JSON.stringify({event})' in script.text
-    assert '/static/app.js?v=20260730-nip46-2' in login_page.text
+    assert '/static/app.js?v=20260730-nip46-3' in login_page.text
 
 
 def test_nip46_mobile_signer_assets_are_self_hosted_and_secret_safe(tmp_path, monkeypatch):
@@ -283,22 +283,26 @@ def test_nip46_mobile_signer_assets_are_self_hosted_and_secret_safe(tmp_path, mo
     assert 'id="nostr-connect-config"' in login_page.text
     assert '"wss://relay.primal.net"' in login_page.text
     assert '"wss://nos.lol"' in login_page.text
-    assert '/static/nostr-connect.js?v=20260730-nip46-2' in login_page.text
+    assert '/static/nostr-connect.js?v=20260730-nip46-3' in login_page.text
     assert '/static/vendor/qrcode-generator-1.4.4.js' in login_page.text
     assert invite_page.status_code == 200
     assert 'id="nostr-connect-config"' in invite_page.text
-    assert '/static/nostr-connect.js?v=20260730-nip46-2' in invite_page.text
+    assert '/static/nostr-connect.js?v=20260730-nip46-3' in invite_page.text
     assert connect_script.status_code == nip46_bundle.status_code == pure_bundle.status_code == qr_script.status_code == 200
     assert "createNostrConnectURI" in connect_script.text
     assert "BunkerSigner.fromURI" in connect_script.text
     assert "generateSecretKey" in connect_script.text
-    assert "sign_event:22242" in connect_script.text
+    assert 'sign_event:${unsignedEvent.kind}' in connect_script.text
+    assert "sign_event:22242" not in connect_script.text
+    assert "kind: affiliateInvitationEventKind" in client.get("/static/app.js").text
+    assert "window.history.state?.inviteToken" in client.get("/static/app.js").text
+    assert "const eventToSign = {...unsignedEvent, created_at: Math.floor(Date.now() / 1000)}" in connect_script.text
     assert "identityMismatch" in connect_script.text
     assert "signingFailed" in connect_script.text
     assert "shareIdentityFailed" in connect_script.text
     assert "raceWithAbort" in connect_script.text
     assert "await raceWithAbort(signer.getPublicKey()" in connect_script.text
-    assert "await raceWithAbort(signer.signEvent(unsignedEvent)" in connect_script.text
+    assert "await raceWithAbort(signer.signEvent(eventToSign)" in connect_script.text
     assert "if (activeAttempt === attempt) {\n      activeAttempt = null;\n      clearDialog();" in connect_script.text
     assert "localStorage" not in connect_script.text
     assert "sessionStorage" not in connect_script.text
@@ -403,6 +407,7 @@ def test_challenge_is_one_use_and_role_origin_are_bound(tmp_path, monkeypatch):
     create_campaign(client, merchant)
 
     challenge = client.post("/auth/nostr/challenge", json={"role": "merchant"}).json()
+    assert challenge["kind"] == 27236
     event = signed_login_event(merchant, challenge)
     first = client.post("/auth/nostr/verify", json={"event": event})
     assert first.status_code == 200
@@ -642,6 +647,7 @@ def test_invitation_resolve_derives_clean_merchant_name_from_campaign_fallback(t
     )
     assert resolved.status_code == 200, resolved.text
     payload = resolved.json()
+    assert payload["auth_event_kind"] == 27236
     assert payload["merchant"]["display_name"] == "Lightning Koffee"
     assert payload["merchant"]["initials"] == "LK"
     assert payload["campaign"]["invite_headline"] == "Recomendá Lightning Koffee. Ganá sats."

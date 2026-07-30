@@ -141,6 +141,7 @@ async function signWithNostr(unsignedEvent, requestedMethod = "auto") {
 }
 
 let affiliateInvitationToken = null;
+let affiliateInvitationEventKind = null;
 
 function clearPreparedInvoice(form) {
   const panel = form.querySelector("[data-invoice-panel]");
@@ -173,8 +174,12 @@ async function resolveAffiliateInvitation() {
     page.querySelectorAll(selector).forEach((element) => { element.textContent = value; });
   };
   const params = new URLSearchParams(window.location.hash.slice(1));
-  const token = params.get("token");
-  window.history.replaceState(null, "", "/invite");
+  const fragmentToken = params.get("token");
+  const historyToken = window.history.state?.inviteToken;
+  const token = fragmentToken || (typeof historyToken === "string" ? historyToken : null);
+  if (fragmentToken) {
+    window.history.replaceState({inviteToken: fragmentToken}, "", "/invite");
+  }
   if (!token) {
     fail("El enlace no contiene una invitación válida. Pedile uno nuevo al comerciante.");
     return;
@@ -184,6 +189,10 @@ async function resolveAffiliateInvitation() {
     const result = await jsonFetch("/invite/resolve", {
       method: "POST", body: JSON.stringify({token})
     });
+    affiliateInvitationEventKind = Number(result.auth_event_kind);
+    if (!Number.isInteger(affiliateInvitationEventKind)) {
+      throw new Error("La invitación no tiene un tipo de firma válido");
+    }
     const merchant = result.merchant || {};
     const campaign = result.campaign || {};
     const displayName = merchant.display_name || result.campaign_name || "Comercio";
@@ -288,7 +297,7 @@ document.addEventListener("click", async (event) => {
       const token = affiliateInvitationToken;
       if (!token) throw new Error("La invitación no está disponible");
       const eventToSign = {
-        kind: 22242,
+        kind: affiliateInvitationEventKind,
         created_at: Math.floor(Date.now() / 1000),
         tags: [
           ["challenge", token],
@@ -303,6 +312,7 @@ document.addEventListener("click", async (event) => {
         method: "POST", body: JSON.stringify({token, event: signedEvent})
       });
       status.textContent = "Invitación aceptada. Abriendo tu espacio de trabajo…";
+      window.history.replaceState(null, "", "/invite");
       window.location.assign(result.redirect);
     } catch (error) {
       status.textContent = readableError(error);

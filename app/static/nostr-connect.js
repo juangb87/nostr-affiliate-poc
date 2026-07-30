@@ -210,7 +210,7 @@ async function signEvent(unsignedEvent) {
     clientPubkey,
     relays,
     secret: randomHex(),
-    perms: ["get_public_key", "sign_event:22242"],
+    perms: ["get_public_key", `sign_event:${unsignedEvent.kind}`],
     name: "Meerat",
     url: window.location.origin,
   });
@@ -254,7 +254,8 @@ async function signEvent(unsignedEvent) {
     }
     let signed;
     try {
-      signed = await raceWithAbort(signer.signEvent(unsignedEvent), controller.signal);
+      const eventToSign = {...unsignedEvent, created_at: Math.floor(Date.now() / 1000)};
+      signed = await raceWithAbort(signer.signEvent(eventToSign), controller.signal);
     } catch (error) {
       if (controller.signal.aborted) throw error;
       throw new Error(copy.signingFailed);

@@ -8,7 +8,9 @@ from typing import Any
 
 from nostr_sdk import Event, PublicKey
 
-AUTH_EVENT_KIND = 22242
+# Ephemeral Meerat authentication proof. Do not use 22242: Amber and other
+# signers correctly reserve that kind for NIP-42 relay authentication.
+AUTH_EVENT_KIND = 27236
 ALLOWED_ROLES = {"merchant", "affiliate", "ops"}
 SESSION_COOKIE = "meerat_session"
 
@@ -58,7 +60,7 @@ def verify_auth_event(
     expected_relay: str,
     max_clock_skew_seconds: int = 90,
 ) -> dict[str, str]:
-    """Verify a one-use, NIP-42-inspired browser authentication event."""
+    """Verify a one-use Meerat browser authentication event."""
     try:
         event = Event.from_json(json.dumps(event_json, separators=(",", ":")))
     except Exception as exc:

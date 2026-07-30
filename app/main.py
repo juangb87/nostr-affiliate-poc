@@ -42,6 +42,7 @@ import qrcode
 from qrcode.image.svg import SvgPathImage
 from qrcode.exceptions import DataOverflowError
 from app.account_auth import (
+    AUTH_EVENT_KIND,
     SESSION_COOKIE,
     digest as auth_digest,
     normalize_role,
@@ -1971,7 +1972,7 @@ def create_auth_challenge(body: AuthChallengeIn, request: Request) -> dict[str, 
         "challenge": challenge,
         "role": role,
         "relay": BASE_URL,
-        "kind": 22242,
+        "kind": AUTH_EVENT_KIND,
         "expires_at": expires_at.isoformat(),
     }
 
@@ -6304,6 +6305,7 @@ def resolve_affiliate_invitation(request: Request, response: Response, body: Aff
     )
     return {
         "ok": True,
+        "auth_event_kind": AUTH_EVENT_KIND,
         "campaign_name": invitation["campaign_name"],
         "commission_percent": commission_percent,
         "window_days": invitation["window_days"],
