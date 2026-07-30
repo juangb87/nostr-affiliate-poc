@@ -9,8 +9,8 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/app.css?v=20260729-ops-observability1">
-  <script src="/static/app.js?v=20260729-payout-evidence1" defer></script>
+  <link rel="stylesheet" href="/static/app.css?v=20260730-affiliate-onboarding1">
+  <script src="/static/app.js?v=20260730-affiliate-onboarding1" defer></script>
 </head>
 <body>
 <a class="skip-link" href="#main">Saltar al contenido</a>
@@ -19,7 +19,7 @@
     <a class="brand" href="/app" aria-label="Meerat"><img src="/static/brand/wordmark-night.png?v=salvia-8a1" width="1428" height="648" alt="Meerat"></a>
     <div class="mobile-account"><span class="account-avatar" aria-hidden="true">{{ role_label[:1] }}</span><code title="{{ account.npub }}">{{ account.npub_short }}</code><button class="link-button" type="button" data-logout>Cerrar sesión</button></div>
   </div>
-  <nav aria-label="Navegación móvil">
+  <nav class="nav-mobile nav-{{ account.role }}" aria-label="Navegación móvil">
     {% for item in nav %}<a href="{{ item.href }}" {% if item.active %}aria-current="page"{% endif %}><span class="nav-icon" aria-hidden="true">{{ item.label[:1] }}</span><span>{{ item.label }}</span></a>{% endfor %}
   </nav>
 </div>
@@ -30,7 +30,7 @@
       <span class="account-avatar" aria-hidden="true">{{ role_label[:1] }}</span>
       <div><small>{{ role_label }}</small><code title="{{ account.npub }}">{{ account.npub_short }}</code></div>
     </div>
-    <nav class="nav" aria-label="Navegación principal">
+    <nav class="nav nav-{{ account.role }}" aria-label="Navegación principal">
       {% for item in nav %}<a href="{{ item.href }}" {% if item.active %}aria-current="page"{% endif %}><span class="nav-icon" aria-hidden="true">{{ item.label[:1] }}</span><span>{{ item.label }}</span></a>{% endfor %}
     </nav>
     <div class="sidebar-footer"><button class="link-button" type="button" data-logout>Cerrar sesión</button></div>

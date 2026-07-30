@@ -236,7 +236,7 @@ def affiliate_workspace_data(
         connection,
         text(
             """
-            SELECT e.id, e.ref_code, e.status, e.lightning_address, e.created_at, c.id AS campaign_id,
+            SELECT e.id, e.ref_code, e.status, e.lightning_address, e.destination_verified_at, e.created_at, c.id AS campaign_id,
                    c.name AS campaign_name, c.merchant_pubkey, c.status AS campaign_status,
                    c.commission_bps, c.window_days, c.destination_url
             FROM enrollments e JOIN campaigns c ON c.id=e.campaign_id
@@ -275,6 +275,19 @@ def affiliate_workspace_data(
         params,
     )
     clicks = int(connection.execute(text("SELECT COUNT(*) FROM clicks WHERE affiliate_pubkey=:npub OR affiliate_pubkey=:hex"), params).scalar_one())
+    profile_row = connection.execute(
+        text(
+            """
+            SELECT lightning_address, verified_at, updated_at
+            FROM affiliate_profiles
+            WHERE affiliate_pubkey_hex=:hex OR affiliate_pubkey=:npub
+            LIMIT 1
+            """
+        ),
+        params,
+    ).fetchone()
+    profile = dict(profile_row._mapping) if profile_row else {}
+    lightning_address = profile.get("lightning_address", "")
     link_base_url = ref_base_url.rstrip("/") if ref_base_url else None
     for link in links:
         link["commission_percent"] = f"{int(link['commission_bps']) / 100:g}"
@@ -284,17 +297,35 @@ def affiliate_workspace_data(
             else f"{base_url.rstrip('/')}/r/{link['ref_code']}"
         )
         link["merchant_short"] = short(link.get("merchant_pubkey"))
-        link["available"] = bool(link.get("status") == "approved" and link.get("campaign_status") == "active")
+        if profile:
+            destination_ready = bool(
+                profile.get("verified_at")
+                and link.get("destination_verified_at")
+                and link.get("lightning_address") == profile.get("lightning_address")
+            )
+        else:
+            # Only enrollments marked during the schema upgrade retain temporary
+            # grandfathered availability until the Affiliate verifies a profile.
+            destination_ready = bool(
+                link.get("lightning_address")
+                and link.get("destination_verified_at") == "legacy"
+            )
+        link["available"] = bool(
+            link.get("status") == "approved"
+            and link.get("campaign_status") == "active"
+            and destination_ready
+        )
         if link["available"]:
             link["user_state"] = "Listo para compartir"
         elif link.get("campaign_status") != "active":
             link["user_state"] = "Programa pausado"
+        elif not destination_ready:
+            link["user_state"] = "Falta destino verificado"
         else:
             link["user_state"] = "Acceso pendiente"
     for payout in payouts:
         payout["user_state"] = payout_user_state(payout.get("state"))
         payout["payment_hash_short"] = short(payout.get("payment_hash"), 8, 6) if payout.get("payment_hash") else None
-    lightning_address = next((row.get("lightning_address") for row in links if row.get("lightning_address")), "")
     affiliate_totals = dict(
         connection.execute(
             text(
@@ -313,6 +344,7 @@ def affiliate_workspace_data(
     return {
         "links": links,
         "lightning_address": lightning_address,
+        "affiliate_profile": profile,
         "conversions": conversions,
         "payouts": payouts,
         "totals": {

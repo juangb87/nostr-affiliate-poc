@@ -451,6 +451,10 @@ document.addEventListener("submit", async (event) => {
         method: "PUT", body: JSON.stringify({lightning_address: String(new FormData(lightningForm).get("lightning_address") || "").trim()})
       });
       status.textContent = `Destino verificado y guardado. ${result.updated_payouts} pago(s) pendiente(s) actualizado(s).`;
+      if (lightningForm.dataset.onboarding === "true") {
+        status.textContent = "Destino verificado. Preparando tu dashboard…";
+        window.location.assign(result.redirect || "/app/affiliate");
+      }
     } catch (error) {
       status.textContent = readableError(error); status.classList.add("error");
     } finally { button.disabled = false; }

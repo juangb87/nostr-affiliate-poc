@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}Onboarding Affiliate · Meerat{% endblock %}
+{% block content %}
+<header class="page-header onboarding-header affiliate-onboarding-header">
+  <div><p class="eyebrow">Primer setup · Cobros</p><h1>Antes de compartir, asegurá cómo cobrar.</h1><p class="lede">Registrá una Lightning Address válida. La verificamos contra LNURL-pay y la asociamos a todos tus programas desde el principio.</p></div>
+</header>
+<section class="affiliate-onboarding-shell" data-affiliate-onboarding>
+  <div class="affiliate-onboarding-copy">
+    <span class="step-number">01</span>
+    <div><p class="eyebrow">Payout destination</p><h2>Tu identidad recomienda. Tu wallet cobra.</h2><p>Meerat no custodia fondos ni necesita acceso a tu wallet. El Merchant genera el invoice directamente desde esta dirección cuando llega el momento de pagarte.</p></div>
+  </div>
+  <ol class="affiliate-assurance-list">
+      <li><span>01</span><div><strong>Verificamos LNURL-pay</strong><small>La dirección debe existir y responder como un destino Lightning cobrable.</small></div></li>
+      <li><span>02</span><div><strong>La propagamos a tus programas</strong><small>Tus enrollments y payouts elegibles quedan vinculados al mismo destino.</small></div></li>
+      <li><span>03</span><div><strong>Seguís siendo non-custodial</strong><small>Los sats viajan del Merchant a tu wallet; Meerat conserva únicamente evidencia.</small></div></li>
+    </ol>
+  <form class="affiliate-onboarding-card" data-affiliate-lightning-address data-onboarding="true" novalidate>
+    <div class="affiliate-onboarding-card-head"><p class="eyebrow">Lightning Address</p><h2>¿Dónde querés recibir tus sats?</h2><p>Usá una dirección de una wallet que controles.</p></div>
+    <label><span>Tu Lightning Address</span><input name="lightning_address" type="email" placeholder="vos@getalby.com" autocomplete="email" inputmode="email" autocapitalize="none" spellcheck="false" required maxlength="320"><small>Ejemplo: <code>nombre@wallet.com</code>. No pegues un invoice BOLT11.</small></label>
+    <aside class="onboarding-privacy-note"><strong>Privado por diseño</strong><p>Tu dirección no aparece en páginas públicas, proofs ni APIs de enrollment.</p></aside>
+    <button class="button" type="submit">Verificar y entrar al dashboard →</button>
+    <p class="form-status" role="status" aria-live="polite" data-lightning-status>Haremos una consulta segura al dominio de tu wallet. No se envían sats durante esta verificación.</p>
+  </form>
+</section>
+{% endblock %}

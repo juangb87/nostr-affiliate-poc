@@ -1,12 +1,29 @@
 {% extends "base.html" %}
-{% block title %}Afiliado · Meerat{% endblock %}
+{% block title %}Affiliate · Meerat{% endblock %}
 {% block content %}
-<header class="page-header"><div><p class="eyebrow">Affiliate account</p><h1>Tus links. Tus conversiones. Tus sats.</h1><p class="lede">Una vista privada de tu actividad como afiliado y pruebas públicas verificables para cada resultado.</p></div></header>
+<header class="page-header"><div><p class="eyebrow">{{ view_meta.eyebrow }}</p><h1>{{ view_meta.title }}</h1><p class="lede">{{ view_meta.lede }}</p></div>{% if view == 'overview' %}<div class="header-actions"><a class="button secondary" href="/app/affiliate?view=links">Ver mis links</a></div>{% endif %}</header>
+
+{% if view == 'overview' %}
+<section class="metrics affiliate-metrics" aria-label="Resumen Affiliate">
+  <article class="metric"><span>Links activos</span><strong>{{ totals.active_links }}</strong><small>programas listos</small></article>
+  <article class="metric"><span>Clicks</span><strong>{{ totals.clicks }}</strong><small>visitas atribuidas</small></article>
+  <article class="metric"><span>Conversiones</span><strong>{{ totals.conversions }}</strong><small>ventas confirmadas</small></article>
+  <article class="metric"><span>Comisión bruta</span><strong>{{ totals.gross_sats }}</strong><small>{{ totals.paid_sats }} sats pagados</small></article>
+</section>
+<aside class="notice affiliate-payment-ready"><div><strong>Listo para cobrar desde el primer link.</strong><p>Tu destino verificado es <code>{{ lightning_address }}</code>. Los Merchants pueden generar invoices LNURL-pay sin que Meerat custodie tus fondos.</p></div><a class="action" href="/app/affiliate?view=settings">Administrar destino</a></aside>
+<section class="section"><div class="section-head"><div><h2>Tu flujo Affiliate</h2><p>Cada tarea tiene su lugar, para que puedas compartir, medir y cobrar sin mezclar información.</p></div></div><div class="workspace-actions affiliate-workspace-actions">
+  <a href="/app/affiliate?view=links"><span>01</span><strong>Compartir links</strong><small>Copiá el enlace canónico de cada programa activo.</small></a>
+  <a href="/app/affiliate?view=activity"><span>02</span><strong>Revisar conversiones</strong><small>Seguimiento de ventas y pruebas públicas.</small></a>
+  <a href="/app/affiliate?view=earnings"><span>03</span><strong>Seguir tus sats</strong><small>Comisiones, estado de pago y receipts.</small></a>
+</div></section>
+{% endif %}
+
+{% if view == 'links' %}
 <section class="section" id="links">
-  <div class="section-head"><div><h2>{% if links %}Tu link para compartir{% else %}Todavía no tenés links{% endif %}</h2><p>{% if links %}Usá el link canónico del programa; cada visita crea un click nuevo sin cambiar tu ref code.{% else %}Abrí una invitación del Merchant y firmala con esta misma identidad Nostr.{% endif %}</p></div></div>
-  <div class="panel record-list">
+  <div class="section-head"><div><h2>{% if links %}Tu link para compartir{% else %}Todavía no tenés links{% endif %}</h2><p>{% if links %}Usá el link canónico del programa; cada visita crea un click nuevo sin cambiar tu ref code.{% else %}Abrí una invitación del Merchant y firmala con esta misma identidad Nostr.{% endif %}</p></div><span class="section-count">{{ totals.active_links }} activo{% if totals.active_links != 1 %}s{% endif %}</span></div>
+  <div class="panel record-list affiliate-link-list">
   {% for link in links %}
-    <article class="record" data-affiliate-link>
+    <article class="record affiliate-link-record" data-affiliate-link>
       <div class="record-main"><strong>{{ link.campaign_name }}</strong><span>Merchant {{ link.merchant_short }} · {{ link.commission_percent }}% · ventana {{ link.window_days }} días</span></div>
       <div><span class="label-mobile">Estado</span><span class="badge {% if link.available %}success{% endif %}">{{ link.user_state }}</span></div>
       <div class="record-span"><span class="label-mobile">Link</span><div class="copy-row"><code class="copy-value" title="{{ link.ref_url }}">{{ link.ref_url }}</code>{% if link.available %}<button class="copy-button" type="button" data-copy="{{ link.ref_url }}">Copiar</button>{% endif %}</div>{% if not link.available %}<small>Esperá que el Merchant active el programa antes de compartirlo.</small>{% endif %}</div>
@@ -17,25 +34,35 @@
   {% endfor %}
   </div>
 </section>
-<section class="metrics" aria-label="Resumen afiliado">
-  <article class="metric"><span>Links activos</span><strong>{{ totals.active_links }}</strong><small>programas listos</small></article>
-  <article class="metric"><span>Clicks</span><strong>{{ totals.clicks }}</strong><small>visitas atribuidas</small></article>
-  <article class="metric"><span>Conversiones</span><strong>{{ totals.conversions }}</strong><small>ventas confirmadas</small></article>
-  <article class="metric"><span>Comisión bruta</span><strong>{{ totals.gross_sats }}</strong><small>{{ totals.paid_sats }} sats pagados</small></article>
+{% endif %}
+
+{% if view == 'earnings' %}
+<section class="metrics affiliate-earnings-metrics" aria-label="Resumen de ganancias">
+  <article class="metric"><span>Comisión bruta</span><strong>{{ totals.gross_sats }}</strong><small>sats atribuidos</small></article>
+  <article class="metric"><span>Pagado</span><strong>{{ totals.paid_sats }}</strong><small>sats liquidados</small></article>
+  <article class="metric"><span>Payouts</span><strong>{{ payouts|length }}</strong><small>obligaciones registradas</small></article>
 </section>
-<section class="section" id="payment-destination"><div class="section-head"><div><h2>Destino Lightning</h2><p>La dirección que usarán los Merchants para pagarte directamente.</p></div></div>
-  <form class="panel form-panel" data-affiliate-lightning-address>
-    <label><span>Lightning Address</span><input name="lightning_address" type="email" value="{{ lightning_address }}" placeholder="vos@getalby.com" autocomplete="off" required maxlength="320"></label>
-    <button class="button" type="submit">Guardar destino</button>
-    <p class="form-status" role="status" aria-live="polite" data-lightning-status>Verificaremos que la dirección ofrezca LNURL-pay. Meerat no recibe ni custodia estos fondos.</p>
-  </form>
-</section>
-<section class="section" id="earnings"><div class="section-head"><div><h2>Ganancias</h2><p>Comisiones atribuidas y su estado de liquidación.</p></div></div><div class="panel record-list">
+<section class="section" id="earnings"><div class="section-head"><div><h2>Ganancias y pagos</h2><p>Comisiones atribuidas y su estado de liquidación.</p></div></div><div class="panel record-list">
 {% for payout in payouts %}<article class="record"><div class="record-main"><strong>{{ payout.campaign_name }}</strong><span>{{ payout.created_at }}</span></div><div><span class="label-mobile">Comisión</span><strong>{{ payout.amount_sats }} sats</strong></div><div><span class="label-mobile">Estado</span><span class="badge {% if payout.state in ['SETTLED','PUBLISHED'] %}success{% elif payout.state in ['FAILED','UNKNOWN'] %}danger{% endif %}">{{ payout.user_state }}</span></div><div><span class="label-mobile">Payment hash</span><code>{{ payout.payment_hash_short or 'Pendiente' }}</code></div><a class="action" href="/payouts/{{ payout.id }}/receipt">Receipt</a></article>
 {% else %}<div class="empty">Todavía no hay payouts asociados a tus conversiones.</div>{% endfor %}
 </div></section>
-<section class="section" id="activity"><div class="section-head"><div><h2>Conversiones recientes</h2><p>Resultados vinculados a tus referral links.</p></div></div><div class="panel record-list">
+{% endif %}
+
+{% if view == 'activity' %}
+<section class="section" id="activity"><div class="section-head"><div><h2>Conversiones recientes</h2><p>Resultados vinculados a tus referral links.</p></div><span class="section-count">{{ totals.conversions }} aprobada{% if totals.conversions != 1 %}s{% endif %}</span></div><div class="panel record-list">
 {% for conversion in conversions %}<article class="record"><div class="record-main"><strong>{{ conversion.campaign_name }}</strong><span>{{ conversion.created_at }}</span></div><div><span class="label-mobile">Comisión</span><strong>{{ conversion.commission_sats }} sats</strong></div><div><span class="label-mobile">Estado</span><span class="badge {% if conversion.status == 'approved' %}success{% endif %}">{{ conversion.status }}</span></div><div class="record-meta">{{ conversion.currency }}</div><a class="action" href="/flows/{{ conversion.id }}/receipt">Proof</a></article>
 {% else %}<div class="empty">Tus primeras conversiones aparecerán acá.</div>{% endfor %}
 </div></section>
+{% endif %}
+
+{% if view == 'settings' %}
+<section class="section" id="payment-destination"><div class="section-head"><div><h2>Destino verificado</h2><p>La dirección que usarán los Merchants para pagarte directamente.</p></div><span class="badge success">LNURL-pay verificado</span></div>
+  <form class="panel form-panel affiliate-destination-form" data-affiliate-lightning-address>
+    <label><span>Lightning Address</span><input name="lightning_address" type="email" value="{{ lightning_address }}" placeholder="vos@getalby.com" autocomplete="email" autocapitalize="none" spellcheck="false" required maxlength="320"><small>Si la cambiás, actualizamos enrollments y payouts seguros todavía no intentados.</small></label>
+    <button class="button" type="submit">Verificar y actualizar</button>
+    <p class="form-status" role="status" aria-live="polite" data-lightning-status>Volveremos a verificar LNURL-pay antes de guardar. Meerat no recibe ni custodia estos fondos.</p>
+  </form>
+</section>
+<section class="section"><div class="panel destination-security-card"><div><p class="eyebrow">Privacidad</p><h3>Tu destino no es público</h3><p>Se comparte únicamente dentro del flujo autenticado de pago. No se expone en receipts públicos ni representaciones de enrollment.</p></div><div><p class="eyebrow">Verificado</p><h3>Destino vigente</h3><p>Validación LNURL-pay completada el <time datetime="{{ affiliate_profile.verified_at }}">{{ affiliate_profile.verified_at[:10] }}</time> (UTC).</p></div></div></section>
+{% endif %}
 {% endblock %}

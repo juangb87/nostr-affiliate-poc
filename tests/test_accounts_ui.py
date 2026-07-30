@@ -58,13 +58,40 @@ def create_campaign(client: TestClient, merchant: Keys, *, name: str = "Merchant
 
 
 def create_enrollment(client: TestClient, campaign_id: str, affiliate: Keys) -> dict:
-    return main._create_enrollment_record(
+    enrollment = main._create_enrollment_record(
         main.EnrollmentIn(
             campaign_id=campaign_id,
             affiliate_pubkey=affiliate.public_key().to_bech32(),
             lightning_address="affiliate@example.com",
         )
     )
+    # Most suite fixtures model enrollments created before Affiliate onboarding.
+    with main.engine().begin() as connection:
+        connection.execute(
+            text("UPDATE enrollments SET destination_verified_at='legacy' WHERE id=:id"),
+            {"id": enrollment["enrollment_id"]},
+        )
+    return enrollment
+
+
+def seed_verified_affiliate_profile(affiliate: Keys, address: str = "affiliate@wallet.example") -> None:
+    timestamp = main.now()
+    with main.engine().begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO affiliate_profiles
+                  (affiliate_pubkey_hex, affiliate_pubkey, lightning_address, verified_at, created_at, updated_at)
+                VALUES (:hex, :npub, :address, :timestamp, :timestamp, :timestamp)
+                """
+            ),
+            {
+                "hex": affiliate.public_key().to_hex(),
+                "npub": affiliate.public_key().to_bech32(),
+                "address": address,
+                "timestamp": timestamp,
+            },
+        )
 
 
 def login(client: TestClient, keys: Keys, role: str):
@@ -396,8 +423,9 @@ def test_merchant_and_affiliate_workspaces_are_role_scoped(tmp_path, monkeypatch
     assert merchant_client.get("/app/affiliate", follow_redirects=False).status_code in {302, 303, 307}
 
     affiliate_client = TestClient(main.app, base_url="https://testserver")
+    seed_verified_affiliate_profile(affiliate)
     login(affiliate_client, affiliate, "affiliate")
-    affiliate_page = affiliate_client.get("/app/affiliate")
+    affiliate_page = affiliate_client.get("/app/affiliate?view=links")
     assert affiliate_page.status_code == 200
     assert "Affiliate account" in affiliate_page.text
     assert "Private merchant campaign" in affiliate_page.text
@@ -513,7 +541,7 @@ def test_merchant_creates_hashed_single_use_invitation_for_owned_campaign(tmp_pa
 
     merchant_page = client.get("/app/merchant?view=affiliates")
     assert merchant_page.status_code == 200
-    assert '/static/app.js?v=20260729-payout-evidence1' in merchant_page.text
+    assert '/static/app.js?v=20260730-affiliate-onboarding1' in merchant_page.text
     assert 'data-invite-origin="https://mrt.st"' in merchant_page.text
 
     invitation = create_invitation(client, campaign["campaign_id"])
@@ -651,10 +679,26 @@ def test_affiliate_accepts_invitation_with_nip07_and_gets_session(tmp_path, monk
     assert accepted.status_code == 200, accepted.text
     payload = accepted.json()
     assert payload["affiliate_pubkey"] == affiliate.public_key().to_bech32()
-    assert payload["redirect"] == "/app/affiliate#links"
+    assert payload["redirect"] == "/app/affiliate?view=links"
     assert payload["ref_url"].startswith("https://mrt.st/")
     assert main.SESSION_COOKIE.lower() in accepted.headers["set-cookie"].lower()
-    workspace = client.get("/app/affiliate")
+    onboarding = client.get("/app/affiliate")
+    assert onboarding.status_code == 200
+    assert "Antes de compartir, asegurá cómo cobrar" in onboarding.text
+    ref_code = payload["ref_url"].rsplit("/", 1)[-1]
+    blocked_referral = client.get(f"/r/{ref_code}", follow_redirects=False)
+    assert blocked_referral.status_code == 409
+    assert blocked_referral.json()["detail"] == "affiliate payout destination is not configured or verified"
+    monkeypatch.setattr(main, "validate_lightning_address", lambda _address: {"tag": "payRequest"})
+    destination = client.put(
+        "/app/affiliate/lightning-address",
+        headers={"origin": "https://testserver"},
+        json={"lightning_address": "affiliate@wallet.example"},
+    )
+    assert destination.status_code == 200
+    payable_referral = client.get(f"/r/{ref_code}", follow_redirects=False)
+    assert payable_referral.status_code in {302, 303, 307}
+    workspace = client.get("/app/affiliate?view=links")
     assert workspace.status_code == 200
     assert "Tu link para compartir" in workspace.text
     assert "Signed invitation campaign" in workspace.text
@@ -713,7 +757,8 @@ def test_paused_campaign_link_is_visible_but_not_actionable(tmp_path, monkeypatc
     assert data["links"][0]["campaign_status"] == "paused"
     assert data["links"][0]["available"] is False
 
-    workspace = client.get("/app/affiliate")
+    seed_verified_affiliate_profile(affiliate)
+    workspace = client.get("/app/affiliate?view=links")
     assert workspace.status_code == 200
     assert accepted.json()["ref_url"] in workspace.text
     assert "Programa pausado" in workspace.text
@@ -1840,6 +1885,213 @@ def test_merchant_dashboard_exposes_clicks_affiliate_npubs_shopify_sales_and_cop
     assert 'data-copy-target="#shopify-custom-pixel"' in integration_page.text
 
 
+def test_affiliate_onboarding_requires_verified_destination_and_segments_workspace(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    merchant = Keys.generate()
+    affiliate = Keys.generate()
+    campaign = create_campaign(client, merchant, name="Payable from day one")
+    enrollment = create_enrollment(client, campaign["campaign_id"], affiliate)
+    login(client, affiliate, "affiliate")
+
+    gated = client.get("/app/affiliate", follow_redirects=False)
+    assert gated.status_code == 303
+    assert gated.headers["location"] == "/app/affiliate/onboarding"
+    onboarding = client.get("/app/affiliate/onboarding")
+    assert onboarding.status_code == 200
+    assert "Antes de compartir, asegurá cómo cobrar" in onboarding.text
+    assert 'data-affiliate-onboarding' in onboarding.text
+    assert 'name="lightning_address"' in onboarding.text
+
+    monkeypatch.setattr(main, "validate_lightning_address", lambda _address: {
+        "tag": "payRequest",
+        "callback": "https://wallet.example/lnurl/callback",
+        "minSendable": 1_000,
+        "maxSendable": 1_000_000,
+    })
+    saved = client.put(
+        "/app/affiliate/lightning-address",
+        headers={"origin": "https://testserver"},
+        json={"lightning_address": "affiliate@wallet.example"},
+    )
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["redirect"] == "/app/affiliate"
+    assert saved.json()["verified"] is True
+
+    with main.engine().connect() as connection:
+        profile = dict(connection.execute(text("SELECT * FROM affiliate_profiles WHERE affiliate_pubkey_hex=:hex"), {"hex": affiliate.public_key().to_hex()}).one()._mapping)
+        stored_enrollment = connection.execute(text("SELECT lightning_address FROM enrollments WHERE id=:id"), {"id": enrollment["enrollment_id"]}).scalar_one()
+    assert profile["lightning_address"] == "affiliate@wallet.example"
+    assert profile["verified_at"]
+    assert stored_enrollment == "affiliate@wallet.example"
+
+    overview = client.get("/app/affiliate")
+    assert overview.status_code == 200
+    assert "Tus resultados, sin mezclar tareas." in overview.text
+    assert 'href="/app/affiliate?view=links"' in overview.text
+    assert 'href="/app/affiliate?view=earnings"' in overview.text
+    assert 'href="/app/affiliate?view=activity"' in overview.text
+    assert 'href="/app/affiliate?view=settings"' in overview.text
+    assert "Payable from day one" not in overview.text
+
+    links = client.get("/app/affiliate?view=links")
+    assert links.status_code == 200
+    assert "Payable from day one" in links.text
+    assert "Tu link para compartir" in links.text
+    assert 'id="earnings"' not in links.text
+
+    settings = client.get("/app/affiliate?view=settings")
+    assert settings.status_code == 200
+    assert "affiliate@wallet.example" in settings.text
+    assert "Destino verificado" in settings.text
+    assert client.get("/app/affiliate?view=unknown").status_code == 404
+
+    with main.engine().begin() as connection:
+        connection.execute(
+            text("UPDATE enrollments SET lightning_address='stale@wallet.example' WHERE id=:id"),
+            {"id": enrollment["enrollment_id"]},
+        )
+    stale_referral = client.get(f"/r/{enrollment['ref_code']}", follow_redirects=False)
+    assert stale_referral.status_code == 409
+    stale_links = client.get("/app/affiliate?view=links")
+    assert "Falta destino verificado" in stale_links.text
+    assert f'data-copy="{enrollment["ref_url"]}"' not in stale_links.text
+
+
+def test_new_unverified_enrollment_address_is_not_grandfathered(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    merchant = Keys.generate()
+    affiliate = Keys.generate()
+    campaign = create_campaign(client, merchant, name="No implicit trust")
+    enrollment = main._create_enrollment_record(
+        main.EnrollmentIn(
+            campaign_id=campaign["campaign_id"],
+            affiliate_pubkey=affiliate.public_key().to_bech32(),
+            lightning_address="unverified@wallet.example",
+        )
+    )
+    with main.engine().connect() as connection:
+        marker = connection.execute(
+            text("SELECT destination_verified_at FROM enrollments WHERE id=:id"),
+            {"id": enrollment["enrollment_id"]},
+        ).scalar_one_or_none()
+    assert marker is None
+    blocked = client.get(f"/r/{enrollment['ref_code']}", follow_redirects=False)
+    assert blocked.status_code == 409
+    assert blocked.json()["detail"] == "affiliate payout destination is not configured or verified"
+
+
+def test_verified_affiliate_destination_is_inherited_by_new_enrollments(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    merchant = Keys.generate()
+    affiliate = Keys.generate()
+    first_campaign = create_campaign(client, merchant, name="First program")
+    create_enrollment(client, first_campaign["campaign_id"], affiliate)
+    login(client, affiliate, "affiliate")
+    monkeypatch.setattr(main, "validate_lightning_address", lambda _address: {"tag": "payRequest"})
+    saved = client.put(
+        "/app/affiliate/lightning-address",
+        headers={"origin": "https://testserver"},
+        json={"lightning_address": "affiliate@wallet.example"},
+    )
+    assert saved.status_code == 200
+
+    second_campaign = create_campaign(client, merchant, name="Second program")
+    inherited = main._create_enrollment_record(main.EnrollmentIn(
+        campaign_id=second_campaign["campaign_id"],
+        affiliate_pubkey=affiliate.public_key().to_bech32(),
+        lightning_address=None,
+    ))
+    with main.engine().connect() as connection:
+        destination = connection.execute(text("SELECT lightning_address FROM enrollments WHERE id=:id"), {"id": inherited["enrollment_id"]}).scalar_one()
+    assert destination == "affiliate@wallet.example"
+
+    client.post("/auth/logout")
+    login(client, merchant, "merchant")
+    invited_campaign = create_campaign(client, merchant, name="Invitation program")
+    invitation = create_invitation(client, invited_campaign["campaign_id"])
+    token = invitation["invite_url"].split("#token=", 1)[1]
+    client.post("/auth/logout")
+    acceptance_event = invitation_acceptance_event(affiliate, token)
+    accepted = client.post(
+        "/invite/accept",
+        headers={"origin": "https://testserver"},
+        json={"token": token, "event": acceptance_event},
+    )
+    assert accepted.status_code == 200, accepted.text
+    invitation_enrollment_id = accepted.json()["enrollment_id"]
+    ref_code = accepted.json()["ref_url"].rsplit("/", 1)[-1]
+    with main.engine().connect() as connection:
+        invitation_destination = connection.execute(
+            text("SELECT lightning_address FROM enrollments WHERE id=:id"),
+            {"id": invitation_enrollment_id},
+        ).scalar_one()
+    assert invitation_destination == "affiliate@wallet.example"
+    assert client.get(f"/r/{ref_code}", follow_redirects=False).status_code in {302, 303, 307}
+
+    with main.engine().begin() as connection:
+        connection.execute(
+            text("UPDATE enrollments SET lightning_address=NULL WHERE id=:id"),
+            {"id": invitation_enrollment_id},
+        )
+    replayed = client.post(
+        "/invite/accept",
+        headers={"origin": "https://testserver"},
+        json={"token": token, "event": acceptance_event},
+    )
+    assert replayed.status_code == 200, replayed.text
+    assert replayed.json()["duplicate"] is True
+    with main.engine().connect() as connection:
+        repaired = connection.execute(
+            text("SELECT lightning_address FROM enrollments WHERE id=:id"),
+            {"id": invitation_enrollment_id},
+        ).scalar_one()
+    assert repaired == "affiliate@wallet.example"
+
+
+def test_pending_enrollment_inherits_destination_before_approval(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    merchant = Keys.generate()
+    affiliate = Keys.generate()
+    campaign = create_campaign(client, merchant, name="Pending destination program")
+    enrollment = create_enrollment(client, campaign["campaign_id"], affiliate)
+    approved_campaign = create_campaign(client, merchant, name="Existing approved program")
+    create_enrollment(client, approved_campaign["campaign_id"], affiliate)
+    with main.engine().begin() as connection:
+        connection.execute(
+            text("UPDATE enrollments SET status='pending', lightning_address=NULL WHERE id=:id"),
+            {"id": enrollment["enrollment_id"]},
+        )
+    login(client, affiliate, "affiliate")
+    monkeypatch.setattr(main, "validate_lightning_address", lambda _address: {"tag": "payRequest"})
+    saved = client.put(
+        "/app/affiliate/lightning-address",
+        headers={"origin": "https://testserver"},
+        json={"lightning_address": "pending@wallet.example"},
+    )
+    assert saved.status_code == 200, saved.text
+    with main.engine().connect() as connection:
+        pending_destination = connection.execute(
+            text("SELECT lightning_address FROM enrollments WHERE id=:id"),
+            {"id": enrollment["enrollment_id"]},
+        ).scalar_one()
+    assert pending_destination == "pending@wallet.example"
+    with main.engine().begin() as connection:
+        connection.execute(
+            text("UPDATE enrollments SET lightning_address='stale@wallet.example' WHERE id=:id"),
+            {"id": enrollment["enrollment_id"]},
+        )
+
+    monkeypatch.setenv("MERCHANT_API_KEYS", "test-merchant-key")
+    monkeypatch.setenv("SHOPIFY_MERCHANT_PUBKEY", merchant.public_key().to_bech32())
+    approved = client.post(
+        f"/enrollments/{enrollment['enrollment_id']}/status",
+        headers={"Authorization": "Bearer test-merchant-key"},
+        json={"status": "approved"},
+    )
+    assert approved.status_code == 200, approved.text
+    assert client.get(f"/r/{enrollment['ref_code']}", follow_redirects=False).status_code in {302, 303, 307}
+
+
 def test_affiliate_updates_lightning_address_and_only_safe_pending_payouts(tmp_path, monkeypatch):
     client = configured_client(tmp_path, monkeypatch)
     merchant = Keys.generate()
@@ -1847,6 +2099,12 @@ def test_affiliate_updates_lightning_address_and_only_safe_pending_payouts(tmp_p
     campaign = create_campaign(client, merchant, name="Lightning destination campaign")
     enrollment = create_enrollment(client, campaign["campaign_id"], affiliate)
     payout_id = seed_payable_payout(campaign, enrollment, affiliate)
+    on_hold_payout_id = seed_payable_payout(campaign, enrollment, affiliate, amount_sats=75)
+    with main.engine().begin() as connection:
+        connection.execute(
+            text("UPDATE payouts SET state='ON_HOLD', status='on_hold' WHERE id=:id"),
+            {"id": on_hold_payout_id},
+        )
     login(client, affiliate, "affiliate")
 
     def fake_validate(address: str):
@@ -1886,13 +2144,17 @@ def test_affiliate_updates_lightning_address_and_only_safe_pending_payouts(tmp_p
         json={"lightning_address": "juan@getalby.com"},
     )
     assert saved.status_code == 200, saved.text
-    assert saved.json()["updated_payouts"] == 1
+    assert saved.json()["updated_payouts"] == 2
 
     with main.engine().connect() as connection:
         address = connection.execute(text("SELECT lightning_address FROM enrollments WHERE id=:id"), {"id": enrollment["enrollment_id"]}).scalar_one()
         payout_address = connection.execute(text("SELECT lightning_address FROM payouts WHERE id=:id"), {"id": payout_id}).scalar_one()
+        on_hold_address = connection.execute(
+            text("SELECT lightning_address FROM payouts WHERE id=:id"), {"id": on_hold_payout_id}
+        ).scalar_one()
     assert address == "juan@getalby.com"
     assert payout_address == "juan@getalby.com"
+    assert on_hold_address == "juan@getalby.com"
     assert "juan@getalby.com" in client.get("/app/affiliate").text
 
 

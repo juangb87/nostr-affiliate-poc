@@ -833,6 +833,7 @@ def _init_db_unlocked() -> None:
         affiliate_pubkey TEXT NOT NULL,
         affiliate_pubkey_hex TEXT,
         lightning_address TEXT,
+        destination_verified_at TEXT,
         ref_code TEXT UNIQUE NOT NULL,
         status TEXT NOT NULL DEFAULT 'approved',
         nostr_event_id TEXT NOT NULL,
@@ -1033,6 +1034,14 @@ def _init_db_unlocked() -> None:
         created_at TEXT NOT NULL,
         PRIMARY KEY (account_id, role)
     );
+    CREATE TABLE IF NOT EXISTS affiliate_profiles (
+        affiliate_pubkey_hex TEXT PRIMARY KEY,
+        affiliate_pubkey TEXT UNIQUE NOT NULL,
+        lightning_address TEXT NOT NULL,
+        verified_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS auth_challenges (
         id TEXT PRIMARY KEY,
         challenge_hash TEXT UNIQUE NOT NULL,
@@ -1101,6 +1110,8 @@ def _init_db_unlocked() -> None:
             c.execute(text("ALTER TABLE merchant_profiles ADD COLUMN IF NOT EXISTS display_name TEXT"))
             c.execute(text("ALTER TABLE merchant_profiles ADD COLUMN IF NOT EXISTS tagline TEXT"))
             c.execute(text("ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS affiliate_pubkey_hex TEXT"))
+            c.execute(text("ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS destination_verified_at TEXT DEFAULT 'legacy'"))
+            c.execute(text("ALTER TABLE enrollments ALTER COLUMN destination_verified_at DROP DEFAULT"))
             c.execute(text("ALTER TABLE conversions ADD COLUMN IF NOT EXISTS merchant_order_key TEXT"))
             c.execute(text("ALTER TABLE conversions ADD COLUMN IF NOT EXISTS idempotency_payload_hash TEXT"))
             c.execute(text("ALTER TABLE conversions ADD COLUMN IF NOT EXISTS order_total_decimal TEXT"))
@@ -1153,6 +1164,8 @@ def _init_db_unlocked() -> None:
                 c.execute(text("ALTER TABLE campaigns ADD COLUMN terms_url TEXT"))
             if "affiliate_pubkey_hex" not in enrollment_cols:
                 c.execute(text("ALTER TABLE enrollments ADD COLUMN affiliate_pubkey_hex TEXT"))
+            if "destination_verified_at" not in enrollment_cols:
+                c.execute(text("ALTER TABLE enrollments ADD COLUMN destination_verified_at TEXT DEFAULT 'legacy'"))
             conversion_column_ddl = {
                 "merchant_order_key": "TEXT",
                 "idempotency_payload_hash": "TEXT",
@@ -2030,6 +2043,60 @@ def update_campaign_status(
     return {"ok": True, "duplicate": False, "campaign_id": campaign_id, "status": status, "nostr_event_id": event["id"], "nostr_event": event, "relay_results": relay_results}
 
 
+def _lock_affiliate_destination(connection: Any, affiliate_hex: str) -> None:
+    if connection.engine.dialect.name == "postgresql":
+        connection.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+            {"lock_key": f"affiliate-destination:{affiliate_hex}"},
+        )
+
+
+def _verified_affiliate_destination(connection: Any, affiliate_hex: str) -> str | None:
+    return connection.execute(
+        text(
+            """
+            SELECT lightning_address
+            FROM affiliate_profiles
+            WHERE affiliate_pubkey_hex=:hex AND verified_at IS NOT NULL
+            LIMIT 1
+            """
+        ),
+        {"hex": affiliate_hex},
+    ).scalar_one_or_none()
+
+
+def _enrollment_destination_ready(connection: Any, enrollment: dict[str, Any]) -> bool:
+    address = str(enrollment.get("lightning_address") or "")
+    if not address:
+        return False
+    affiliate_hex = enrollment.get("affiliate_pubkey_hex")
+    if not affiliate_hex:
+        try:
+            affiliate_hex = normalize_pubkey(enrollment["affiliate_pubkey"], "affiliate_pubkey")["hex"]
+        except (KeyError, ValueError):
+            return False
+    profile = connection.execute(
+        text(
+            """
+            SELECT lightning_address, verified_at
+            FROM affiliate_profiles
+            WHERE affiliate_pubkey_hex=:hex
+            LIMIT 1
+            """
+        ),
+        {"hex": affiliate_hex},
+    ).fetchone()
+    if profile is None:
+        # Explicit grandfather policy: only rows marked during the schema upgrade
+        # may keep using their historical non-empty destination without a profile.
+        return enrollment.get("destination_verified_at") == "legacy"
+    return bool(
+        profile.verified_at
+        and enrollment.get("destination_verified_at")
+        and profile.lightning_address == address
+    )
+
+
 def _create_enrollment_record(body: EnrollmentIn) -> dict[str, Any]:
     init_db()
     with engine().connect() as c:
@@ -2049,14 +2116,17 @@ def _create_enrollment_record(body: EnrollmentIn) -> dict[str, Any]:
     event = build_enrollment_event(enrollment_row, camp)
     relay_results = publish_event(event)
     with engine().begin() as c:
+        _lock_affiliate_destination(c, affiliate["hex"])
+        verified_destination = _verified_affiliate_destination(c, affiliate["hex"])
+        lightning_address = verified_destination or body.lightning_address
         persist_nostr_event(c, event, "enrollment", enrollment_id, relay_results)
         c.execute(
             text(
                 """
                 INSERT INTO enrollments (id, campaign_id, affiliate_pubkey, affiliate_pubkey_hex, lightning_address,
-                ref_code, status, nostr_event_id, nostr_event_json, created_at)
+                destination_verified_at, ref_code, status, nostr_event_id, nostr_event_json, created_at)
                 VALUES (:id, :campaign_id, :affiliate_pubkey, :affiliate_pubkey_hex, :lightning_address,
-                :ref_code, :status, :nostr_event_id, :nostr_event_json, :created_at)
+                :destination_verified_at, :ref_code, :status, :nostr_event_id, :nostr_event_json, :created_at)
                 """
             ),
             {
@@ -2064,7 +2134,8 @@ def _create_enrollment_record(body: EnrollmentIn) -> dict[str, Any]:
                 "campaign_id": body.campaign_id,
                 "affiliate_pubkey": affiliate["npub"],
                 "affiliate_pubkey_hex": affiliate["hex"],
-                "lightning_address": body.lightning_address,
+                "lightning_address": lightning_address,
+                "destination_verified_at": now() if verified_destination else None,
                 "ref_code": ref_code,
                 "status": "approved",
                 "nostr_event_id": event["id"],
@@ -2094,6 +2165,23 @@ def update_enrollment_status(
         if not campaign:
             raise HTTPException(404, "campaign not found")
         require_merchant_ownership(campaign, authorized_merchant_hex)
+        if status == "approved":
+            affiliate_hex = enrollment.get("affiliate_pubkey_hex") or normalize_pubkey(
+                enrollment["affiliate_pubkey"], "affiliate_pubkey"
+            )["hex"]
+            _lock_affiliate_destination(c, affiliate_hex)
+            verified_destination = _verified_affiliate_destination(c, affiliate_hex)
+            if verified_destination and (
+                enrollment.get("lightning_address") != verified_destination
+                or not enrollment.get("destination_verified_at")
+            ):
+                verified_at = now()
+                enrollment["lightning_address"] = verified_destination
+                enrollment["destination_verified_at"] = verified_at
+                c.execute(
+                    text("UPDATE enrollments SET lightning_address=:address, destination_verified_at=:verified_at WHERE id=:id"),
+                    {"address": verified_destination, "verified_at": verified_at, "id": enrollment_id},
+                )
         if enrollment.get("status") == status:
             return {"ok": True, "duplicate": True, "enrollment_id": enrollment_id, "status": status, "nostr_event_id": enrollment["nostr_event_id"], "nostr_event": json.loads(enrollment["nostr_event_json"])}
         enrollment["status"] = status
@@ -2114,6 +2202,8 @@ def redirect_click(ref_code: str, request: Request) -> RedirectResponse:
         camp = asdict(c.execute(text("SELECT * FROM campaigns WHERE id=:id"), {"id": enr["campaign_id"]}).fetchone())
         if enr.get("status") != "approved":
             raise HTTPException(409, "enrollment is not approved")
+        if not _enrollment_destination_ready(c, enr):
+            raise HTTPException(409, "affiliate payout destination is not configured or verified")
         if not camp or camp.get("status") != "active":
             raise HTTPException(409, "campaign is not active")
         click_id = hid("clk")
@@ -2443,6 +2533,8 @@ def simulate_click(body: SimulateClickIn) -> dict[str, Any]:
         camp = asdict(c.execute(text("SELECT * FROM campaigns WHERE id=:id"), {"id": enr["campaign_id"]}).fetchone())
         if enr.get("status") != "approved":
             raise HTTPException(409, "enrollment is not approved")
+        if not _enrollment_destination_ready(c, enr) and not legacy_demo_mutations_enabled():
+            raise HTTPException(409, "affiliate payout destination is not configured or verified")
         if not camp or camp.get("status") != "active":
             raise HTTPException(409, "campaign is not active")
         click_id = hid("clk")
@@ -5689,26 +5781,53 @@ def affiliate_update_lightning_address(request: Request, body: AffiliateLightnin
         logger.info("Lightning Address verification rejected %s: %s", address, exc)
         raise HTTPException(422, "La Lightning Address no existe o no ofrece LNURL-pay.") from exc
     init_db()
-    params = {"npub": session["npub"], "hex": session["nostr_pubkey_hex"], "address": address}
+    timestamp = now()
+    params = {
+        "npub": session["npub"],
+        "hex": session["nostr_pubkey_hex"],
+        "address": address,
+        "timestamp": timestamp,
+    }
     with engine().begin() as c:
-        if c.engine.dialect.name == "postgresql":
-            c.execute(
-                text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
-                {"lock_key": f"affiliate-destination:{session['nostr_pubkey_hex']}"},
-            )
+        _lock_affiliate_destination(c, session["nostr_pubkey_hex"])
+        c.execute(
+            text(
+                """
+                INSERT INTO affiliate_profiles
+                  (affiliate_pubkey_hex, affiliate_pubkey, lightning_address, verified_at, created_at, updated_at)
+                VALUES (:hex, :npub, :address, :timestamp, :timestamp, :timestamp)
+                ON CONFLICT (affiliate_pubkey_hex) DO UPDATE SET
+                  affiliate_pubkey=excluded.affiliate_pubkey,
+                  lightning_address=excluded.lightning_address,
+                  verified_at=excluded.verified_at,
+                  updated_at=excluded.updated_at
+                """
+            ),
+            params,
+        )
         enrollments = c.execute(text("""
-            UPDATE enrollments SET lightning_address=:address
-            WHERE status='approved' AND (
-              affiliate_pubkey=:npub OR affiliate_pubkey_hex=:hex OR affiliate_pubkey=:hex
-            )
+            UPDATE enrollments
+            SET lightning_address=:address, destination_verified_at=:timestamp
+            WHERE affiliate_pubkey=:npub OR affiliate_pubkey_hex=:hex OR affiliate_pubkey=:hex
         """), params)
         payouts = c.execute(text("""
             UPDATE payouts SET lightning_address=:address
-            WHERE state='PAYABLE' AND status='pending' AND payment_provider IS NULL
+            WHERE (
+                (state='PAYABLE' AND status='pending')
+                OR (state='ON_HOLD' AND status IN ('on_hold','pending'))
+              )
+              AND payment_provider IS NULL
               AND (affiliate_pubkey=:npub OR affiliate_pubkey=:hex)
               AND NOT EXISTS (SELECT 1 FROM payment_attempts a WHERE a.payout_id=payouts.id)
         """), params)
-    return {"ok": True, "lightning_address": address, "updated_enrollments": enrollments.rowcount, "updated_payouts": payouts.rowcount}
+    return {
+        "ok": True,
+        "verified": True,
+        "redirect": "/app/affiliate",
+        "lightning_address": address,
+        "updated_enrollments": enrollments.rowcount,
+        "updated_payouts": payouts.rowcount,
+    }
 
 
 def _owned_merchant_payout(c: Any, session: dict[str, Any], payout_id: str, *, lock: bool = False) -> dict[str, Any] | None:
@@ -6116,6 +6235,8 @@ def accept_affiliate_invitation(request: Request, response: Response, body: Affi
     duplicate = False
     with _INVITATION_ACCEPT_LOCK:
         with engine().begin() as c:
+            _lock_affiliate_destination(c, identity["hex"])
+            verified_destination = _verified_affiliate_destination(c, identity["hex"])
             if database_url().startswith("postgresql"):
                 c.execute(
                     text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
@@ -6134,6 +6255,15 @@ def accept_affiliate_invitation(request: Request, response: Response, body: Affi
                 )
                 if not enrollment or enrollment.get("status") != "approved":
                     raise HTTPException(409, "accepted invitation has no active enrollment")
+                if verified_destination and (
+                    enrollment.get("lightning_address") != verified_destination
+                    or not enrollment.get("destination_verified_at")
+                ):
+                    c.execute(
+                        text("UPDATE enrollments SET lightning_address=:address, destination_verified_at=:verified_at WHERE id=:id"),
+                        {"address": verified_destination, "verified_at": now(), "id": enrollment["id"]},
+                    )
+                    enrollment["lightning_address"] = verified_destination
                 session_token, session_expires_at = _create_affiliate_session(c, identity)
                 recovery_nostr_status = "existing"
                 proof_status = c.execute(
@@ -6159,7 +6289,7 @@ def accept_affiliate_invitation(request: Request, response: Response, body: Affi
                     "ref_url": referral_url(enrollment["ref_code"]),
                     "nostr_status": recovery_nostr_status,
                     "session_expires_at": session_expires_at,
-                    "redirect": "/app/affiliate#links",
+                    "redirect": "/app/affiliate?view=links",
                 }
             if invitation["status"] != "pending":
                 raise HTTPException(409, "invitation was revoked")
@@ -6199,6 +6329,15 @@ def accept_affiliate_invitation(request: Request, response: Response, body: Affi
             if existing:
                 if existing["status"] != "approved":
                     raise HTTPException(409, f"affiliate enrollment is {existing['status']}")
+                if verified_destination and (
+                    existing.get("lightning_address") != verified_destination
+                    or not existing.get("destination_verified_at")
+                ):
+                    c.execute(
+                        text("UPDATE enrollments SET lightning_address=:address, destination_verified_at=:verified_at WHERE id=:id"),
+                        {"address": verified_destination, "verified_at": now(), "id": existing["id"]},
+                    )
+                    existing["lightning_address"] = verified_destination
                 enrollment = existing
                 duplicate = True
             else:
@@ -6207,7 +6346,8 @@ def accept_affiliate_invitation(request: Request, response: Response, body: Affi
                     "campaign_id": campaign["id"],
                     "affiliate_pubkey": identity["npub"],
                     "affiliate_pubkey_hex": identity["hex"],
-                    "lightning_address": None,
+                    "lightning_address": verified_destination,
+                    "destination_verified_at": now() if verified_destination else None,
                     "ref_code": hid("ref"),
                     "status": "approved",
                     "created_at": now(),
@@ -6219,9 +6359,9 @@ def accept_affiliate_invitation(request: Request, response: Response, body: Affi
                     text(
                         """
                         INSERT INTO enrollments (id, campaign_id, affiliate_pubkey, affiliate_pubkey_hex, lightning_address,
-                        ref_code, status, nostr_event_id, nostr_event_json, created_at)
+                        destination_verified_at, ref_code, status, nostr_event_id, nostr_event_json, created_at)
                         VALUES (:id, :campaign_id, :affiliate_pubkey, :affiliate_pubkey_hex, :lightning_address,
-                        :ref_code, :status, :nostr_event_id, :nostr_event_json, :created_at)
+                        :destination_verified_at, :ref_code, :status, :nostr_event_id, :nostr_event_json, :created_at)
                         """
                     ),
                     enrollment,
@@ -6266,7 +6406,7 @@ def accept_affiliate_invitation(request: Request, response: Response, body: Affi
         "ref_url": referral_url(enrollment["ref_code"]),
         "nostr_status": nostr_status,
         "session_expires_at": session_expires_at,
-        "redirect": "/app/affiliate#links",
+        "redirect": "/app/affiliate?view=links",
     }
 
 
@@ -6294,12 +6434,31 @@ def _merchant_enrollment_result(
 
 
 @app.get("/app/affiliate", response_class=HTMLResponse)
-def affiliate_account_page(request: Request) -> Response:
+def affiliate_account_page(request: Request, view: str = "overview") -> Response:
     session = _session_account(request, "affiliate")
     if not session:
         return RedirectResponse("/app?role=affiliate", status_code=303)
+    views = {"overview", "links", "earnings", "activity", "settings"}
+    if view not in views:
+        raise HTTPException(404, "affiliate workspace view not found")
     with engine().connect() as c:
         data = affiliate_workspace_data(c, session, base_url=BASE_URL, ref_base_url=SHORT_LINK_BASE_URL)
+    if not data["affiliate_profile"].get("verified_at"):
+        return RedirectResponse("/app/affiliate/onboarding", status_code=303)
+    view_meta = {
+        "overview": {"eyebrow": "Affiliate account", "title": "Tus resultados, sin mezclar tareas.", "lede": "Una lectura rápida de tus links, conversiones y sats; cada operación vive en su propia vista."},
+        "links": {"eyebrow": "Distribución", "title": "Mis links", "lede": "Programas aceptados y enlaces canónicos listos para compartir."},
+        "earnings": {"eyebrow": "Lightning", "title": "Ganancias", "lede": "Comisiones atribuidas, estado de liquidación y receipts verificables."},
+        "activity": {"eyebrow": "Resultados", "title": "Conversiones", "lede": "Ventas confirmadas desde tus referral links y sus pruebas públicas."},
+        "settings": {"eyebrow": "Cobros", "title": "Destino Lightning", "lede": "La dirección LNURL-pay verificada que usarán los Merchants para pagarte."},
+    }[view]
+    nav_items = [
+        ("Resumen", "overview"),
+        ("Mis links", "links"),
+        ("Ganancias", "earnings"),
+        ("Conversiones", "activity"),
+        ("Cobros", "settings"),
+    ]
     return templates.TemplateResponse(
         request=request,
         name="affiliate.html",
@@ -6307,12 +6466,43 @@ def affiliate_account_page(request: Request) -> Response:
             **data,
             "account": _account_shell(session, "affiliate"),
             "role_label": "Affiliate account",
+            "view": view,
+            "view_meta": view_meta,
+            "workspace_status": {"label": "Destino verificado", "class": "is-healthy"},
             "nav": [
-                {"label": "Resumen", "href": "/app/affiliate", "active": True},
-                {"label": "Mis links", "href": "#links", "active": False},
-                {"label": "Ganancias", "href": "#earnings", "active": False},
-                {"label": "Conversiones", "href": "#activity", "active": False},
+                {
+                    "label": label,
+                    "href": "/app/affiliate" if key == "overview" else f"/app/affiliate?view={key}",
+                    "active": view == key,
+                }
+                for label, key in nav_items
             ],
+        },
+    )
+
+
+@app.get("/app/affiliate/onboarding", response_class=HTMLResponse)
+def affiliate_onboarding_page(request: Request) -> Response:
+    session = _session_account(request, "affiliate")
+    if not session:
+        return RedirectResponse("/app?role=affiliate", status_code=303)
+    with engine().connect() as c:
+        profile = asdict(
+            c.execute(
+                text("SELECT * FROM affiliate_profiles WHERE affiliate_pubkey_hex=:hex LIMIT 1"),
+                {"hex": session["nostr_pubkey_hex"]},
+            ).fetchone()
+        )
+    if profile and profile.get("verified_at"):
+        return RedirectResponse("/app/affiliate", status_code=303)
+    return templates.TemplateResponse(
+        request=request,
+        name="affiliate_onboarding.html",
+        context={
+            "account": _account_shell(session, "affiliate"),
+            "role_label": "Affiliate onboarding",
+            "workspace_status": {"label": "Falta destino de cobro", "class": "is-degraded"},
+            "nav": [{"label": "Configurar cobro", "href": "/app/affiliate/onboarding", "active": True}],
         },
     )
 
