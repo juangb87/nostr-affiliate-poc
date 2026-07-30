@@ -1,3 +1,63 @@
+const APP_I18N = (() => {
+  const node = document.getElementById("app-i18n");
+  if (!node) return {};
+  try { return JSON.parse(node.textContent || "{}"); } catch (_) { return {}; }
+})();
+
+function tr(message) {
+  if (typeof message !== "string" || !Object.keys(APP_I18N).length) return message;
+  if (APP_I18N[message]) return APP_I18N[message];
+  const patterns = [
+    [/^(\d+) sats pagados$/, "$1 sats paid"],
+    [/^(\d+) activos$/, "$1 active links"],
+    [/^(\d+) activo$/, "$1 active link"],
+    [/^(\d+) aprobadas$/, "$1 approved conversions"],
+    [/^(\d+) aprobada$/, "$1 approved conversion"],
+    [/^La solicitud falló \((\d+)\)$/, "The request failed ($1)"],
+    [/^No se pudo cerrar sesión: (.+)$/, "Could not sign out: $1"],
+    [/^Se requiere iniciar sesión con el rol (.+)\.$/, "$1 sign-in is required."],
+    [/^Esta identidad Nostr no está autorizada para el rol (.+)\.$/, "This Nostr identity is not authorized for the $1 role."],
+    [/^(.+) debe ser una URL válida\.$/, "$1 must be a valid URL."],
+    [/^(.+) debe ser una URL (HTTPS|HTTP\(S\)) válida\.$/, "$1 must be a valid $2 URL."],
+    [/^(.+) no debe contener credenciales\.$/, "$1 must not contain credentials."],
+    [/^(.+) contiene un host no válido\.$/, "$1 contains an invalid host."],
+    [/^El pago con estado (.+) no se puede liquidar manualmente\.$/, "A payout in $1 state cannot be settled manually."],
+    [/^La inscripción del afiliado tiene el estado (.+)\.$/, "The affiliate enrollment is in $1 state."]
+  ];
+  for (const [pattern, replacement] of patterns) {
+    if (pattern.test(message)) return message.replace(pattern, replacement);
+  }
+  return message;
+}
+
+function translateUiNode(root) {
+  if (!Object.keys(APP_I18N).length || !root) return;
+  if (root.nodeType === Node.TEXT_NODE) {
+    const trimmed = root.nodeValue.trim();
+    if (!trimmed) return;
+    const translated = tr(trimmed);
+    if (translated !== trimmed) root.nodeValue = root.nodeValue.replace(trimmed, translated);
+    return;
+  }
+  if (root.nodeType !== Node.ELEMENT_NODE && root.nodeType !== Node.DOCUMENT_NODE) return;
+  if (root.matches?.("script,style,code,pre,textarea")) return;
+  for (const attr of ["aria-label", "placeholder", "title", "alt"]) {
+    if (root.hasAttribute?.(attr)) root.setAttribute(attr, tr(root.getAttribute(attr)));
+  }
+  for (const child of root.childNodes || []) translateUiNode(child);
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  translateUiNode(document.body);
+  if (!Object.keys(APP_I18N).length) return;
+  new MutationObserver((mutations) => {
+    for (const mutation of mutations) {
+      if (mutation.type === "characterData") translateUiNode(mutation.target);
+      for (const node of mutation.addedNodes || []) translateUiNode(node);
+    }
+  }).observe(document.body, {subtree: true, childList: true, characterData: true});
+});
+
 async function jsonFetch(url, options = {}) {
   const response = await fetch(url, {
     ...options,
@@ -6,7 +66,7 @@ async function jsonFetch(url, options = {}) {
   let data = {};
   try { data = await response.json(); } catch (_) {}
   if (!response.ok) {
-    throw new Error(readableError(data.detail, `Request failed (${response.status})`));
+    throw new Error(readableError(data.detail, `La solicitud falló (${response.status})`));
   }
   return data;
 }
@@ -30,7 +90,7 @@ function readableError(error, fallback = "No se pudo completar la operación. In
       return "";
     }
   }
-  return messageFrom(error) || fallback;
+  return tr(messageFrom(error) || fallback);
 }
 
 function requireSignedNostrEvent(result) {
@@ -86,7 +146,7 @@ async function resolveAffiliateInvitation() {
   const token = params.get("token");
   window.history.replaceState(null, "", "/invite");
   if (!token) {
-    fail("El enlace no contiene una invitación válida. Pedile al Merchant uno nuevo.");
+    fail("El enlace no contiene una invitación válida. Pedile uno nuevo al comerciante.");
     return;
   }
   affiliateInvitationToken = token;
@@ -96,12 +156,12 @@ async function resolveAffiliateInvitation() {
     });
     const merchant = result.merchant || {};
     const campaign = result.campaign || {};
-    const displayName = merchant.display_name || result.campaign_name || "Merchant";
+    const displayName = merchant.display_name || result.campaign_name || "Comercio";
     const initials = merchant.initials || "₿";
     setAllText("[data-invite-merchant-name]", displayName);
     setAllText("[data-invite-initials]", initials);
     setAllText("[data-invite-tagline]", merchant.tagline || "Comunidad, recomendaciones y sats");
-    setAllText("[data-invite-eyebrow]", campaign.invite_eyebrow || "Programa de afiliados · Value for value");
+    setAllText("[data-invite-eyebrow]", campaign.invite_eyebrow || "Programa de afiliados · Valor por valor");
     setAllText("[data-invite-headline]", campaign.invite_headline || `Recomendá ${displayName}. Ganá sats.`);
     setAllText("[data-invite-description]", campaign.invite_description || `Sumate al programa de afiliados de ${displayName}.`);
     setAllText("[data-invite-commission]", campaign.commission_percent || result.commission_percent);
@@ -197,11 +257,11 @@ document.addEventListener("click", async (event) => {
         content: ""
       };
       const signedEvent = requireSignedNostrEvent(await window.nostr.signEvent(eventToSign));
-      status.textContent = "Creando tu enrollment y link único…";
+      status.textContent = "Creando tu inscripción y tu enlace único…";
       const result = await jsonFetch("/invite/accept", {
         method: "POST", body: JSON.stringify({token, event: signedEvent})
       });
-      status.textContent = "Invitación aceptada. Abriendo tu workspace…";
+      status.textContent = "Invitación aceptada. Abriendo tu espacio de trabajo…";
       window.location.assign(result.redirect);
     } catch (error) {
       status.textContent = readableError(error);
@@ -217,19 +277,19 @@ document.addEventListener("click", async (event) => {
     const paymentHash = form.dataset.preparedPaymentHash || "";
     const expiresAt = Date.parse(form.dataset.preparedExpiresAt || "");
     if (!/^[0-9a-f]{64}$/.test(paymentHash) || !Number.isFinite(expiresAt)) {
-      status.textContent = "Generá nuevamente el invoice antes de registrar el pago.";
+      status.textContent = "Generá nuevamente la factura Lightning antes de registrar el pago.";
       status.classList.add("error");
       return;
     }
     if (Date.now() >= expiresAt) {
-      status.textContent = "Este invoice expiró. Generá uno nuevo antes de pagar.";
+      status.textContent = "Esta factura Lightning expiró. Generá una nueva antes de pagar.";
       status.classList.add("error");
       return;
     }
     form.querySelector("[name='evidence_type']").value = "payment_hash";
     form.querySelector("[name='evidence']").value = paymentHash;
     status.classList.remove("error");
-    status.textContent = "Hash del invoice cargado. Confirmá abajo únicamente si tu wallet mostró el pago exitoso.";
+    status.textContent = "Hash de la factura cargado. Confirmá abajo únicamente si tu billetera mostró que el pago fue exitoso.";
     form.querySelector("[name='confirmed']").focus();
     return;
   }
@@ -240,7 +300,7 @@ document.addEventListener("click", async (event) => {
     const status = form.querySelector("[data-invoice-status]");
     prepareInvoice.disabled = true;
     status.classList.remove("error");
-    status.textContent = "Resolviendo Lightning Address y generando invoice…";
+    status.textContent = "Resolviendo la dirección Lightning y generando la factura…";
     clearPreparedInvoice(form);
     try {
       const result = await jsonFetch(`/app/merchant/payouts/${encodeURIComponent(form.dataset.manualPayout)}/prepare-invoice`, {
@@ -248,7 +308,7 @@ document.addEventListener("click", async (event) => {
       });
       const expiresAt = Date.parse(result.expires_at);
       if (!/^lnbc[0-9a-z]+$/i.test(result.invoice) || !/^data:image\/svg\+xml;base64,/.test(result.qr_data_uri) || !/^[0-9a-f]{64}$/.test(result.payment_hash) || !Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
-        throw new Error("El servidor devolvió un invoice inválido");
+        throw new Error("El servidor devolvió una factura Lightning inválida");
       }
       panel.querySelector("[data-invoice-qr]").src = result.qr_data_uri;
       panel.querySelector("[data-invoice-amount]").textContent = String(result.amount_sats);
@@ -260,8 +320,8 @@ document.addEventListener("click", async (event) => {
       form.dataset.preparedExpiresAt = result.expires_at;
       panel.querySelector("[data-invoice-expiry]").textContent = `Expira: ${new Date(expiresAt).toLocaleString()}`;
       panel.hidden = false;
-      prepareInvoice.textContent = "Regenerar invoice y QR";
-      status.textContent = `Invoice listo por ${result.amount_sats} sats. Generarlo no realiza el pago.`;
+      prepareInvoice.textContent = "Regenerar factura Lightning y QR";
+      status.textContent = `Factura Lightning lista por ${result.amount_sats} sats. Generarlo no realiza el pago.`;
     } catch (error) {
       clearPreparedInvoice(form);
       status.textContent = readableError(error);
@@ -418,7 +478,7 @@ document.addEventListener("submit", async (event) => {
           logo_url: String(fields.get("logo_url") || "").trim() || null
         })
       });
-      status.textContent = "Guardando copy de invitación…";
+      status.textContent = "Guardando el texto de la invitación…";
       await jsonFetch("/app/merchant/campaign-invite", {
         method: "PUT",
         body: JSON.stringify({
@@ -445,14 +505,14 @@ document.addEventListener("submit", async (event) => {
     const button = lightningForm.querySelector("button[type='submit']");
     button.disabled = true;
     status.classList.remove("error");
-    status.textContent = "Verificando Lightning Address…";
+    status.textContent = "Verificando la dirección Lightning…";
     try {
       const result = await jsonFetch("/app/affiliate/lightning-address", {
         method: "PUT", body: JSON.stringify({lightning_address: String(new FormData(lightningForm).get("lightning_address") || "").trim()})
       });
       status.textContent = `Destino verificado y guardado. ${result.updated_payouts} pago(s) pendiente(s) actualizado(s).`;
       if (lightningForm.dataset.onboarding === "true") {
-        status.textContent = "Destino verificado. Preparando tu dashboard…";
+        status.textContent = "Destino verificado. Preparando tu panel…";
         window.location.assign(result.redirect || "/app/affiliate");
       }
     } catch (error) {
@@ -471,10 +531,10 @@ document.addEventListener("submit", async (event) => {
     button.disabled = true; status.classList.remove("error");
     try {
       if (!/^[0-9a-f]{64}$/.test(evidence)) {
-        throw new Error("Ingresá el payment hash Lightning: exactamente 64 caracteres hexadecimales, sin guiones. El ID UUID de Strike no es un payment hash.");
+        throw new Error("Ingresá el hash de pago Lightning: exactamente 64 caracteres hexadecimales, sin guiones. El ID UUID de Strike no es un hash de pago.");
       }
       if (fields.get("confirmed") !== "on") {
-        throw new Error("Marcá la confirmación únicamente si tu wallet mostró el pago exitoso.");
+        throw new Error("Marcá la confirmación únicamente si tu billetera mostró que el pago fue exitoso.");
       }
       if (fields.get("evidence_type") === "preimage") {
         const bytes = new Uint8Array(evidence.match(/.{2}/g).map(byte => parseInt(byte, 16)));

@@ -148,7 +148,7 @@ def test_login_frontend_preserves_role_card_markup_and_formats_structured_signer
     login_page = client.get("/app?role=merchant")
 
     assert script.status_code == 200
-    assert '/static/app.js?v=20260728-merchant-insights1' in login_page.text
+    assert '/static/app.js?v=20260730-app-i18n1' in login_page.text
     assert "function readableError(error" in script.text
     assert 'value === "[object Object]"' in script.text
     assert "new Error(readableError(data.detail" in script.text
@@ -239,7 +239,7 @@ def test_salvia_concept_brand_contract_is_served(tmp_path, monkeypatch):
     favicon = client.get("/static/brand/favicon.svg")
 
     assert login_page.status_code == 200
-    assert '/static/app.css?v=20260728-salvia-concept1' in login_page.text
+    assert '/static/app.css?v=20260730-app-i18n1' in login_page.text
     assert '/static/brand/wordmark-night.png' in login_page.text
     assert stylesheet.status_code == 200
     assert "--sage: #9cc97e" in stylesheet.text.lower()
@@ -263,7 +263,7 @@ def test_login_frontend_rejects_empty_or_invalid_signer_responses_before_verify(
     assert "NostrKey no devolvió un evento firmado" in script.text
     assert "requireSignedNostrEvent(await window.nostr.signEvent(unsignedEvent))" in script.text
     assert 'JSON.stringify({event})' in script.text
-    assert '/static/app.js?v=20260728-merchant-insights1' in login_page.text
+    assert '/static/app.js?v=20260730-app-i18n1' in login_page.text
 
 
 def test_nostr_login_issues_http_only_session_and_logout(tmp_path, monkeypatch):
@@ -341,7 +341,7 @@ def test_malformed_bindings_do_not_authorize_unrelated_identity(tmp_path, monkey
     )
 
     assert response.status_code == 503
-    assert response.json()["detail"] == "merchant account binding configuration is invalid"
+    assert response.json()["detail"] == "La configuración de vinculación de la cuenta del comerciante no es válida."
     assert client.get("/auth/me").status_code == 401
 
 
@@ -417,7 +417,8 @@ def test_merchant_and_affiliate_workspaces_are_role_scoped(tmp_path, monkeypatch
     login(merchant_client, merchant, "merchant")
     merchant_page = merchant_client.get("/app/merchant?view=campaigns")
     assert merchant_page.status_code == 200
-    assert "Merchant account" in merchant_page.text
+    assert "Cuenta de comerciante" in merchant_page.text
+    assert "Merchant account" not in merchant_page.text
     assert "Private merchant campaign" in merchant_page.text
     assert "affiliate@example.com" not in merchant_page.text
     assert merchant_client.get("/app/affiliate", follow_redirects=False).status_code in {302, 303, 307}
@@ -427,7 +428,8 @@ def test_merchant_and_affiliate_workspaces_are_role_scoped(tmp_path, monkeypatch
     login(affiliate_client, affiliate, "affiliate")
     affiliate_page = affiliate_client.get("/app/affiliate?view=links")
     assert affiliate_page.status_code == 200
-    assert "Affiliate account" in affiliate_page.text
+    assert "Cuenta de afiliado" in affiliate_page.text
+    assert "Affiliate account" not in affiliate_page.text
     assert "Private merchant campaign" in affiliate_page.text
     assert "https://mrt.st/" in affiliate_page.text
     assert affiliate_client.get("/app/merchant", follow_redirects=False).status_code in {302, 303, 307}
@@ -541,7 +543,7 @@ def test_merchant_creates_hashed_single_use_invitation_for_owned_campaign(tmp_pa
 
     merchant_page = client.get("/app/merchant?view=affiliates")
     assert merchant_page.status_code == 200
-    assert '/static/app.js?v=20260730-affiliate-onboarding1' in merchant_page.text
+    assert '/static/app.js?v=20260730-app-i18n1' in merchant_page.text
     assert 'data-invite-origin="https://mrt.st"' in merchant_page.text
 
     invitation = create_invitation(client, campaign["campaign_id"])
@@ -688,7 +690,7 @@ def test_affiliate_accepts_invitation_with_nip07_and_gets_session(tmp_path, monk
     ref_code = payload["ref_url"].rsplit("/", 1)[-1]
     blocked_referral = client.get(f"/r/{ref_code}", follow_redirects=False)
     assert blocked_referral.status_code == 409
-    assert blocked_referral.json()["detail"] == "affiliate payout destination is not configured or verified"
+    assert blocked_referral.json()["detail"] == "El destino de cobro del afiliado no está configurado o verificado."
     monkeypatch.setattr(main, "validate_lightning_address", lambda _address: {"tag": "payRequest"})
     destination = client.put(
         "/app/affiliate/lightning-address",
@@ -700,7 +702,7 @@ def test_affiliate_accepts_invitation_with_nip07_and_gets_session(tmp_path, monk
     assert payable_referral.status_code in {302, 303, 307}
     workspace = client.get("/app/affiliate?view=links")
     assert workspace.status_code == 200
-    assert "Tu link para compartir" in workspace.text
+    assert "Tu enlace para compartir" in workspace.text
     assert "Signed invitation campaign" in workspace.text
     assert main.workspace_short(merchant.public_key().to_bech32()) in workspace.text
     assert payload["ref_url"] in workspace.text
@@ -762,7 +764,7 @@ def test_paused_campaign_link_is_visible_but_not_actionable(tmp_path, monkeypatc
     assert workspace.status_code == 200
     assert accepted.json()["ref_url"] in workspace.text
     assert "Programa pausado" in workspace.text
-    assert "Esperá que el Merchant active el programa" in workspace.text
+    assert "Esperá a que el comerciante active el programa" in workspace.text
     assert "Abrir visita de prueba" not in workspace.text
 
 
@@ -880,10 +882,16 @@ def test_merchant_workspace_separates_operational_views_and_settings(tmp_path, m
     assert 'data-merchant-profile' not in overview.text
     assert 'data-merchant-invitation' not in overview.text
 
+    campaigns = client.get("/app/merchant?view=campaigns")
+    assert campaigns.status_code == 200
+    assert "Campañas" in campaigns.text
+    assert ">Activa<" in campaigns.text
+    assert ">active<" not in campaigns.text
+
     affiliates = client.get("/app/merchant?view=affiliates")
     assert affiliates.status_code == 200
     assert 'data-merchant-invitation' in affiliates.text
-    assert "Afiliados enrolados" in affiliates.text
+    assert "Afiliados inscritos" in affiliates.text
     assert 'href="/app/merchant?view=affiliates" aria-current="page"' in affiliates.text
 
     settings = client.get("/app/merchant?view=settings")
@@ -1869,14 +1877,17 @@ def test_merchant_dashboard_exposes_clicks_affiliate_npubs_shopify_sales_and_cop
     integration_page = client.get("/app/merchant?view=integration")
 
     assert overview.status_code == affiliates_page.status_code == activity_page.status_code == integration_page.status_code == 200
-    assert "Clicks" in activity_page.text
+    assert "Clics" in activity_page.text
+    assert "Clicks" not in activity_page.text
     assert "Compras Shopify" in overview.text
     assert "$149.50" in overview.text
     assert affiliate_a.public_key().to_bech32() in affiliates_page.text
     assert affiliate_b.public_key().to_bech32() in affiliates_page.text
     assert other_affiliate.public_key().to_bech32() not in affiliates_page.text
-    assert "Shopify Theme Script" in integration_page.text
-    assert "Shopify Custom Pixel" in integration_page.text
+    assert "Script del tema de Shopify" in integration_page.text
+    assert "Píxel personalizado de Shopify" in integration_page.text
+    assert "Shopify Theme Script" not in integration_page.text
+    assert "Shopify Custom Pixel" not in integration_page.text
     assert "https://testserver/v1/events" in integration_page.text
     assert "https://testserver/v1/conversions" in integration_page.text
     assert "pilot-shop.myshopify.com" in integration_page.text
@@ -1936,7 +1947,7 @@ def test_affiliate_onboarding_requires_verified_destination_and_segments_workspa
     links = client.get("/app/affiliate?view=links")
     assert links.status_code == 200
     assert "Payable from day one" in links.text
-    assert "Tu link para compartir" in links.text
+    assert "Tu enlace para compartir" in links.text
     assert 'id="earnings"' not in links.text
 
     settings = client.get("/app/affiliate?view=settings")
@@ -1977,7 +1988,7 @@ def test_new_unverified_enrollment_address_is_not_grandfathered(tmp_path, monkey
     assert marker is None
     blocked = client.get(f"/r/{enrollment['ref_code']}", follow_redirects=False)
     assert blocked.status_code == 409
-    assert blocked.json()["detail"] == "affiliate payout destination is not configured or verified"
+    assert blocked.json()["detail"] == "El destino de cobro del afiliado no está configurado o verificado."
 
 
 def test_verified_affiliate_destination_is_inherited_by_new_enrollments(tmp_path, monkeypatch):
@@ -2132,7 +2143,7 @@ def test_affiliate_updates_lightning_address_and_only_safe_pending_payouts(tmp_p
         json={"lightning_address": "juang87@cash.app"},
     )
     assert invalid.status_code == 422
-    assert invalid.json()["detail"] == "La Lightning Address no existe o no ofrece LNURL-pay."
+    assert invalid.json()["detail"] == "La dirección Lightning no existe o no ofrece LNURL-pay."
     with main.engine().connect() as connection:
         assert connection.execute(
             text("SELECT lightning_address FROM payouts WHERE id=:id"), {"id": payout_id}
@@ -2250,7 +2261,7 @@ def test_merchant_discards_invoice_when_payout_changes_during_lnurl(tmp_path, mo
         headers={"origin": "https://testserver"},
     )
     assert response.status_code == 409
-    assert "changed" in response.json()["detail"]
+    assert "cambió" in response.json()["detail"]
 
 
 def test_merchant_manual_settlement_is_owned_idempotent_and_attested(tmp_path, monkeypatch):
@@ -2281,12 +2292,12 @@ def test_merchant_manual_settlement_is_owned_idempotent_and_attested(tmp_path, m
     assert 'class="record payout-record"' in merchant_page.text
     assert 'class="payout-actions"' in merchant_page.text
     assert 'class="form-panel payout-form"' in merchant_page.text
-    assert "Generar invoice y QR" in merchant_page.text
+    assert "Generar factura Lightning y QR" in merchant_page.text
     assert "data-prepare-invoice" in merchant_page.text
     assert "data-invoice-panel hidden" in merchant_page.text
-    assert "Ya pagué · cargar hash del invoice" in merchant_page.text
-    assert "Generar el invoice no realiza ni verifica el pago" in merchant_page.text
-    assert "Payment hash Lightning (64 hex)" in merchant_page.text
+    assert "Ya pagué · cargar el hash de la factura" in merchant_page.text
+    assert "Generar la factura no realiza ni verifica el pago" in merchant_page.text
+    assert "Hash de pago Lightning (64 caracteres hexadecimales)" in merchant_page.text
     assert "No pegues el ID UUID de Strike" in merchant_page.text
     assert 'data-manual-payout="' in merchant_page.text and "novalidate" in merchant_page.text
     assert 'role="status" aria-live="polite" data-manual-status' in merchant_page.text
@@ -2389,3 +2400,59 @@ def test_manual_settlement_persists_outbox_before_publish_and_retries_same_event
         ), {"id": payout_id}).one()
     assert final.state == "PUBLISHED"
     assert final.reserved_sats == 0
+
+
+def test_app_language_selector_persists_english_and_keeps_spanish_default(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+
+    spanish = client.get("/app?role=merchant&lang=es")
+    assert spanish.status_code == 200
+    assert '<html lang="es">' in spanish.text
+    assert "Cuenta de comerciante" in spanish.text
+    assert 'lang="en"' in spanish.text and ">EN<" in spanish.text
+    assert spanish.headers["content-language"] == "es"
+
+    english = client.get("/app?role=merchant&lang=en")
+    assert english.status_code == 200
+    assert '<html lang="en">' in english.text
+    assert "Merchant account" in english.text
+    assert ">Cuenta de comerciante<" not in english.text
+    assert english.headers["content-language"] == "en"
+    assert "meerat_lang=en" in english.headers["set-cookie"]
+
+    persisted = client.get("/app?role=affiliate")
+    assert '<html lang="en">' in persisted.text
+    assert "Affiliate account" in persisted.text
+    assert persisted.headers["content-language"] == "en"
+
+    restored = client.get("/app?role=affiliate&lang=es")
+    assert '<html lang="es">' in restored.text
+    assert "Cuenta de afiliado" in restored.text
+
+
+def test_authenticated_merchant_and_affiliate_views_render_in_english(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    merchant = Keys.generate()
+    affiliate = Keys.generate()
+    campaign = create_campaign(client, merchant, name="Lightning Koffee")
+    create_enrollment(client, campaign["campaign_id"], affiliate)
+
+    login(client, merchant, "merchant")
+    merchant_page = client.get("/app/merchant?view=integration&lang=en")
+    assert merchant_page.status_code == 200
+    assert '<html lang="en">' in merchant_page.text
+    assert "Merchant account" in merchant_page.text
+    assert "Shopify theme script" in merchant_page.text
+    assert ">Script del tema de Shopify<" not in merchant_page.text
+    assert "Lightning Koffee" in merchant_page.text
+
+    client.post("/auth/logout")
+    seed_verified_affiliate_profile(affiliate)
+    login(client, affiliate, "affiliate")
+    affiliate_page = client.get("/app/affiliate?view=links&lang=en")
+    assert affiliate_page.status_code == 200
+    assert '<html lang="en">' in affiliate_page.text
+    assert "Affiliate account" in affiliate_page.text
+    assert "My links" in affiliate_page.text
+    assert ">Mis enlaces<" not in affiliate_page.text
+    assert "Lightning Koffee" in affiliate_page.text

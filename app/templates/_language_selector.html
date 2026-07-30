@@ -1,0 +1,5 @@
+<nav class="language-switch" aria-label="Idioma">
+  <a href="{{ request.url.include_query_params(lang='es') }}" lang="es" {% if language == 'es' %}aria-current="true"{% endif %}>ES</a>
+  <span aria-hidden="true">/</span>
+  <a href="{{ request.url.include_query_params(lang='en') }}" lang="en" {% if language == 'en' %}aria-current="true"{% endif %}>EN</a>
+</nav>

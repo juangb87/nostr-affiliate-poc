@@ -1,27 +1,27 @@
 {% extends "base.html" %}
-{% block title %}Onboarding Merchant · Meerat{% endblock %}
+{% block title %}Configuración inicial del comerciante · Meerat{% endblock %}
 {% block content %}
 <header class="page-header onboarding-header">
-  <div><p class="eyebrow">Primer setup</p><h1>Configurá tu programa.</h1><p class="lede">Primero definimos tu marca, después las condiciones y finalmente la invitación que verá cada Affiliate.</p></div>
+  <div><p class="eyebrow">Configuración inicial</p><h1>Configurá tu programa.</h1><p class="lede">Primero definimos tu marca, después las condiciones y finalmente la invitación que verá cada afiliado.</p></div>
 </header>
 <section class="onboarding-shell" data-merchant-onboarding>
-  <ol class="onboarding-progress" aria-label="Progreso del onboarding">
+  <ol class="onboarding-progress" aria-label="Progreso de la configuración inicial">
     <li class="active" data-onboarding-progress="1"><span>01</span><strong>Marca</strong><small>Cómo te van a reconocer</small></li>
     <li data-onboarding-progress="2"><span>02</span><strong>Programa</strong><small>Comisión y destino</small></li>
-    <li data-onboarding-progress="3"><span>03</span><strong>Invitación</strong><small>El mensaje para Affiliates</small></li>
+    <li data-onboarding-progress="3"><span>03</span><strong>Invitación</strong><small>El mensaje para los afiliados</small></li>
   </ol>
   <form class="onboarding-form" data-merchant-bootstrap data-merchant-onboarding-wizard>
     <section class="onboarding-step" data-onboarding-step="1">
-      <div class="onboarding-step-head"><span class="step-number">01</span><div><p class="eyebrow">Identidad</p><h2>Presentá tu marca</h2><p>Esta información protagoniza el lander de invitación y se reutiliza en todas tus campañas.</p></div></div>
+      <div class="onboarding-step-head"><span class="step-number">01</span><div><p class="eyebrow">Identidad</p><h2>Presentá tu marca</h2><p>Esta información protagoniza la página de invitación y se reutiliza en todas tus campañas.</p></div></div>
       <div class="onboarding-fields two-columns">
         {% if bootstrap_tenants|length == 1 %}
           <input type="hidden" name="merchant_pubkey" value="{{ bootstrap_tenants[0].merchant_pubkey }}">
-          <label class="field-wide"><span>Identidad Merchant</span><code>{{ bootstrap_tenants[0].merchant_short }}</code></label>
+          <label class="field-wide"><span>Identidad del comerciante</span><code>{{ bootstrap_tenants[0].merchant_short }}</code></label>
         {% else %}
-          <label class="field-wide"><span>Identidad Merchant</span><select name="merchant_pubkey" required>{% for tenant in bootstrap_tenants %}<option value="{{ tenant.merchant_pubkey }}">{{ tenant.merchant_short }}</option>{% endfor %}</select></label>
+          <label class="field-wide"><span>Identidad del comerciante</span><select name="merchant_pubkey" required>{% for tenant in bootstrap_tenants %}<option value="{{ tenant.merchant_pubkey }}">{{ tenant.merchant_short }}</option>{% endfor %}</select></label>
         {% endif %}
         <label><span>Nombre visible</span><input name="display_name" maxlength="120" placeholder="Lightning Koffee" required autocomplete="organization"><small>La marca, no el nombre interno de la campaña.</small></label>
-        <label><span>Tagline</span><input name="tagline" maxlength="180" placeholder="Café, Bitcoin y comunidad"><small>Una frase corta que explique tu universo.</small></label>
+        <label><span>Lema</span><input name="tagline" maxlength="180" placeholder="Café, Bitcoin y comunidad"><small>Una frase corta que explique tu universo.</small></label>
         <label class="field-wide"><span>Logo (URL HTTPS)</span><input name="logo_url" type="url" maxlength="2048" placeholder="https://cdn.example.com/logo.png"><small>PNG, JPG o WebP público. Si lo dejás vacío, usamos las iniciales.</small></label>
       </div>
       <div class="onboarding-actions"><span></span><button class="button" type="button" data-wizard-next>Continuar al programa →</button></div>
@@ -32,7 +32,7 @@
       <div class="onboarding-fields two-columns">
         <label class="field-wide"><span>Nombre del programa</span><input name="program_name" maxlength="160" value="{{ program_defaults.name }}" required></label>
         <label><span>Comisión por venta (%)</span><input name="commission_percent" type="number" min="0.01" max="100" step="0.01" value="{{ program_defaults.commission_bps / 100 }}" required inputmode="decimal"><small>Ejemplo: 8 equivale al 8%.</small></label>
-        <label><span>Ventana de atribución (días)</span><input name="attribution_window_days" type="number" min="1" max="365" step="1" value="{{ program_defaults.window_days }}" required inputmode="numeric"><small>Se aplica internamente; no aparece en el hero del invite.</small></label>
+        <label><span>Ventana de atribución (días)</span><input name="attribution_window_days" type="number" min="1" max="365" step="1" value="{{ program_defaults.window_days }}" required inputmode="numeric"><small>Se aplica internamente; no aparece en el encabezado destacado de la invitación.</small></label>
         <label class="field-wide"><span>URL de destino</span><input name="destination_url" type="url" maxlength="3000" value="{{ program_defaults.destination_url }}" required placeholder="https://tienda.example/"></label>
         <label class="field-wide"><span>URL de términos</span><input name="terms_url" type="url" maxlength="3000" value="{{ program_defaults.terms_url }}" required placeholder="https://tienda.example/terminos-afiliados"></label>
       </div>
@@ -40,10 +40,10 @@
     </section>
 
     <section class="onboarding-step" data-onboarding-step="3" hidden>
-      <div class="onboarding-step-head"><span class="step-number">03</span><div><p class="eyebrow">Conversión</p><h2>Prepará la invitación</h2><p>Personalizá el mensaje de inscripción. Si dejás el copy vacío, usamos un fallback basado en tu marca.</p></div></div>
+      <div class="onboarding-step-head"><span class="step-number">03</span><div><p class="eyebrow">Conversión</p><h2>Prepará la invitación</h2><p>Personalizá el mensaje de inscripción. Si dejás el texto vacío, usamos una versión predeterminada basada en tu marca.</p></div></div>
       <div class="onboarding-fields two-columns">
-        <label class="field-wide"><span>Eyebrow</span><input name="invite_eyebrow" maxlength="100" value="Programa de afiliados · Value for value" placeholder="Programa de afiliados · Value for value"></label>
-        <label class="field-wide"><span>Headline</span><input name="invite_headline" maxlength="120" placeholder="Recomendá café. Ganá sats."></label>
+        <label class="field-wide"><span>Antetítulo</span><input name="invite_eyebrow" maxlength="100" value="Programa de afiliados · Valor por valor" placeholder="Programa de afiliados · Valor por valor"></label>
+        <label class="field-wide"><span>Título principal</span><input name="invite_headline" maxlength="120" placeholder="Recomendá café. Ganá sats."></label>
         <label class="field-wide"><span>Descripción</span><textarea name="invite_description" maxlength="360" rows="5" placeholder="Sumate al programa de afiliados…"></textarea></label>
       </div>
       <div class="onboarding-actions"><button class="button secondary" type="button" data-wizard-back>← Volver</button><button class="button" type="submit">Crear programa y terminar</button></div>

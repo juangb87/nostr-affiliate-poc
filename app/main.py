@@ -51,6 +51,13 @@ from app.account_auth import (
     random_token,
     verify_auth_event,
 )
+from app.i18n import (
+    LANGUAGE_COOKIE,
+    SUPPORTED_LANGUAGES,
+    javascript_catalog,
+    resolve_language,
+    translate_html,
+)
 from app.lightning import (
     LightningPaymentError,
     bolt11_expires_at,
@@ -105,8 +112,85 @@ app = FastAPI(
 )
 
 APP_DIR = Path(__file__).resolve().parent
-templates = Jinja2Templates(directory=str(APP_DIR / "templates"))
+
+_APP_STATUS_LABELS = {
+    "active": "Activa",
+    "paused": "Pausada",
+    "ended": "Finalizada",
+    "pending": "Pendiente",
+    "approved": "Aprobada",
+    "rejected": "Rechazada",
+    "terminated": "Finalizada",
+    "paid": "Pagado",
+    "failed": "Fallido",
+}
+
+
+def app_status_label(value: Any) -> str:
+    normalized = str(value or "").strip()
+    return _APP_STATUS_LABELS.get(normalized.lower(), normalized or "Pendiente")
+
+
+def _i18n_context(request: Request) -> dict[str, Any]:
+    language = getattr(request.state, "language", "es")
+    return {
+        "language": language,
+        "i18n_catalog": javascript_catalog(language),
+    }
+
+
+templates = Jinja2Templates(
+    directory=str(APP_DIR / "templates"),
+    context_processors=[_i18n_context],
+)
+templates.env.globals["app_status"] = app_status_label
 app.mount("/static", StaticFiles(directory=str(APP_DIR / "static")), name="static")
+
+
+@app.middleware("http")
+async def app_language_middleware(request: Request, call_next):
+    requested = request.query_params.get("lang")
+    language = resolve_language(
+        requested,
+        request.cookies.get(LANGUAGE_COOKIE),
+        request.headers.get("accept-language"),
+    )
+    request.state.language = language
+    response = await call_next(request)
+
+    content_type = response.headers.get("content-type", "")
+    if (
+        language == "en"
+        and "text/html" in content_type
+        and (request.url.path == "/app" or request.url.path.startswith("/app/") or request.url.path == "/ops")
+    ):
+        chunks = [bytes(chunk) async for chunk in response.body_iterator]
+        translated = translate_html(b"".join(chunks).decode("utf-8"), language).encode("utf-8")
+
+        async def translated_body():
+            yield translated
+
+        response.body_iterator = translated_body()
+        response.headers["content-length"] = str(len(translated))
+
+    response.headers["content-language"] = language
+    vary = [item.strip() for item in response.headers.get("vary", "").split(",") if item.strip()]
+    for item in ("Cookie", "Accept-Language"):
+        if item not in vary:
+            vary.append(item)
+    response.headers["vary"] = ", ".join(vary)
+    if requested in SUPPORTED_LANGUAGES:
+        response.set_cookie(
+            LANGUAGE_COOKIE,
+            requested,
+            max_age=31_536_000,
+            path="/",
+            secure=BASE_URL.startswith("https://"),
+            httponly=True,
+            samesite="lax",
+        )
+    return response
+
 
 
 def tracking_cors_origins() -> list[str]:
@@ -1706,7 +1790,7 @@ def _auth_event_challenge(event_json: dict[str, Any]) -> str:
     tags = event_json.get("tags") if isinstance(event_json, dict) else None
     values = [tag[1] for tag in (tags or []) if isinstance(tag, list) and len(tag) >= 2 and tag[0] == "challenge"]
     if len(values) != 1 or not isinstance(values[0], str) or not values[0]:
-        raise HTTPException(400, "authentication event requires exactly one challenge tag")
+        raise HTTPException(400, "El evento de autenticación debe incluir exactamente una etiqueta challenge.")
     return values[0]
 
 
@@ -1734,7 +1818,7 @@ def _grant_role_if_authorized(c: Any, account_id: str, pubkey_hex: str, role: st
             bindings = parse_merchant_bindings(os.getenv("MERCHANT_ACCOUNT_BINDINGS", ""))
         except ValueError as exc:
             if not authorized:
-                raise HTTPException(503, "merchant account binding configuration is invalid") from exc
+                raise HTTPException(503, "La configuración de vinculación de la cuenta del comerciante no es válida.") from exc
             bindings = []
         c.execute(
             text("DELETE FROM merchant_account_links WHERE account_id=:account_id AND source='environment_binding'"),
@@ -1756,7 +1840,7 @@ def _grant_role_if_authorized(c: Any, account_id: str, pubkey_hex: str, role: st
         try:
             authorized = pubkey_hex in parse_pubkey_set(os.getenv("OPS_NOSTR_PUBKEYS", ""))
         except ValueError as exc:
-            raise HTTPException(503, "operator allowlist configuration is invalid") from exc
+            raise HTTPException(503, "La configuración de la lista de operadores permitidos no es válida.") from exc
     if authorized:
         c.execute(
             text("""
@@ -1800,7 +1884,7 @@ def _session_account(request: Request, required_role: str | None = None) -> dict
 def require_account_session(request: Request, role: str) -> dict[str, Any]:
     session = _session_account(request, role)
     if not session:
-        raise HTTPException(401, f"{role} sign-in required")
+        raise HTTPException(401, f"Se requiere iniciar sesión con el rol {role}.")
     return session
 
 
@@ -1826,7 +1910,7 @@ def create_auth_challenge(body: AuthChallengeIn, request: Request) -> dict[str, 
             ).scalar_one()
         )
         if recent_client >= 20:
-            raise HTTPException(429, "too many authentication challenges; retry shortly")
+            raise HTTPException(429, "Se solicitaron demasiados desafíos de autenticación. Intentá nuevamente en unos instantes.")
         recent_global = int(
             c.execute(
                 text("SELECT COUNT(*) FROM auth_challenges WHERE created_at>=:cutoff"),
@@ -1834,7 +1918,7 @@ def create_auth_challenge(body: AuthChallengeIn, request: Request) -> dict[str, 
             ).scalar_one()
         )
         if recent_global >= 3000:
-            raise HTTPException(429, "authentication service is busy; retry shortly")
+            raise HTTPException(429, "El servicio de autenticación está ocupado. Intentá nuevamente en unos instantes.")
         c.execute(
             text("""
                 INSERT INTO auth_challenges
@@ -1868,11 +1952,11 @@ def verify_auth_login(body: AuthVerifyIn, response: Response) -> dict[str, Any]:
     with engine().begin() as c:
         challenge_row = asdict(c.execute(text("SELECT * FROM auth_challenges WHERE challenge_hash=:hash LIMIT 1"), {"hash": auth_digest(challenge)}).fetchone())
         if not challenge_row:
-            raise HTTPException(404, "authentication challenge not found")
+            raise HTTPException(404, "No se encontró el desafío de autenticación.")
         if challenge_row["consumed_at"]:
-            raise HTTPException(409, "authentication challenge was already used")
+            raise HTTPException(409, "El desafío de autenticación ya fue utilizado.")
         if parse_iso(challenge_row["expires_at"]) <= datetime.now(timezone.utc):
-            raise HTTPException(410, "authentication challenge expired")
+            raise HTTPException(410, "El desafío de autenticación expiró.")
         try:
             identity = verify_auth_event(
                 body.event,
@@ -1887,7 +1971,7 @@ def verify_auth_login(body: AuthVerifyIn, response: Response) -> dict[str, Any]:
             {"now": now(), "id": challenge_row["id"]},
         )
         if consumed.rowcount != 1:
-            raise HTTPException(409, "authentication challenge was already used")
+            raise HTTPException(409, "El desafío de autenticación ya fue utilizado.")
 
         existing = asdict(c.execute(text("SELECT * FROM accounts WHERE nostr_pubkey_hex=:hex"), {"hex": identity["hex"]}).fetchone())
         account_id = existing["id"] if existing else hid("acct")
@@ -1904,7 +1988,7 @@ def verify_auth_login(body: AuthVerifyIn, response: Response) -> dict[str, Any]:
             )
         role = challenge_row["role"]
         if not _grant_role_if_authorized(c, account_id, identity["hex"], role):
-            raise HTTPException(403, f"this Nostr identity is not authorized as {role}")
+            raise HTTPException(403, f"Esta identidad Nostr no está autorizada para el rol {role}.")
         session_id = hid("ses")
         expires_at = (datetime.now(timezone.utc) + timedelta(hours=12)).isoformat()
         c.execute(
@@ -1937,7 +2021,7 @@ def verify_auth_login(body: AuthVerifyIn, response: Response) -> dict[str, Any]:
 def auth_me(request: Request) -> dict[str, Any]:
     session = _session_account(request)
     if not session:
-        raise HTTPException(401, "not authenticated")
+        raise HTTPException(401, "No hay una sesión autenticada.")
     return {"authenticated": True, "account": {"npub": session["npub"], "role": session["role"], "display_name": session.get("display_name")}}
 
 
@@ -2006,7 +2090,7 @@ def get_campaign(campaign_id: str) -> dict[str, Any]:
     with engine().connect() as c:
         campaign = asdict(c.execute(text("SELECT * FROM campaigns WHERE id=:id"), {"id": campaign_id}).fetchone())
     if not campaign:
-        raise HTTPException(404, "campaign not found")
+        raise HTTPException(404, "No se encontró la campaña.")
     campaign["nostr_event"] = json.loads(campaign.pop("nostr_event_json"))
     return campaign
 
@@ -2031,7 +2115,7 @@ def update_campaign_status(
                 )
             campaign = asdict(c.execute(text("SELECT * FROM campaigns WHERE id=:id"), {"id": campaign_id}).fetchone())
             if not campaign:
-                raise HTTPException(404, "campaign not found")
+                raise HTTPException(404, "No se encontró la campaña.")
             require_merchant_ownership(campaign, authorized_merchant_hex)
             if campaign.get("status") == status:
                 return {"ok": True, "duplicate": True, "campaign_id": campaign_id, "status": status, "nostr_event_id": campaign["nostr_event_id"], "nostr_event": json.loads(campaign["nostr_event_json"])}
@@ -2102,7 +2186,7 @@ def _create_enrollment_record(body: EnrollmentIn) -> dict[str, Any]:
     with engine().connect() as c:
         camp = asdict(c.execute(text("SELECT * FROM campaigns WHERE id=:id"), {"id": body.campaign_id}).fetchone())
     if not camp:
-        raise HTTPException(404, "campaign not found")
+        raise HTTPException(404, "No se encontró la campaña.")
     enrollment_id = hid("enr")
     ref_code = hid("ref")
     affiliate = normalize_pubkey(body.affiliate_pubkey, "affiliate_pubkey")
@@ -2163,7 +2247,7 @@ def update_enrollment_status(
             raise HTTPException(404, "enrollment not found")
         campaign = asdict(c.execute(text("SELECT * FROM campaigns WHERE id=:id"), {"id": enrollment["campaign_id"]}).fetchone())
         if not campaign:
-            raise HTTPException(404, "campaign not found")
+            raise HTTPException(404, "No se encontró la campaña.")
         require_merchant_ownership(campaign, authorized_merchant_hex)
         if status == "approved":
             affiliate_hex = enrollment.get("affiliate_pubkey_hex") or normalize_pubkey(
@@ -2203,9 +2287,9 @@ def redirect_click(ref_code: str, request: Request) -> RedirectResponse:
         if enr.get("status") != "approved":
             raise HTTPException(409, "enrollment is not approved")
         if not _enrollment_destination_ready(c, enr):
-            raise HTTPException(409, "affiliate payout destination is not configured or verified")
+            raise HTTPException(409, "El destino de cobro del afiliado no está configurado o verificado.")
         if not camp or camp.get("status") != "active":
-            raise HTTPException(409, "campaign is not active")
+            raise HTTPException(409, "La campaña no está activa.")
         click_id = hid("clk")
         ip = request.client.host if request.client else "unknown"
         ua = request.headers.get("user-agent", "")
@@ -2267,7 +2351,7 @@ def _create_conversion(
         camp = asdict(c.execute(text("SELECT * FROM campaigns WHERE id=:id"), {"id": click["campaign_id"]}).fetchone())
         enr = asdict(c.execute(text("SELECT * FROM enrollments WHERE ref_code=:ref"), {"ref": click["ref_code"]}).fetchone())
         if not camp or camp.get("status") != "active":
-            raise HTTPException(409, "campaign is not active")
+            raise HTTPException(409, "La campaña no está activa.")
         if not enr or enr.get("status") != "approved":
             raise HTTPException(409, "enrollment is not approved")
         total_sats = order_total_sats(body.order_total, body.currency, quote)
@@ -2534,9 +2618,9 @@ def simulate_click(body: SimulateClickIn) -> dict[str, Any]:
         if enr.get("status") != "approved":
             raise HTTPException(409, "enrollment is not approved")
         if not _enrollment_destination_ready(c, enr) and not legacy_demo_mutations_enabled():
-            raise HTTPException(409, "affiliate payout destination is not configured or verified")
+            raise HTTPException(409, "El destino de cobro del afiliado no está configurado o verificado.")
         if not camp or camp.get("status") != "active":
-            raise HTTPException(409, "campaign is not active")
+            raise HTTPException(409, "La campaña no está activa.")
         click_id = hid("clk")
         c.execute(
             text(
@@ -3460,7 +3544,7 @@ def campaign_budget_detail(campaign_id: str, authorization: Optional[str] = Head
     with engine().begin() as c:
         campaign = c.execute(text("SELECT 1 FROM campaigns WHERE id=:id"), {"id": campaign_id}).fetchone()
         if not campaign:
-            raise HTTPException(404, "campaign not found")
+            raise HTTPException(404, "No se encontró la campaña.")
         budget = ensure_campaign_budget(c, campaign_id)
     return {"budget": budget, "available_sats": max(0, budget["budget_sats"] - budget["committed_sats"] - budget["settled_sats"])}
 
@@ -3475,7 +3559,7 @@ def update_campaign_budget(
     init_db()
     with engine().begin() as c:
         if not c.execute(text("SELECT 1 FROM campaigns WHERE id=:id"), {"id": campaign_id}).fetchone():
-            raise HTTPException(404, "campaign not found")
+            raise HTTPException(404, "No se encontró la campaña.")
         locked_campaign_budget(c, campaign_id)
         updated = c.execute(
             text("""
@@ -3498,7 +3582,7 @@ def release_payout_hold(payout_id: str, authorization: Optional[str] = Header(No
         suffix = " FOR UPDATE" if c.engine.dialect.name == "postgresql" else ""
         payout = asdict(c.execute(text(f"SELECT * FROM payouts WHERE id=:id{suffix}"), {"id": payout_id}).fetchone())
         if not payout:
-            raise HTTPException(404, "payout not found")
+            raise HTTPException(404, "No se encontró el pago.")
         if payout["state"] == "PAYABLE":
             return {"ok": True, "duplicate": True, "payout_id": payout_id, "payout_state": "PAYABLE"}
         if payout["state"] != "ON_HOLD":
@@ -3524,7 +3608,7 @@ def payout_attempts(payout_id: str, authorization: Optional[str] = Header(None))
     init_db()
     with engine().connect() as c:
         if not c.execute(text("SELECT 1 FROM payouts WHERE id=:id"), {"id": payout_id}).fetchone():
-            raise HTTPException(404, "payout not found")
+            raise HTTPException(404, "No se encontró el pago.")
         attempts = [dict(row._mapping) for row in c.execute(
             text("SELECT * FROM payment_attempts WHERE payout_id=:id ORDER BY attempt_number, created_at"),
             {"id": payout_id},
@@ -3540,7 +3624,7 @@ def payout_ledger(payout_id: str, authorization: Optional[str] = Header(None)) -
     init_db()
     with engine().connect() as c:
         if not c.execute(text("SELECT 1 FROM payouts WHERE id=:id"), {"id": payout_id}).fetchone():
-            raise HTTPException(404, "payout not found")
+            raise HTTPException(404, "No se encontró el pago.")
         entries = [dict(row._mapping) for row in c.execute(
             text("SELECT * FROM ledger_entries WHERE payout_id=:id ORDER BY created_at, id"),
             {"id": payout_id},
@@ -3820,7 +3904,7 @@ def payout_data(payout_id: str) -> dict[str, Any]:
     with engine().connect() as c:
         payout = asdict(c.execute(text("SELECT * FROM payouts WHERE id=:id"), {"id": payout_id}).fetchone())
         if not payout:
-            raise HTTPException(404, "payout not found")
+            raise HTTPException(404, "No se encontró el pago.")
         conversion = asdict(c.execute(text("SELECT * FROM conversions WHERE id=:id"), {"id": payout["conversion_id"]}).fetchone())
         campaign = asdict(c.execute(text("SELECT * FROM campaigns WHERE id=:id"), {"id": conversion["campaign_id"] if conversion else None}).fetchone()) if conversion else None
         click = asdict(c.execute(text("SELECT * FROM clicks WHERE id=:id"), {"id": conversion["click_id"] if conversion else None}).fetchone()) if conversion else None
@@ -3856,7 +3940,7 @@ def finalize_payout_paid(
         suffix = " FOR UPDATE" if c.engine.dialect.name == "postgresql" else ""
         payout = asdict(c.execute(text(f"SELECT * FROM payouts WHERE id=:id{suffix}"), {"id": payout_id}).fetchone())
         if not payout:
-            raise HTTPException(404, "payout not found")
+            raise HTTPException(404, "No se encontró el pago.")
         if c.engine.dialect.name == "postgresql":
             c.execute(
                 text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
@@ -3869,7 +3953,7 @@ def finalize_payout_paid(
             LIMIT 1
         """), {"payment_hash": payment_hash, "id": payout_id}).fetchone()
         if hash_used_elsewhere:
-            raise HTTPException(409, "payment hash is already assigned to another payout")
+            raise HTTPException(409, "El hash de pago ya está asignado a otro pago.")
         conversion = asdict(c.execute(text("SELECT * FROM conversions WHERE id=:id"), {"id": payout["conversion_id"]}).fetchone())
         campaign = asdict(c.execute(text("SELECT * FROM campaigns WHERE id=:id"), {"id": conversion["campaign_id"] if conversion else None}).fetchone()) if conversion else None
         if payout["status"] == "paid" and payout.get("nostr_event_id"):
@@ -3969,7 +4053,7 @@ def mark_payout_paid(
     with engine().begin() as c:
         payout = asdict(c.execute(text("SELECT * FROM payouts WHERE id=:id"), {"id": payout_id}).fetchone())
         if not payout:
-            raise HTTPException(404, "payout not found")
+            raise HTTPException(404, "No se encontró el pago.")
         if payout.get("payment_provider") == "nwc":
             raise HTTPException(409, "sandbox cannot modify a real NWC payout")
         if payout["status"] != "paid":
@@ -4081,7 +4165,7 @@ def execute_payout(
             WHERE p.id=:id
         """), {"id": payout_id}).fetchone())
     if not payout:
-        raise HTTPException(404, "payout not found")
+        raise HTTPException(404, "No se encontró el pago.")
     if payout.get("conversion_status") == "reversed":
         raise HTTPException(409, "reversed conversion payout is not executable")
     if payout["status"] == "paid":
@@ -4114,14 +4198,14 @@ def execute_payout(
         raise HTTPException(409, f"payout state {payout['state']} is not executable")
     obligation_sats = int(payout["amount_sats"]) + int(payout.get("fee_sats") or 0)
     if int(payout.get("reserved_sats") or 0) < obligation_sats:
-        raise HTTPException(409, "payout has no complete campaign budget reservation")
+        raise HTTPException(409, "El pago no tiene una reserva completa en el presupuesto de la campaña.")
     if payout.get("return_window_ends_at"):
         try:
             return_window_ends_at = datetime.fromisoformat(str(payout["return_window_ends_at"]).replace("Z", "+00:00"))
             if return_window_ends_at > datetime.now(timezone.utc):
-                raise HTTPException(409, "payout return window has not ended")
+                raise HTTPException(409, "El período de devolución del pago todavía no terminó.")
         except ValueError as exc:
-            raise HTTPException(500, "payout has an invalid return window") from exc
+            raise HTTPException(500, "El pago tiene un período de devolución no válido.") from exc
     if not payout.get("lightning_address"):
         raise HTTPException(400, "payout has no Lightning Address")
     if payout["amount_sats"] > lightning_max_payout_sats():
@@ -4587,7 +4671,7 @@ def campaign_public_data(campaign_id: str) -> dict[str, Any]:
     with engine().connect() as c:
         campaign = asdict(c.execute(text("SELECT * FROM campaigns WHERE id=:id"), {"id": campaign_id}).fetchone())
         if not campaign:
-            raise HTTPException(404, "campaign not found")
+            raise HTTPException(404, "No se encontró la campaña.")
         merchant_profile = asdict(
             c.execute(
                 text("SELECT merchant_pubkey, merchant_pubkey_hex, logo_url FROM merchant_profiles WHERE merchant_pubkey_hex=:hex"),
@@ -5099,7 +5183,7 @@ def merchant_account_page(request: Request, view: str = "overview") -> Response:
         return RedirectResponse("/app?role=merchant", status_code=303)
     valid_views = {"overview", "campaigns", "affiliates", "activity", "payouts", "integration", "settings"}
     if view not in valid_views:
-        raise HTTPException(404, "merchant workspace view not found")
+        raise HTTPException(404, "No se encontró la vista solicitada del espacio del comerciante.")
     configured_shopify_merchant = os.getenv("SHOPIFY_MERCHANT_PUBKEY", DEFAULT_MERCHANT_NPUB)
     try:
         shopify_merchant_hex = normalize_pubkey(configured_shopify_merchant, "SHOPIFY_MERCHANT_PUBKEY")["hex"]
@@ -5139,24 +5223,24 @@ def merchant_account_page(request: Request, view: str = "overview") -> Response:
     elif configured:
         detail = "Configurado; esperando el primer webhook orders/paid válido."
     else:
-        detail = "La integración de Shopify todavía no está configurada para este merchant."
+        detail = "La integración de Shopify todavía no está configurada para este comerciante."
     with engine().connect() as c:
         data = merchant_workspace_data(c, session, base_url=BASE_URL, shopify_ready=shopify_ready, shopify_detail=detail)
     if not data["totals"]["campaigns"]:
         return RedirectResponse("/app/merchant/onboarding", status_code=303)
     view_meta = {
-        "overview": {"eyebrow": "Merchant account", "title": "Tu programa, bajo control.", "lede": "El estado de tu programa, las próximas acciones y sus resultados en un solo lugar."},
+        "overview": {"eyebrow": "Cuenta de comerciante", "title": "Tu programa, bajo control.", "lede": "El estado de tu programa, las próximas acciones y sus resultados en un solo lugar."},
         "campaigns": {"eyebrow": "Programa", "title": "Campañas", "lede": "Condiciones públicas, estado y rendimiento de tus programas de afiliados."},
-        "affiliates": {"eyebrow": "Comunidad", "title": "Affiliates", "lede": "Invitá personas y administrá las identidades enroladas en tus campañas."},
-        "activity": {"eyebrow": "Analytics", "title": "Actividad", "lede": "Clicks, conversiones y comisiones confirmadas desde tus enlaces."},
+        "affiliates": {"eyebrow": "Comunidad", "title": "Afiliados", "lede": "Invitá personas y administrá las identidades inscritas en tus campañas."},
+        "activity": {"eyebrow": "Analítica", "title": "Actividad", "lede": "Clics, conversiones y comisiones confirmadas desde tus enlaces."},
         "payouts": {"eyebrow": "Lightning", "title": "Pagos", "lede": "Obligaciones de pago sin custodia y evidencia verificable de liquidación."},
-        "integration": {"eyebrow": "Commerce", "title": "Integración Shopify", "lede": "Tracking, Pixel y webhook firmado para atribución autoritativa."},
-        "settings": {"eyebrow": "Configuración", "title": "Marca e invitación", "lede": "Actualizá la identidad pública del Merchant y el mensaje de cada campaña."},
+        "integration": {"eyebrow": "Comercio", "title": "Integración Shopify", "lede": "Seguimiento, píxel y webhook firmado para una atribución verificable."},
+        "settings": {"eyebrow": "Configuración", "title": "Marca e invitación", "lede": "Actualizá la identidad pública del comerciante y el mensaje de cada campaña."},
     }[view]
     nav_items = [
         ("Resumen", "overview"),
         ("Programa", "campaigns"),
-        ("Affiliates", "affiliates"),
+        ("Afiliados", "affiliates"),
         ("Actividad", "activity"),
         ("Pagos", "payouts"),
         ("Shopify", "integration"),
@@ -5174,7 +5258,7 @@ def merchant_account_page(request: Request, view: str = "overview") -> Response:
             "short_link_base_url": SHORT_LINK_BASE_URL,
             "program_defaults": _merchant_default_program(),
             "account": _account_shell(session, "merchant"),
-            "role_label": "Merchant account",
+            "role_label": "Cuenta de comerciante",
             "view": view,
             "view_meta": view_meta,
             "nav": [
@@ -5226,8 +5310,8 @@ def merchant_onboarding_page(request: Request) -> Response:
             "bootstrap_tenants": bootstrap_tenants,
             "program_defaults": _merchant_default_program(),
             "account": _account_shell(session, "merchant"),
-            "role_label": "Merchant onboarding",
-            "nav": [{"label": "Onboarding", "href": "/app/merchant/onboarding", "active": True}],
+            "role_label": "Configuración inicial del comerciante",
+            "nav": [{"label": "Configuración inicial", "href": "/app/merchant/onboarding", "active": True}],
         },
     )
 
@@ -5236,7 +5320,7 @@ def _require_same_origin(request: Request) -> None:
     expected = urlparse(BASE_URL)
     supplied = urlparse(request.headers.get("origin", ""))
     if supplied.scheme != expected.scheme or supplied.netloc != expected.netloc:
-        raise HTTPException(403, "same-origin request required")
+        raise HTTPException(403, "La solicitud debe provenir del mismo origen.")
 
 
 def _normalized_merchant_url(value: str, field_name: str, *, logo: bool = False) -> str:
@@ -5246,16 +5330,16 @@ def _normalized_merchant_url(value: str, field_name: str, *, logo: bool = False)
         hostname = parsed.hostname
         port = parsed.port
     except (UnicodeError, ValueError) as exc:
-        raise HTTPException(422, f"{field_name} must be a valid URL") from exc
+        raise HTTPException(422, f"{field_name} debe ser una URL válida.") from exc
     allowed_schemes = {"https"} if logo else {"http", "https"}
     if parsed.scheme.lower() not in allowed_schemes or not parsed.netloc or not hostname:
-        raise HTTPException(422, f"{field_name} must be a valid {'HTTPS' if logo else 'HTTP(S)'} URL")
+        raise HTTPException(422, f"{field_name} debe ser una URL {'HTTPS' if logo else 'HTTP(S)'} válida.")
     if parsed.username or parsed.password:
-        raise HTTPException(422, f"{field_name} must not contain credentials")
+        raise HTTPException(422, f"{field_name} no debe contener credenciales.")
     try:
         hostname = hostname.encode("idna").decode("ascii").lower().rstrip(".")
     except UnicodeError as exc:
-        raise HTTPException(422, f"{field_name} has an invalid host") from exc
+        raise HTTPException(422, f"{field_name} contiene un host no válido.") from exc
     if len(hostname) > 253 or any(
         not label or len(label) > 63 or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label)
         for label in hostname.split(".")
@@ -5263,22 +5347,22 @@ def _normalized_merchant_url(value: str, field_name: str, *, logo: bool = False)
         try:
             ipaddress.ip_address(hostname)
         except ValueError as exc:
-            raise HTTPException(422, f"{field_name} has an invalid host") from exc
+            raise HTTPException(422, f"{field_name} contiene un host no válido.") from exc
     if logo:
         if port not in {None, 443}:
-            raise HTTPException(422, "logo_url must use the standard HTTPS port")
+            raise HTTPException(422, "logo_url debe usar el puerto HTTPS estándar.")
         if hostname == "localhost" or hostname.endswith((".localhost", ".local")):
-            raise HTTPException(422, "logo_url must use a public host")
+            raise HTTPException(422, "logo_url debe usar un host público.")
         try:
             address = ipaddress.ip_address(hostname)
         except ValueError:
             if re.fullmatch(r"(?:0x[0-9a-f]+|[0-9.]+)", hostname):
-                raise HTTPException(422, "logo_url must use a public host")
+                raise HTTPException(422, "logo_url debe usar un host público.")
         else:
             if not address.is_global:
-                raise HTTPException(422, "logo_url must use a public host")
+                raise HTTPException(422, "logo_url debe usar un host público.")
         if unquote(parsed.path).lower().endswith(".svg"):
-            raise HTTPException(422, "logo_url SVG images are not supported")
+            raise HTTPException(422, "logo_url no admite imágenes SVG.")
     return urlunparse(parsed._replace(fragment=""))
 
 
@@ -5286,7 +5370,7 @@ def _merchant_requested_program(body: MerchantBootstrapIn) -> dict[str, Any]:
     defaults = _merchant_default_program()
     name = safe_text(body.program_name if body.program_name is not None else defaults["name"], 160)
     if not name:
-        raise HTTPException(422, "program_name is required")
+        raise HTTPException(422, "program_name es obligatorio.")
     commission_percent = (
         body.commission_percent
         if body.commission_percent is not None
@@ -5320,19 +5404,19 @@ def _merchant_default_program() -> dict[str, Any]:
         commission_bps = int(os.getenv("MERCHANT_DEFAULT_COMMISSION_BPS", "800"))
         window_days = int(os.getenv("MERCHANT_DEFAULT_WINDOW_DAYS", "30"))
     except ValueError as exc:
-        raise HTTPException(503, "merchant default program configuration is invalid") from exc
+        raise HTTPException(503, "La configuración predeterminada del programa del comerciante no es válida.") from exc
     if not 1 <= commission_bps <= 10_000 or not 1 <= window_days <= 365:
-        raise HTTPException(503, "merchant default program configuration is invalid")
+        raise HTTPException(503, "La configuración predeterminada del programa del comerciante no es válida.")
 
     name = safe_text(os.getenv("MERCHANT_DEFAULT_PROGRAM_NAME", "Meerat Affiliate Program"), 160)
     if not name:
-        raise HTTPException(503, "merchant default program configuration is invalid")
+        raise HTTPException(503, "La configuración predeterminada del programa del comerciante no es válida.")
 
     def configured_url(env_name: str, fallback: str) -> str:
         value = safe_text(os.getenv(env_name, fallback), 3000)
         parsed = urlparse(value)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise HTTPException(503, "merchant default program configuration is invalid")
+            raise HTTPException(503, "La configuración predeterminada del programa del comerciante no es válida.")
         return value
 
     return {
@@ -5389,7 +5473,7 @@ def merchant_update_profile(body: MerchantProfileIn, request: Request) -> dict[s
     timestamp = now()
     with engine().begin() as c:
         if not _merchant_profile_target(c, session, merchant["hex"]):
-            raise HTTPException(404, "merchant profile target not found")
+            raise HTTPException(404, "No se encontró el perfil del comerciante solicitado.")
         c.execute(
             text(
                 """
@@ -5435,7 +5519,7 @@ def _persist_merchant_campaign_invite(
         ).fetchone()
     )
     if not campaign or not _merchant_profile_target(c, session, campaign["merchant_pubkey_hex"]):
-        raise HTTPException(404, "campaign not found")
+        raise HTTPException(404, "No se encontró la campaña.")
     c.execute(
         text(
             """
@@ -5511,12 +5595,12 @@ def merchant_bootstrap(body: MerchantBootstrapIn, request: Request) -> dict[str,
                 {"account_id": session["account_id"], "merchant_hex": merchant["hex"]},
             ).fetchone()
             if not linked or merchant["hex"] == session["nostr_pubkey_hex"]:
-                raise HTTPException(404, "merchant bootstrap target not found")
+                raise HTTPException(404, "No se encontró el comerciante que se quería configurar.")
 
             existing = asdict(c.execute(text("SELECT * FROM campaigns WHERE id=:id"), {"id": campaign_id}).fetchone())
             if existing:
                 if existing.get("merchant_pubkey_hex") != merchant["hex"]:
-                    raise HTTPException(409, "default program identity conflict")
+                    raise HTTPException(409, "La identidad no coincide con la del programa predeterminado.")
                 requested_fields = {
                     "name": body.program_name,
                     "commission_bps": body.commission_percent,
@@ -5532,7 +5616,7 @@ def merchant_bootstrap(body: MerchantBootstrapIn, request: Request) -> dict[str,
                     or (requested_fields["terms_url"] is not None and existing.get("terms_url") != program["terms_url"])
                 )
                 if conflicts:
-                    raise HTTPException(409, "program already exists with different settings")
+                    raise HTTPException(409, "El programa ya existe con una configuración diferente.")
                 event = json.loads(existing["nostr_event_json"])
                 duplicate = True
                 status = existing["status"]
@@ -5578,7 +5662,7 @@ def merchant_bootstrap(body: MerchantBootstrapIn, request: Request) -> dict[str,
                 else:
                     existing = asdict(c.execute(text("SELECT * FROM campaigns WHERE id=:id"), {"id": campaign_id}).fetchone())
                     if not existing or existing.get("merchant_pubkey_hex") != merchant["hex"]:
-                        raise HTTPException(409, "default program identity conflict")
+                        raise HTTPException(409, "La identidad no coincide con la del programa predeterminado.")
                     event = json.loads(existing["nostr_event_json"])
                     duplicate = True
                     status = existing["status"]
@@ -5659,7 +5743,7 @@ def merchant_complete_onboarding(body: MerchantOnboardingIn, request: Request) -
                 {"account_id": session["account_id"], "merchant_hex": merchant["hex"]},
             ).fetchone()
             if not linked or merchant["hex"] == session["nostr_pubkey_hex"]:
-                raise HTTPException(404, "merchant bootstrap target not found")
+                raise HTTPException(404, "No se encontró el comerciante que se quería configurar.")
 
             existing = asdict(c.execute(text("SELECT * FROM campaigns WHERE id=:id"), {"id": campaign_id}).fetchone())
             if existing:
@@ -5671,9 +5755,9 @@ def merchant_complete_onboarding(body: MerchantOnboardingIn, request: Request) -
                     or (body.terms_url is not None and existing.get("terms_url") != program["terms_url"])
                 )
                 if existing.get("merchant_pubkey_hex") != merchant["hex"]:
-                    raise HTTPException(409, "default program identity conflict")
+                    raise HTTPException(409, "La identidad no coincide con la del programa predeterminado.")
                 if conflicts:
-                    raise HTTPException(409, "program already exists with different settings")
+                    raise HTTPException(409, "El programa ya existe con una configuración diferente.")
                 event = json.loads(existing["nostr_event_json"])
                 duplicate = True
                 status = existing["status"]
@@ -5764,10 +5848,10 @@ def _normalize_lightning_address(value: str) -> str:
             not re.fullmatch(r"[A-Za-z0-9_+.-]+", name)
             or name.startswith(".") or name.endswith(".") or ".." in name
         ):
-            raise ValueError("invalid Lightning Address local-part")
+            raise ValueError("La dirección Lightning no es válida. local-part")
         return f"{name}@{domain.encode('idna').decode('ascii').lower()}"
     except (LightningPaymentError, UnicodeError, ValueError) as exc:
-        raise HTTPException(422, "invalid Lightning Address") from exc
+        raise HTTPException(422, "La dirección Lightning no es válida.") from exc
 
 
 @app.put("/app/affiliate/lightning-address", tags=["Accounts"])
@@ -5779,7 +5863,7 @@ def affiliate_update_lightning_address(request: Request, body: AffiliateLightnin
         validate_lightning_address(address)
     except LightningPaymentError as exc:
         logger.info("Lightning Address verification rejected %s: %s", address, exc)
-        raise HTTPException(422, "La Lightning Address no existe o no ofrece LNURL-pay.") from exc
+        raise HTTPException(422, "La dirección Lightning no existe o no ofrece LNURL-pay.") from exc
     init_db()
     timestamp = now()
     params = {
@@ -5849,27 +5933,27 @@ def _owned_merchant_payout(c: Any, session: dict[str, Any], payout_id: str, *, l
 
 def _require_unsettled_manual_payout(c: Any, payout: dict[str, Any]) -> None:
     if payout.get("state") != "PAYABLE" or payout.get("status") != "pending":
-        raise HTTPException(409, f"payout state {payout.get('state')} is not manually payable")
+        raise HTTPException(409, f"El pago con estado {payout.get('state')} no se puede liquidar manualmente.")
     if payout.get("conversion_status") == "reversed" or c.execute(
         text("SELECT 1 FROM reversals WHERE conversion_id=:id LIMIT 1"),
         {"id": payout["conversion_id"]},
     ).fetchone():
-        raise HTTPException(409, "reversed conversion payout is not payable")
+        raise HTTPException(409, "No se puede pagar una conversión revertida.")
     if payout.get("return_window_ends_at"):
         try:
             return_window = datetime.fromisoformat(str(payout["return_window_ends_at"]).replace("Z", "+00:00"))
         except ValueError as exc:
-            raise HTTPException(500, "payout has an invalid return window") from exc
+            raise HTTPException(500, "El pago tiene un período de devolución no válido.") from exc
         if return_window > datetime.now(timezone.utc):
-            raise HTTPException(409, "payout return window has not ended")
+            raise HTTPException(409, "El período de devolución del pago todavía no terminó.")
     if not payout.get("lightning_address"):
-        raise HTTPException(409, "affiliate has not configured a Lightning Address")
+        raise HTTPException(409, "El afiliado todavía no configuró una dirección Lightning.")
     if payout.get("payment_provider") or payout.get("bolt11_invoice"):
-        raise HTTPException(409, "payout already belongs to a payment provider")
+        raise HTTPException(409, "El pago ya está asignado a un proveedor de pagos.")
     if int(payout.get("reserved_sats") or 0) < int(payout["amount_sats"]) + int(payout.get("fee_sats") or 0):
-        raise HTTPException(409, "payout has no complete campaign budget reservation")
+        raise HTTPException(409, "El pago no tiene una reserva completa en el presupuesto de la campaña.")
     if c.execute(text("SELECT 1 FROM payment_attempts WHERE payout_id=:id LIMIT 1"), {"id": payout["id"]}).fetchone():
-        raise HTTPException(409, "payout already has payment evidence or an attempt")
+        raise HTTPException(409, "El pago ya tiene evidencia o un intento de pago registrado.")
 
 
 def _bolt11_qr_data_uri(invoice: str) -> str:
@@ -5891,7 +5975,7 @@ async def merchant_prepare_payout_invoice(payout_id: str, request: Request, resp
     with engine().connect() as c:
         payout = _owned_merchant_payout(c, session, payout_id)
         if not payout:
-            raise HTTPException(404, "payout not found")
+            raise HTTPException(404, "No se encontró el pago.")
         _require_unsettled_manual_payout(c, payout)
         lightning_address = str(payout["lightning_address"])
         amount_sats = int(payout["amount_sats"])
@@ -5902,7 +5986,7 @@ async def merchant_prepare_payout_invoice(payout_id: str, request: Request, resp
             if started - timestamp > 60:
                 _INVOICE_PREPARE_LAST.pop(key, None)
         if rate_key in _INVOICE_PREPARE_ACTIVE or started - _INVOICE_PREPARE_LAST.get(rate_key, 0) < 5:
-            raise HTTPException(429, "invoice preparation is already running or was requested too recently")
+            raise HTTPException(429, "La preparación de la factura Lightning ya está en curso o se solicitó hace muy poco.")
         _INVOICE_PREPARE_ACTIVE.add(rate_key)
         _INVOICE_PREPARE_LAST[rate_key] = started
     try:
@@ -5913,15 +5997,15 @@ async def merchant_prepare_payout_invoice(payout_id: str, request: Request, resp
         with engine().connect() as c:
             latest = _owned_merchant_payout(c, session, payout_id)
             if not latest:
-                raise HTTPException(409, "payout changed while preparing the invoice")
+                raise HTTPException(409, "El pago cambió mientras se preparaba la factura Lightning.")
             _require_unsettled_manual_payout(c, latest)
             if str(latest["lightning_address"]) != lightning_address or int(latest["amount_sats"]) != amount_sats:
-                raise HTTPException(409, "payout destination or amount changed while preparing the invoice")
+                raise HTTPException(409, "El destino o el monto del pago cambió mientras se preparaba la factura Lightning.")
         expires_at = bolt11_expires_at(invoice)
         try:
             qr_data_uri = await asyncio.to_thread(_bolt11_qr_data_uri, invoice)
         except (DataOverflowError, ValueError) as exc:
-            raise HTTPException(502, "BOLT11 invoice is too large to render safely") from exc
+            raise HTTPException(502, "La factura BOLT11 es demasiado grande para mostrarla de forma segura.") from exc
         response.headers["Cache-Control"] = "no-store"
         response.headers["Pragma"] = "no-cache"
         response.headers["Referrer-Policy"] = "no-referrer"
@@ -5949,10 +6033,10 @@ def merchant_manual_settlement(payout_id: str, request: Request, body: MerchantM
     with engine().begin() as c:
         payout = _owned_merchant_payout(c, session, payout_id, lock=True)
         if not payout:
-            raise HTTPException(404, "payout not found")
+            raise HTTPException(404, "No se encontró el pago.")
         if payout["status"] == "paid" or payout.get("state") in {"SETTLED", "PUBLISHED"}:
             if payout.get("payment_provider") != "manual" or payout.get("payment_hash") != payment_hash:
-                raise HTTPException(409, "payout was settled with different evidence")
+                raise HTTPException(409, "El pago se liquidó con evidencia diferente.")
         else:
             _require_unsettled_manual_payout(c, payout)
             if c.engine.dialect.name == "postgresql":
@@ -5972,7 +6056,7 @@ def merchant_manual_settlement(payout_id: str, request: Request, body: MerchantM
                 {"payment_hash": payment_hash, "id": payout_id},
             ).fetchone()
             if hash_used:
-                raise HTTPException(409, "payment hash is already assigned to another payout")
+                raise HTTPException(409, "El hash de pago ya está asignado a otro pago.")
             timestamp = now()
             c.execute(text("""
                 INSERT INTO payment_attempts
@@ -5995,7 +6079,7 @@ def merchant_manual_settlement(payout_id: str, request: Request, body: MerchantM
                 WHERE id=:id AND status='pending' AND state='PAYABLE' AND payment_provider IS NULL
             """), {"id": payout_id, "payment_hash": payment_hash, "settled_at": timestamp})
             if updated.rowcount != 1:
-                raise HTTPException(409, "payout was concurrently modified")
+                raise HTTPException(409, "El pago fue modificado simultáneamente por otra operación.")
     return finalize_payout_paid(payout_id, payment_hash, "Merchant-attested manual Lightning settlement", sandbox=False, provider="manual")
 
 
@@ -6037,9 +6121,9 @@ def merchant_create_invitation(request: Request, body: MerchantInvitationIn) -> 
     with engine().begin() as c:
         campaign = _owned_merchant_campaign(c, session, body.campaign_id)
         if not campaign:
-            raise HTTPException(404, "campaign not found")
+            raise HTTPException(404, "No se encontró la campaña.")
         if campaign.get("status") != "active":
-            raise HTTPException(409, "campaign is not active")
+            raise HTTPException(409, "La campaña no está activa.")
         c.execute(
             text(
                 """
@@ -6105,13 +6189,13 @@ def resolve_affiliate_invitation(request: Request, response: Response, body: Aff
     response.headers["Cache-Control"] = "no-store"
     response.headers["Referrer-Policy"] = "no-referrer"
     if not invitation:
-        raise HTTPException(404, "invitation not found")
+        raise HTTPException(404, "No se encontró la invitación.")
     if parse_iso(invitation["expires_at"]) <= datetime.now(timezone.utc):
-        raise HTTPException(410, "invitation expired")
+        raise HTTPException(410, "La invitación expiró.")
     if invitation["status"] != "pending":
-        raise HTTPException(409, "invitation was already used or revoked")
+        raise HTTPException(409, "La invitación ya fue utilizada o revocada.")
     if invitation["campaign_status"] != "active":
-        raise HTTPException(409, "campaign is not active")
+        raise HTTPException(409, "La campaña no está activa.")
     profile_name = safe_text(invitation.get("display_name"), 120)
     fallback_name = re.sub(
         r"\s+(?:affiliate\s+program|affiliate\s+programme|programa\s+de\s+afiliados|programa\s+affiliate)$",
@@ -6124,7 +6208,7 @@ def resolve_affiliate_invitation(request: Request, response: Response, body: Aff
     words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]+", display_name)
     initials = "".join(word[0] for word in words[:2]).upper() or "₿"
     commission_percent = f"{int(invitation['commission_bps']) / 100:g}"
-    invite_eyebrow = safe_text(invitation.get("invite_eyebrow"), 100) or "Programa de afiliados · Value for value"
+    invite_eyebrow = safe_text(invitation.get("invite_eyebrow"), 100) or "Programa de afiliados · Valor por valor"
     invite_headline = safe_text(invitation.get("invite_headline"), 120) or f"Recomendá {display_name}. Ganá sats."
     invite_description = safe_text(invitation.get("invite_description"), 360) or (
         f"Sumate al programa de afiliados de {display_name}. Compartí tu link con tu comunidad "
@@ -6156,7 +6240,7 @@ def _create_affiliate_session(c: Any, identity: dict[str, str]) -> tuple[str, st
     existing = asdict(c.execute(text("SELECT * FROM accounts WHERE nostr_pubkey_hex=:hex"), {"hex": identity["hex"]}).fetchone())
     account_id = existing["id"] if existing else hid("acct")
     if existing and existing.get("status") != "active":
-        raise HTTPException(403, "affiliate account is not active")
+        raise HTTPException(403, "La cuenta del afiliado no está activa.")
     timestamp = now()
     if existing:
         c.execute(
@@ -6246,15 +6330,15 @@ def accept_affiliate_invitation(request: Request, response: Response, body: Affi
                 c.execute(text("SELECT * FROM affiliate_invitations WHERE token_hash=:token_hash LIMIT 1"), {"token_hash": token_hash}).fetchone()
             )
             if not invitation:
-                raise HTTPException(404, "invitation not found")
+                raise HTTPException(404, "No se encontró la invitación.")
             if invitation["status"] == "accepted":
                 if invitation.get("accepted_by_hex") != identity["hex"]:
-                    raise HTTPException(409, "invitation was already used by another identity")
+                    raise HTTPException(409, "Otra identidad ya utilizó esta invitación.")
                 enrollment = asdict(
                     c.execute(text("SELECT * FROM enrollments WHERE id=:id LIMIT 1"), {"id": invitation.get("enrollment_id")}).fetchone()
                 )
                 if not enrollment or enrollment.get("status") != "approved":
-                    raise HTTPException(409, "accepted invitation has no active enrollment")
+                    raise HTTPException(409, "La invitación aceptada no tiene una inscripción activa.")
                 if verified_destination and (
                     enrollment.get("lightning_address") != verified_destination
                     or not enrollment.get("destination_verified_at")
@@ -6292,9 +6376,9 @@ def accept_affiliate_invitation(request: Request, response: Response, body: Affi
                     "redirect": "/app/affiliate?view=links",
                 }
             if invitation["status"] != "pending":
-                raise HTTPException(409, "invitation was revoked")
+                raise HTTPException(409, "La invitación fue revocada.")
             if parse_iso(invitation["expires_at"]) <= datetime.now(timezone.utc):
-                raise HTTPException(410, "invitation expired")
+                raise HTTPException(410, "La invitación expiró.")
             if database_url().startswith("postgresql"):
                 c.execute(
                     text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
@@ -6302,7 +6386,7 @@ def accept_affiliate_invitation(request: Request, response: Response, body: Affi
                 )
             campaign = asdict(c.execute(text("SELECT * FROM campaigns WHERE id=:id"), {"id": invitation["campaign_id"]}).fetchone())
             if not campaign or campaign.get("status") != "active":
-                raise HTTPException(409, "campaign is not active")
+                raise HTTPException(409, "La campaña no está activa.")
             if database_url().startswith("postgresql"):
                 c.execute(
                     text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
@@ -6328,7 +6412,7 @@ def accept_affiliate_invitation(request: Request, response: Response, body: Affi
             )
             if existing:
                 if existing["status"] != "approved":
-                    raise HTTPException(409, f"affiliate enrollment is {existing['status']}")
+                    raise HTTPException(409, f"La inscripción del afiliado tiene el estado {existing['status']}.")
                 if verified_destination and (
                     existing.get("lightning_address") != verified_destination
                     or not existing.get("destination_verified_at")
@@ -6384,7 +6468,7 @@ def accept_affiliate_invitation(request: Request, response: Response, body: Affi
                 },
             )
             if updated.rowcount != 1:
-                raise HTTPException(409, "invitation was already used or revoked")
+                raise HTTPException(409, "La invitación ya fue utilizada o revocada.")
             session_token, session_expires_at = _create_affiliate_session(c, identity)
 
     if event is not None:
@@ -6440,21 +6524,21 @@ def affiliate_account_page(request: Request, view: str = "overview") -> Response
         return RedirectResponse("/app?role=affiliate", status_code=303)
     views = {"overview", "links", "earnings", "activity", "settings"}
     if view not in views:
-        raise HTTPException(404, "affiliate workspace view not found")
+        raise HTTPException(404, "No se encontró la vista solicitada del espacio del afiliado.")
     with engine().connect() as c:
         data = affiliate_workspace_data(c, session, base_url=BASE_URL, ref_base_url=SHORT_LINK_BASE_URL)
     if not data["affiliate_profile"].get("verified_at"):
         return RedirectResponse("/app/affiliate/onboarding", status_code=303)
     view_meta = {
-        "overview": {"eyebrow": "Affiliate account", "title": "Tus resultados, sin mezclar tareas.", "lede": "Una lectura rápida de tus links, conversiones y sats; cada operación vive en su propia vista."},
-        "links": {"eyebrow": "Distribución", "title": "Mis links", "lede": "Programas aceptados y enlaces canónicos listos para compartir."},
-        "earnings": {"eyebrow": "Lightning", "title": "Ganancias", "lede": "Comisiones atribuidas, estado de liquidación y receipts verificables."},
-        "activity": {"eyebrow": "Resultados", "title": "Conversiones", "lede": "Ventas confirmadas desde tus referral links y sus pruebas públicas."},
-        "settings": {"eyebrow": "Cobros", "title": "Destino Lightning", "lede": "La dirección LNURL-pay verificada que usarán los Merchants para pagarte."},
+        "overview": {"eyebrow": "Cuenta de afiliado", "title": "Tus resultados, sin mezclar tareas.", "lede": "Una lectura rápida de tus enlaces, conversiones y sats; cada operación vive en su propia vista."},
+        "links": {"eyebrow": "Distribución", "title": "Mis enlaces", "lede": "Programas aceptados y enlaces canónicos listos para compartir."},
+        "earnings": {"eyebrow": "Lightning", "title": "Ganancias", "lede": "Comisiones atribuidas, estado de liquidación y recibos verificables."},
+        "activity": {"eyebrow": "Resultados", "title": "Conversiones", "lede": "Ventas confirmadas desde tus enlaces de referencia y sus pruebas públicas."},
+        "settings": {"eyebrow": "Cobros", "title": "Destino Lightning", "lede": "La dirección LNURL-pay verificada que usarán los comerciantes para pagarte."},
     }[view]
     nav_items = [
         ("Resumen", "overview"),
-        ("Mis links", "links"),
+        ("Mis enlaces", "links"),
         ("Ganancias", "earnings"),
         ("Conversiones", "activity"),
         ("Cobros", "settings"),
@@ -6465,7 +6549,7 @@ def affiliate_account_page(request: Request, view: str = "overview") -> Response
         context={
             **data,
             "account": _account_shell(session, "affiliate"),
-            "role_label": "Affiliate account",
+            "role_label": "Cuenta de afiliado",
             "view": view,
             "view_meta": view_meta,
             "workspace_status": {"label": "Destino verificado", "class": "is-healthy"},
@@ -6500,14 +6584,14 @@ def affiliate_onboarding_page(request: Request) -> Response:
         name="affiliate_onboarding.html",
         context={
             "account": _account_shell(session, "affiliate"),
-            "role_label": "Affiliate onboarding",
+            "role_label": "Configuración inicial del afiliado",
             "workspace_status": {"label": "Falta destino de cobro", "class": "is-degraded"},
             "nav": [{"label": "Configurar cobro", "href": "/app/affiliate/onboarding", "active": True}],
         },
     )
 
 
-@app.get("/ops/data", tags=["Operations"])
+@app.get("/ops/data", tags=["Operaciones"])
 def ops_dashboard_data(request: Request, response: Response) -> dict[str, Any]:
     require_account_session(request, "ops")
     response.headers["Cache-Control"] = "no-store"
@@ -6533,7 +6617,7 @@ def operations_dashboard(request: Request) -> Response:
         context={
             "data": data,
             "account": _account_shell(session, "ops"),
-            "role_label": "Operations",
+            "role_label": "Operaciones",
             "workspace_status": {
                 "label": "Operativo" if healthy else "Revisar estado",
                 "class": "is-healthy" if healthy else "is-degraded",
