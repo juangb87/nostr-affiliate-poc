@@ -148,7 +148,7 @@ def test_login_frontend_preserves_role_card_markup_and_formats_structured_signer
     login_page = client.get("/app?role=merchant")
 
     assert script.status_code == 200
-    assert '/static/app.js?v=20260730-nip46-1' in login_page.text
+    assert '/static/app.js?v=20260730-nip46-2' in login_page.text
     assert "function readableError(error" in script.text
     assert 'value === "[object Object]"' in script.text
     assert "new Error(readableError(data.detail" in script.text
@@ -239,7 +239,7 @@ def test_salvia_concept_brand_contract_is_served(tmp_path, monkeypatch):
     favicon = client.get("/static/brand/favicon.svg")
 
     assert login_page.status_code == 200
-    assert '/static/app.css?v=20260730-nip46-1' in login_page.text
+    assert '/static/app.css?v=20260730-nip46-2' in login_page.text
     assert '/static/brand/wordmark-night.png' in login_page.text
     assert stylesheet.status_code == 200
     assert "--sage: #9cc97e" in stylesheet.text.lower()
@@ -263,7 +263,7 @@ def test_login_frontend_rejects_empty_or_invalid_signer_responses_before_verify(
     assert "NostrKey no devolvió un evento firmado" in script.text
     assert "signWithNostr(unsignedEvent" in script.text
     assert 'JSON.stringify({event})' in script.text
-    assert '/static/app.js?v=20260730-nip46-1' in login_page.text
+    assert '/static/app.js?v=20260730-nip46-2' in login_page.text
 
 
 def test_nip46_mobile_signer_assets_are_self_hosted_and_secret_safe(tmp_path, monkeypatch):
@@ -283,16 +283,19 @@ def test_nip46_mobile_signer_assets_are_self_hosted_and_secret_safe(tmp_path, mo
     assert 'id="nostr-connect-config"' in login_page.text
     assert '"wss://relay.primal.net"' in login_page.text
     assert '"wss://nos.lol"' in login_page.text
-    assert '/static/nostr-connect.js?v=20260730-nip46-1' in login_page.text
+    assert '/static/nostr-connect.js?v=20260730-nip46-2' in login_page.text
     assert '/static/vendor/qrcode-generator-1.4.4.js' in login_page.text
     assert invite_page.status_code == 200
     assert 'id="nostr-connect-config"' in invite_page.text
-    assert '/static/nostr-connect.js?v=20260730-nip46-1' in invite_page.text
+    assert '/static/nostr-connect.js?v=20260730-nip46-2' in invite_page.text
     assert connect_script.status_code == nip46_bundle.status_code == pure_bundle.status_code == qr_script.status_code == 200
     assert "createNostrConnectURI" in connect_script.text
     assert "BunkerSigner.fromURI" in connect_script.text
     assert "generateSecretKey" in connect_script.text
     assert "sign_event:22242" in connect_script.text
+    assert "identityMismatch" in connect_script.text
+    assert "signingFailed" in connect_script.text
+    assert "shareIdentityFailed" in connect_script.text
     assert "raceWithAbort" in connect_script.text
     assert "await raceWithAbort(signer.getPublicKey()" in connect_script.text
     assert "await raceWithAbort(signer.signEvent(unsignedEvent)" in connect_script.text
@@ -2468,6 +2471,7 @@ def test_app_language_selector_persists_english_and_keeps_spanish_default(tmp_pa
     assert "Continue with Nostr" in english.text
     assert "Use another Nostr app or QR" in english.text
     assert "On mobile, open a Nostr app" in english.text
+    assert "The operation could not be completed. Try again." in english.text
     assert ">Cuenta de comerciante<" not in english.text
     assert english.headers["content-language"] == "en"
     assert "meerat_lang=en" in english.headers["set-cookie"]

@@ -14,6 +14,10 @@ const COPY = {
     auth: "Tu signer necesita una autorización adicional.",
     authOpen: "Abrir autorización",
     unavailable: "No se pudo iniciar la conexión Nostr.",
+    connectFailed: "No se pudo conectar con la app Nostr. Volvé a abrir Primal y aprobá la conexión.",
+    shareIdentityFailed: "La app Nostr se conectó, pero no pudo compartir la identidad seleccionada.",
+    signingFailed: "La app Nostr no pudo firmar con la cuenta elegida. Verificá que Primal tenga la clave de esa identidad y no sea una cuenta de solo lectura.",
+    identityMismatch: "La app Nostr conectó una identidad, pero firmó con otra. Seleccioná la misma cuenta en Primal e intentá nuevamente.",
     cancelled: "Cancelaste la conexión Nostr.",
     timeout: "La conexión expiró. Intentá nuevamente.",
     qrAlt: "QR temporal para conectar una app Nostr",
@@ -30,6 +34,10 @@ const COPY = {
     auth: "Your signer needs additional authorization.",
     authOpen: "Open authorization",
     unavailable: "Could not start the Nostr connection.",
+    connectFailed: "Could not connect to the Nostr app. Reopen Primal and approve the connection.",
+    shareIdentityFailed: "The Nostr app connected but could not share the selected identity.",
+    signingFailed: "The Nostr app could not sign with the selected account. Check that Primal holds the key for this identity and that it is not a read-only account.",
+    identityMismatch: "The Nostr app connected one identity but signed with another. Select the same account in Primal and try again.",
     cancelled: "You cancelled the Nostr connection.",
     timeout: "The connection expired. Try again.",
     qrAlt: "Temporary QR code to connect a Nostr app",
@@ -214,26 +222,44 @@ async function signEvent(unsignedEvent) {
     timer = setTimeout(() => {
       if (activeAttempt === attempt) cancelAttempt("timeout");
     }, timeoutMs);
-    const signer = await raceWithAbort(
-      BunkerSigner.fromURI(
-        clientSecretKey,
-        uri,
-        {
-          skipSwitchRelays: true,
-          onauth: (url) => {
-            if (activeAttempt === attempt) showSignerAuthorization(url);
+    let signer;
+    try {
+      signer = await raceWithAbort(
+        BunkerSigner.fromURI(
+          clientSecretKey,
+          uri,
+          {
+            skipSwitchRelays: true,
+            onauth: (url) => {
+              if (activeAttempt === attempt) showSignerAuthorization(url);
+            },
           },
-        },
+          controller.signal,
+        ),
         controller.signal,
-      ),
-      controller.signal,
-    );
+      );
+    } catch (error) {
+      if (controller.signal.aborted) throw error;
+      throw new Error(copy.connectFailed);
+    }
     if (activeAttempt !== attempt) throw new Error(copy.cancelled);
     attempt.signer = signer;
     ensureDialog().querySelector("[data-nostr-connect-status]").textContent = copy.connected;
-    const expectedPubkey = await raceWithAbort(signer.getPublicKey(), controller.signal);
-    const signed = await raceWithAbort(signer.signEvent(unsignedEvent), controller.signal);
-    if (!signed || signed.pubkey !== expectedPubkey) throw new Error(copy.unavailable);
+    let expectedPubkey;
+    try {
+      expectedPubkey = await raceWithAbort(signer.getPublicKey(), controller.signal);
+    } catch (error) {
+      if (controller.signal.aborted) throw error;
+      throw new Error(copy.shareIdentityFailed);
+    }
+    let signed;
+    try {
+      signed = await raceWithAbort(signer.signEvent(unsignedEvent), controller.signal);
+    } catch (error) {
+      if (controller.signal.aborted) throw error;
+      throw new Error(copy.signingFailed);
+    }
+    if (!signed || signed.pubkey !== expectedPubkey) throw new Error(copy.identityMismatch);
     return signed;
   } catch (error) {
     if (attempt.cancelReason === "timeout") throw new Error(copy.timeout);

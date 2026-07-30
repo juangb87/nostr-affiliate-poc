@@ -39,6 +39,7 @@ ES_TO_EN: dict[str, str] = {
     "Conectá tu app Nostr y confirmá la firma…": "Connect your Nostr app and confirm the signature…",
     "Validando identidad…": "Validating identity…",
     "No encontramos una extensión Nostr. Usá una app Nostr o el QR para continuar.": "We could not find a Nostr extension. Use a Nostr app or the QR code to continue.",
+    "No se pudo completar la operación. Intentá nuevamente.": "The operation could not be completed. Try again.",
     "Meerat nunca solicita tu nsec.": "Meerat never asks for your nsec.",
     "La firma no mueve fondos ni autoriza pagos.": "The signature does not move funds or authorize payments.",
     "Saltar al contenido": "Skip to content",
