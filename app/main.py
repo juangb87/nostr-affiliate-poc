@@ -93,6 +93,7 @@ SHORT_LINK_RESERVED_PATHS = {
 }
 DEFAULT_DESTINATION = os.getenv("DEFAULT_DESTINATION_URL", "https://example.com/checkout")
 DEFAULT_RELAYS = "wss://nos.lol,wss://relay.damus.io,wss://relay.primal.net"
+DEFAULT_NIP46_RELAYS = "wss://relay.primal.net,wss://nos.lol"
 DEFAULT_MERCHANT_NPUB = "npub1540rxhz9x7fpc73nu5q3qydykej7lceh5j4jej6mmpc6n3saw3cqv7s8js"
 DEFAULT_AFFILIATE_NPUB = "npub16ghkhw9d4g9x6pxp6l6dtyjqaeuavwucrq8gpkt60x0kx9fzqwpszhtw0n"
 _MERCHANT_ENROLLMENT_LOCK = threading.Lock()
@@ -131,11 +132,42 @@ def app_status_label(value: Any) -> str:
     return _APP_STATUS_LABELS.get(normalized.lower(), normalized or "Pendiente")
 
 
+def nip46_relays() -> list[str]:
+    """Return a small, secure relay allowlist for temporary NIP-46 login."""
+    relays: list[str] = []
+    for raw in os.getenv("NIP46_RELAYS", DEFAULT_NIP46_RELAYS).split(","):
+        candidate = raw.strip().rstrip("/")
+        if not candidate or candidate in relays or any(char.isspace() for char in candidate):
+            continue
+        try:
+            parsed = urlparse(candidate)
+            hostname = parsed.hostname
+            _ = parsed.port
+        except ValueError:
+            continue
+        if (
+            parsed.scheme != "wss"
+            or not hostname
+            or parsed.username
+            or parsed.password
+            or parsed.fragment
+        ):
+            continue
+        relays.append(candidate)
+        if len(relays) == 3:
+            break
+    return relays or DEFAULT_NIP46_RELAYS.split(",")
+
+
 def _i18n_context(request: Request) -> dict[str, Any]:
     language = getattr(request.state, "language", "es")
     return {
         "language": language,
         "i18n_catalog": javascript_catalog(language),
+        "nostr_connect_config": {
+            "relays": nip46_relays(),
+            "timeout_ms": 180_000,
+        },
     }
 
 

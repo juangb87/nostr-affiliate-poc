@@ -6,19 +6,32 @@
   <title>Entrar · Meerat</title>
   <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/app.css?v=20260730-app-i18n1"><script id="app-i18n" type="application/json">{{ i18n_catalog | tojson }}</script><script src="/static/app.js?v=20260730-app-i18n1" defer></script>
+  <link rel="stylesheet" href="/static/app.css?v=20260730-nip46-1">
+  <link rel="stylesheet" href="/static/nostr-connect.css?v=20260730-nip46-1">
+  <script id="app-i18n" type="application/json">{{ i18n_catalog | tojson }}</script>
+  <script id="nostr-connect-config" type="application/json">{{ nostr_connect_config | tojson }}</script>
+  <script src="/static/vendor/qrcode-generator-1.4.4.js" defer></script>
+  <script type="module" src="/static/nostr-connect.js?v=20260730-nip46-1"></script>
+  <script src="/static/app.js?v=20260730-nip46-1" defer></script>
 </head>
 <body><main class="login-shell"><section class="login-card" aria-labelledby="login-title">
   <div class="login-toolbar"><a class="brand" href="/" aria-label="Meerat"><img src="/static/brand/wordmark-night.png?v=salvia-8a1" width="1428" height="648" alt="Meerat"></a>{% include "_language_selector.html" %}</div>
   <p class="eyebrow" style="margin-top:42px">Tu red de afiliados, verificable</p>
   <h1 id="login-title">Entrá con tu identidad Nostr.</h1>
-  <p class="lede">Sin contraseñas ni claves privadas compartidas. Tu extensión firma un desafío de un solo uso y Meerat crea una sesión segura.</p>
+  <p class="lede">Sin contraseñas ni claves privadas compartidas. Firmá un desafío de un solo uso desde una extensión o una app Nostr en tu teléfono.</p>
   <div class="notice"><div><strong>Acceso por invitación durante el POC.</strong><p>Tu identidad Nostr debe estar asociada previamente a un comerciante o a una inscripción de afiliado.</p></div></div>
-  <div class="role-grid">
-    {% if requested_role in [None, '', 'merchant'] %}<button class="role-card" type="button" data-login-role="merchant"><strong>Cuenta de comerciante</strong><span>Gestioná campañas, conversiones, afiliados y obligaciones de pago.</span></button>{% endif %}
-    {% if requested_role in [None, '', 'affiliate'] %}<button class="role-card" type="button" data-login-role="affiliate"><strong>Cuenta de afiliado</strong><span>Copiá tus enlaces, seguí conversiones y verificá tus ganancias.</span></button>{% endif %}
-    {% if requested_role == 'ops' %}<button class="role-card" type="button" data-login-role="ops"><strong>Operaciones</strong><span>Acceso restringido a diagnóstico, pruebas y operaciones técnicas.</span></button>{% endif %}
+  <p class="login-step">1 · Elegí tu espacio</p>
+  <div class="role-grid" data-role-picker>
+    {% if requested_role in [None, '', 'merchant'] %}<button class="role-card{% if requested_role == 'merchant' %} selected{% endif %}" type="button" data-login-role="merchant" aria-pressed="{{ 'true' if requested_role == 'merchant' else 'false' }}"><strong>Cuenta de comerciante</strong><span>Gestioná campañas, conversiones, afiliados y obligaciones de pago.</span></button>{% endif %}
+    {% if requested_role in [None, '', 'affiliate'] %}<button class="role-card{% if requested_role == 'affiliate' %} selected{% endif %}" type="button" data-login-role="affiliate" aria-pressed="{{ 'true' if requested_role == 'affiliate' else 'false' }}"><strong>Cuenta de afiliado</strong><span>Copiá tus enlaces, seguí conversiones y verificá tus ganancias.</span></button>{% endif %}
+    {% if requested_role == 'ops' %}<button class="role-card selected" type="button" data-login-role="ops" aria-pressed="true"><strong>Operaciones</strong><span>Acceso restringido a diagnóstico, pruebas y operaciones técnicas.</span></button>{% endif %}
   </div>
-  <p class="login-status" data-login-status aria-live="polite">Usá una extensión compatible con NIP-07, como Alby.</p>
-  <div class="notice"><div><strong>Meerat nunca solicita tu nsec.</strong><p>La firma no mueve fondos ni autoriza pagos.</p></div></div>
+  <div class="login-methods" data-login-methods>
+    <p class="login-step">2 · Firmá de forma segura</p>
+    <button class="button login-primary" type="button" data-login-method="auto">Continuar con Nostr</button>
+    <button class="button secondary" type="button" data-login-method="nip46">Usar otra app Nostr o QR</button>
+    <button class="login-extension-link" type="button" data-login-method="nip07">Usar extensión del navegador</button>
+  </div>
+  <p class="login-status" data-login-status aria-live="polite">En mobile podés abrir una app Nostr; en desktop también podés escanear un QR.</p>
+  <div class="notice"><div><strong>Meerat nunca solicita tu nsec.</strong><p>La firma no mueve fondos ni autoriza pagos. La conexión mobile es temporal y se elimina al terminar.</p></div></div>
 </section></main></body></html>

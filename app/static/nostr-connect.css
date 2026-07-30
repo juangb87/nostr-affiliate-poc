@@ -1,0 +1,33 @@
+.nostr-connect-dialog {
+  width: min(520px, calc(100% - 28px));
+  max-height: calc(100vh - 28px);
+  padding: 0;
+  border: 1px solid #344334;
+  border-radius: 0;
+  background: #1a211a;
+  color: #eef2ec;
+  box-shadow: 0 26px 80px rgba(0, 0, 0, .55);
+}
+.nostr-connect-dialog::backdrop { background: rgba(7, 10, 7, .82); backdrop-filter: blur(5px); }
+.nostr-connect-card { position: relative; overflow-y: auto; padding: clamp(24px, 6vw, 42px); text-align: center; }
+.nostr-connect-card .eyebrow { margin: 0 0 12px; color: #9cc97e; font: 500 11px/1.3 "DM Mono", monospace; letter-spacing: .12em; text-transform: uppercase; }
+.nostr-connect-card h2 { margin: 0; color: #eef2ec; font: 700 clamp(25px, 6vw, 34px)/1.08 "Space Grotesk", sans-serif; }
+.nostr-connect-intro { margin: 12px auto 20px; max-width: 39ch; color: #aab5a7; font: 400 14px/1.55 "Space Grotesk", sans-serif; }
+.nostr-connect-close { position: absolute; top: 12px; right: 14px; width: 42px; height: 42px; border: 0; background: transparent; color: #aab5a7; font-size: 28px; cursor: pointer; }
+.nostr-connect-close:hover, .nostr-connect-close:focus-visible { color: #eef2ec; outline: 2px solid #9cc97e; }
+.nostr-connect-qr-frame { display: grid; place-items: center; width: min(288px, 100%); margin: 0 auto 20px; padding: 12px; background: #fff; }
+.nostr-connect-qr-frame img { display: block; width: 100%; height: auto; image-rendering: pixelated; }
+.nostr-connect-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.nostr-connect-dialog .button { display: inline-flex; min-height: 48px; align-items: center; justify-content: center; padding: 11px 16px; border: 1px solid #9cc97e; border-radius: 0; background: #9cc97e; color: #141914; font: 700 14px/1.2 "Space Grotesk", sans-serif; text-decoration: none; cursor: pointer; }
+.nostr-connect-dialog .button.secondary { background: transparent; color: #eef2ec; }
+.nostr-connect-dialog .button.ghost { min-height: 40px; margin-top: 8px; border-color: transparent; background: transparent; color: #aab5a7; }
+.nostr-connect-auth { display: inline-block; margin-top: 14px; color: #f5a623; font: 600 13px/1.3 "Space Grotesk", sans-serif; }
+.nostr-connect-dialog .login-status { min-height: 22px; margin: 16px 0 0; color: #aab5a7; font: 400 13px/1.5 "Space Grotesk", sans-serif; }
+@media (max-width: 520px) {
+  .nostr-connect-actions { grid-template-columns: 1fr; }
+  .nostr-connect-card { padding: 28px 18px 20px; }
+  .nostr-connect-qr-frame { width: min(248px, 86vw); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .nostr-connect-dialog::backdrop { backdrop-filter: none; }
+}

@@ -110,6 +110,36 @@ function requireSignedNostrEvent(result) {
   return result;
 }
 
+async function waitForNostrConnect() {
+  if (window.MeeratNostrConnect) return window.MeeratNostrConnect;
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("No se pudo cargar la conexión con la app Nostr. Recargá la página e intentá nuevamente.")), 5000);
+    window.addEventListener("meerat:nostr-connect-ready", () => {
+      clearTimeout(timer);
+      resolve();
+    }, {once: true});
+  });
+  if (!window.MeeratNostrConnect) throw new Error("No se pudo cargar la conexión con la app Nostr.");
+  return window.MeeratNostrConnect;
+}
+
+async function signWithNostr(unsignedEvent, requestedMethod = "auto") {
+  const method = requestedMethod === "auto"
+    ? (typeof window.nostr?.signEvent === "function" ? "nip07" : "nip46")
+    : requestedMethod;
+  if (method === "nip07") {
+    if (typeof window.nostr?.signEvent !== "function") {
+      throw new Error("No encontramos una extensión Nostr. Usá una app Nostr o el QR para continuar.");
+    }
+    return requireSignedNostrEvent(await window.nostr.signEvent(unsignedEvent));
+  }
+  if (method === "nip46") {
+    const connector = await waitForNostrConnect();
+    return requireSignedNostrEvent(await connector.signEvent(unsignedEvent));
+  }
+  throw new Error("El método de firma Nostr no es válido.");
+}
+
 let affiliateInvitationToken = null;
 
 function clearPreparedInvoice(form) {
@@ -186,21 +216,19 @@ async function resolveAffiliateInvitation() {
   }
 }
 
-async function loginWithNostr(role, button) {
+async function loginWithNostr(role, method) {
   const status = document.querySelector("[data-login-status]");
-  if (!window.nostr) {
-    status.textContent = "Necesitás una extensión Nostr compatible, como Alby, para iniciar sesión.";
-    status.classList.add("error");
-    return;
-  }
-  button.disabled = true;
+  const methodButtons = document.querySelectorAll("[data-login-method]");
+  methodButtons.forEach((element) => { element.disabled = true; });
   status.classList.remove("error");
-  status.textContent = "Preparando desafío seguro…";
+  status.textContent = tr("Preparando desafío seguro…");
   try {
     const challenge = await jsonFetch("/auth/nostr/challenge", {
       method: "POST", body: JSON.stringify({role})
     });
-    status.textContent = "Confirmá la firma en tu extensión Nostr…";
+    status.textContent = tr(method === "nip07"
+      ? "Confirmá la firma en tu extensión Nostr…"
+      : "Conectá tu app Nostr y confirmá la firma…");
     const unsignedEvent = {
       kind: challenge.kind,
       created_at: Math.floor(Date.now() / 1000),
@@ -211,8 +239,8 @@ async function loginWithNostr(role, button) {
       ],
       content: ""
     };
-    const event = requireSignedNostrEvent(await window.nostr.signEvent(unsignedEvent));
-    status.textContent = "Validando identidad…";
+    const event = await signWithNostr(unsignedEvent, method);
+    status.textContent = tr("Validando identidad…");
     const result = await jsonFetch("/auth/nostr/verify", {
       method: "POST", body: JSON.stringify({event})
     });
@@ -220,29 +248,42 @@ async function loginWithNostr(role, button) {
   } catch (error) {
     status.textContent = readableError(error);
     status.classList.add("error");
-    button.disabled = false;
+    methodButtons.forEach((element) => { element.disabled = false; });
   }
 }
 
 document.addEventListener("click", async (event) => {
-  const login = event.target.closest("[data-login-role]");
-  if (login) {
-    document.querySelectorAll("[data-login-role]").forEach(el => el.classList.remove("selected"));
-    login.classList.add("selected");
-    await loginWithNostr(login.dataset.loginRole, login);
+  const roleChoice = event.target.closest("[data-login-role]");
+  if (roleChoice) {
+    document.querySelectorAll("[data-login-role]").forEach((element) => {
+      const selected = element === roleChoice;
+      element.classList.toggle("selected", selected);
+      element.setAttribute("aria-pressed", selected ? "true" : "false");
+    });
+    const status = document.querySelector("[data-login-status]");
+    status?.classList.remove("error");
+    if (status) status.textContent = tr("Ahora continuá con tu signer Nostr.");
+    return;
+  }
+  const loginMethod = event.target.closest("[data-login-method]");
+  if (loginMethod) {
+    const selectedRole = document.querySelector("[data-login-role][aria-pressed='true']");
+    const status = document.querySelector("[data-login-status]");
+    if (!selectedRole) {
+      status.textContent = tr("Elegí primero si entrás como comerciante o afiliado.");
+      status.classList.add("error");
+      document.querySelector("[data-login-role]")?.focus();
+      return;
+    }
+    await loginWithNostr(selectedRole.dataset.loginRole, loginMethod.dataset.loginMethod);
     return;
   }
   const invite = event.target.closest("[data-invite-accept]");
   if (invite) {
     const status = document.querySelector("[data-invite-status]");
-    if (!window.nostr) {
-      status.textContent = "Necesitás una extensión Nostr compatible, como Alby, para aceptar.";
-      status.classList.add("error");
-      return;
-    }
     invite.disabled = true;
     status.classList.remove("error");
-    status.textContent = "Confirmá la aceptación en tu extensión Nostr…";
+    status.textContent = "Conectá tu app Nostr y confirmá la aceptación…";
     try {
       const token = affiliateInvitationToken;
       if (!token) throw new Error("La invitación no está disponible");
@@ -256,7 +297,7 @@ document.addEventListener("click", async (event) => {
         ],
         content: ""
       };
-      const signedEvent = requireSignedNostrEvent(await window.nostr.signEvent(eventToSign));
+      const signedEvent = await signWithNostr(eventToSign, "auto");
       status.textContent = "Creando tu inscripción y tu enlace único…";
       const result = await jsonFetch("/invite/accept", {
         method: "POST", body: JSON.stringify({token, event: signedEvent})

@@ -40,6 +40,7 @@ python scripts/e2e.py
 - `GET /dashboard/data` — compatibility redirect to `/ops/data`
 - `POST /auth/nostr/challenge` — one-use Nostr login challenge
 - `POST /auth/nostr/verify` — verify a signed challenge and create an opaque session
+- Browser signing adapters: NIP-07 extensions plus temporary NIP-46 `nostrconnect://` deep links/QR for mobile and cross-device login. Both adapters sign the same server challenge; Meerat never receives an `nsec`.
 - `GET /auth/me` — safe current-account summary
 - `POST /auth/logout` — revoke the current session
 - `GET /bb.js` — lightweight tracking snippet that captures `bb_click_id`/`bb_ref`
@@ -140,6 +141,7 @@ Recommended environment variables:
 - `SHOPIFY_STORE_DOMAIN`: permanent `*.myshopify.com` domain accepted in signed webhook headers.
 - `SHOPIFY_MERCHANT_PUBKEY`: merchant identity assigned to authoritative Shopify conversions.
 - `OPS_NOSTR_PUBKEYS`: comma-separated Nostr pubkeys authorized for `/ops`.
+- `NIP46_RELAYS`: comma-separated secure `wss://` relays used only for temporary browser-to-signer NIP-46 login connections. Invalid, duplicate, credential-bearing, and non-TLS URLs are ignored; at most three are exposed to the browser.
 - `MERCHANT_ACCOUNT_BINDINGS`: comma-separated `owner_pubkey:merchant_pubkey` administrative ownership pairs. For pilot bootstrap these identities must be distinct: the owner signs in through NIP-07 and the merchant pubkey identifies the tenant. Removing the pair revokes that delegated workspace access. Meerat never requests the owner's `nsec`.
 - `MERCHANT_DEFAULT_PROGRAM_NAME`: server-controlled name for a bootstrapped Merchant's first Affiliate Program. Default: `Meerat Affiliate Program`.
 - `MERCHANT_DEFAULT_COMMISSION_BPS`: commission for that first paused program. Default: `800` (8%).
