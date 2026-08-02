@@ -148,7 +148,7 @@ def test_login_frontend_preserves_role_card_markup_and_formats_structured_signer
     login_page = client.get("/app?role=merchant")
 
     assert script.status_code == 200
-    assert '/static/app.js?v=20260730-nip46-3' in login_page.text
+    assert '/static/app.js?v=20260730-authux-1' in login_page.text
     assert "function readableError(error" in script.text
     assert 'value === "[object Object]"' in script.text
     assert "new Error(readableError(data.detail" in script.text
@@ -239,7 +239,7 @@ def test_salvia_concept_brand_contract_is_served(tmp_path, monkeypatch):
     favicon = client.get("/static/brand/favicon.svg")
 
     assert login_page.status_code == 200
-    assert '/static/app.css?v=20260730-nip46-3' in login_page.text
+    assert '/static/app.css?v=20260730-authux-1' in login_page.text
     assert '/static/brand/wordmark-night.png' in login_page.text
     assert stylesheet.status_code == 200
     assert "--sage: #9cc97e" in stylesheet.text.lower()
@@ -263,7 +263,7 @@ def test_login_frontend_rejects_empty_or_invalid_signer_responses_before_verify(
     assert "NostrKey no devolvió un evento firmado" in script.text
     assert "signWithNostr(unsignedEvent" in script.text
     assert 'JSON.stringify({event})' in script.text
-    assert '/static/app.js?v=20260730-nip46-3' in login_page.text
+    assert '/static/app.js?v=20260730-authux-1' in login_page.text
 
 
 def test_nip46_mobile_signer_assets_are_self_hosted_and_secret_safe(tmp_path, monkeypatch):
@@ -278,12 +278,14 @@ def test_nip46_mobile_signer_assets_are_self_hosted_and_secret_safe(tmp_path, mo
     qr_script = client.get("/static/vendor/qrcode-generator-1.4.4.js")
 
     assert login_page.status_code == 200
-    assert 'data-login-method="auto"' in login_page.text
-    assert 'data-login-method="nip46"' in login_page.text
+    assert 'data-login-method="auto"' not in login_page.text
+    assert login_page.text.count('data-login-method="nip46"') == 1
+    assert "Continuar con una app Nostr" in login_page.text
+    assert "Usar otra app Nostr o QR" not in login_page.text
     assert 'id="nostr-connect-config"' in login_page.text
     assert '"wss://relay.primal.net"' in login_page.text
     assert '"wss://nos.lol"' in login_page.text
-    assert '/static/nostr-connect.js?v=20260730-nip46-3' in login_page.text
+    assert '/static/nostr-connect.js?v=20260730-authux-1' in login_page.text
     assert '/static/vendor/qrcode-generator-1.4.4.js' in login_page.text
     assert invite_page.status_code == 200
     assert 'id="nostr-connect-config"' in invite_page.text
@@ -2474,9 +2476,9 @@ def test_app_language_selector_persists_english_and_keeps_spanish_default(tmp_pa
     assert english.status_code == 200
     assert '<html lang="en">' in english.text
     assert "Merchant account" in english.text
-    assert "Continue with Nostr" in english.text
-    assert "Use another Nostr app or QR" in english.text
-    assert "On mobile, open a Nostr app" in english.text
+    assert "Continue with a Nostr app" in english.text
+    assert "Use another Nostr app or QR" not in english.text
+    assert "On mobile, we open your Nostr app" in english.text
     assert "The operation could not be completed. Try again." in english.text
     assert ">Cuenta de comerciante<" not in english.text
     assert english.headers["content-language"] == "en"
