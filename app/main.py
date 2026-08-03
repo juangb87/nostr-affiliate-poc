@@ -37,7 +37,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from urllib.parse import parse_qsl, unquote, urlencode, urlparse, urlunparse
-from nostr_sdk import Client, Event, EventBuilder, Keys, Kind, PublicKey, RelayUrl, Tag
+from nostr_sdk import Client, Event, EventBuilder, Keys, Kind, PublicKey, RelayUrl, Tag, Timestamp
 import qrcode
 from qrcode.image.svg import SvgPathImage
 from qrcode.exceptions import DataOverflowError
@@ -583,9 +583,18 @@ def nostr_keys() -> Keys:
     return Keys.parse(derived)
 
 
-def build_nostr_event(kind: int, tags: list[list[str]], content: str = "") -> dict[str, Any]:
+def build_nostr_event(
+    kind: int,
+    tags: list[list[str]],
+    content: str = "",
+    *,
+    created_at: int | None = None,
+) -> dict[str, Any]:
     keys = nostr_keys()
-    event = EventBuilder(Kind(kind), content).tags([Tag.parse(t) for t in tags]).sign_with_keys(keys)
+    builder = EventBuilder(Kind(kind), content).tags([Tag.parse(t) for t in tags])
+    if created_at is not None:
+        builder = builder.custom_created_at(Timestamp.from_secs(created_at))
+    event = builder.sign_with_keys(keys)
     data = json.loads(event.as_json())
     data["relay_status"] = "pending_publication" if nostr_publish_enabled() else "signed_not_published"
     return data
@@ -600,6 +609,20 @@ def fiat_order_tags(order_total: Decimal | str | int | float, currency: str) -> 
     if normalized in {"USD", "USDC"}:
         return [["order_fiat_amount", decimal_text(order_total)], ["order_fiat_currency", normalized]]
     return []
+
+
+def _next_campaign_event_created_at(campaign: dict[str, Any]) -> int:
+    previous = campaign.get("nostr_event_json")
+    if isinstance(previous, str):
+        try:
+            previous = json.loads(previous)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            previous = None
+    try:
+        previous_created_at = int(previous.get("created_at") or 0) if isinstance(previous, dict) else 0
+    except (TypeError, ValueError):
+        previous_created_at = 0
+    return max(int(time.time()), previous_created_at + 1)
 
 
 def build_campaign_event(campaign: dict[str, Any], terms_url: Optional[str] = None) -> dict[str, Any]:
@@ -625,6 +648,7 @@ def build_campaign_event(campaign: dict[str, Any], terms_url: Optional[str] = No
             ["destination", campaign["destination_url"]],
         ],
         json.dumps(content),
+        created_at=_next_campaign_event_created_at(campaign),
     )
 
 
@@ -837,7 +861,7 @@ def _finalize_committed_nostr_event_unlocked(
             c.execute(
                 text("""
                     UPDATE campaigns SET nostr_event_json=:event_json
-                    WHERE id=:id AND EXISTS (
+                    WHERE id=:id AND nostr_event_id=:event_id AND EXISTS (
                         SELECT 1 FROM nostr_events
                         WHERE event_id=:event_id AND relay_status=:relay_status
                     )
@@ -1486,7 +1510,7 @@ def archive_campaign_preserving_history(
             if database_url().startswith("postgresql"):
                 c.execute(
                     text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
-                    {"lock_key": f"campaign-archive:{campaign_id}"},
+                    {"lock_key": f"campaign-state:{campaign_id}"},
                 )
             campaign = asdict(
                 c.execute(text("SELECT * FROM campaigns WHERE id=:id"), {"id": campaign_id}).fetchone()
@@ -1881,6 +1905,11 @@ class CampaignJoinIn(BaseModel):
 class CampaignEnrollmentModeIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
     enrollment_mode: Literal["private", "approval", "open"]
+
+
+class CampaignCommissionIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    commission_percent: Decimal = Field(gt=0, le=100, max_digits=5, decimal_places=2)
 
 
 class MerchantEnrollmentDecisionIn(BaseModel):
@@ -2295,7 +2324,7 @@ def update_campaign_status(
             if database_url().startswith("postgresql"):
                 c.execute(
                     text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
-                    {"lock_key": f"campaign-enrollment:{campaign_id}"},
+                    {"lock_key": f"campaign-state:{campaign_id}"},
                 )
             campaign = asdict(c.execute(text("SELECT * FROM campaigns WHERE id=:id"), {"id": campaign_id}).fetchone())
             if not campaign:
@@ -2522,12 +2551,16 @@ def _create_conversion(
     init_db()
     click_id = body.click_id or bb_click_id
     pause_event: dict[str, Any] | None = None
-    with engine().begin() as c:
+    with _INVITATION_ACCEPT_LOCK, engine().begin() as c:
         click = asdict(c.execute(text("SELECT * FROM clicks WHERE id=:id"), {"id": click_id}).fetchone())
         if not click:
             raise HTTPException(404, "click not found")
         affiliate_lock_hex = normalize_pubkey(click["affiliate_pubkey"], "affiliate_pubkey")["hex"]
         if c.engine.dialect.name == "postgresql":
+            c.execute(
+                text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+                {"lock_key": f"campaign-state:{click['campaign_id']}"},
+            )
             c.execute(
                 text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
                 {"lock_key": f"affiliate-destination:{affiliate_lock_hex}"},
@@ -6348,6 +6381,69 @@ def merchant_create_invitation(request: Request, body: MerchantInvitationIn) -> 
     }
 
 
+@app.put("/app/merchant/campaigns/{campaign_id}/commission", tags=["Accounts"])
+def merchant_update_campaign_commission(
+    campaign_id: str, body: CampaignCommissionIn, request: Request
+) -> dict[str, Any]:
+    session = require_account_session(request, "merchant")
+    _require_same_origin(request)
+    init_db()
+    commission_bps = int(body.commission_percent * Decimal(100))
+    commission_percent = format((Decimal(commission_bps) / Decimal(100)).normalize(), "f")
+    event: dict[str, Any]
+    with _INVITATION_ACCEPT_LOCK:
+        with engine().begin() as c:
+            if c.engine.dialect.name == "postgresql":
+                c.execute(
+                    text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+                    {"key": f"campaign-state:{campaign_id}"},
+                )
+            campaign = _owned_merchant_campaign(c, session, campaign_id)
+            if not campaign:
+                raise HTTPException(404, "No se encontró la campaña.")
+            if campaign.get("status") != "active" or campaign.get("archived_at"):
+                raise HTTPException(409, "Solo se puede cambiar la comisión de una campaña activa.")
+            if int(campaign["commission_bps"]) == commission_bps:
+                return {
+                    "ok": True,
+                    "campaign_id": campaign_id,
+                    "commission_bps": commission_bps,
+                    "commission_percent": commission_percent,
+                    "duplicate": True,
+                    "nostr_event_id": campaign["nostr_event_id"],
+                    "nostr_event": json.loads(campaign["nostr_event_json"]),
+                }
+            campaign["commission_bps"] = commission_bps
+            event = build_campaign_event(campaign, campaign.get("terms_url"))
+            c.execute(
+                text("""
+                    UPDATE campaigns
+                    SET commission_bps=:commission_bps,
+                        nostr_event_id=:event_id,
+                        nostr_event_json=:event_json
+                    WHERE id=:id
+                """),
+                {
+                    "commission_bps": commission_bps,
+                    "event_id": event["id"],
+                    "event_json": json.dumps(event),
+                    "id": campaign_id,
+                },
+            )
+            persist_nostr_event(c, event, "campaign", campaign_id, [])
+    relay_results = finalize_committed_nostr_event(event, "campaign", campaign_id)
+    return {
+        "ok": True,
+        "campaign_id": campaign_id,
+        "commission_bps": commission_bps,
+        "commission_percent": commission_percent,
+        "duplicate": False,
+        "nostr_event_id": event["id"],
+        "nostr_event": event,
+        "relay_results": relay_results,
+    }
+
+
 @app.put("/app/merchant/campaigns/{campaign_id}/enrollment-mode", tags=["Accounts"])
 def merchant_update_enrollment_mode(
     campaign_id: str, body: CampaignEnrollmentModeIn, request: Request
@@ -6359,7 +6455,7 @@ def merchant_update_enrollment_mode(
     with _INVITATION_ACCEPT_LOCK:
         with engine().begin() as c:
             if c.engine.dialect.name == "postgresql":
-                c.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"), {"key": f"campaign-enrollment:{campaign_id}"})
+                c.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"), {"key": f"campaign-state:{campaign_id}"})
             campaign = _owned_merchant_campaign(c, session, campaign_id)
             if not campaign:
                 raise HTTPException(404, "No se encontró la campaña.")
@@ -6495,7 +6591,7 @@ def campaign_join(campaign_id: str, body: CampaignJoinIn, request: Request, resp
             except ValueError as exc:
                 raise HTTPException(400, str(exc)) from exc
             if c.engine.dialect.name == "postgresql":
-                c.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"), {"key": f"campaign-enrollment:{campaign_id}"})
+                c.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"), {"key": f"campaign-state:{campaign_id}"})
                 c.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"), {"key": f"affiliate-enrollment:{campaign_id}:{identity['hex']}"})
             campaign = asdict(c.execute(text("SELECT * FROM campaigns WHERE id=:id LIMIT 1"), {"id": campaign_id}).fetchone())
             if not campaign or campaign.get("archived_at") or campaign.get("enrollment_mode", "private") == "private":
@@ -6768,7 +6864,7 @@ def accept_affiliate_invitation(request: Request, response: Response, body: Affi
             if database_url().startswith("postgresql"):
                 c.execute(
                     text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
-                    {"lock_key": f"campaign-enrollment:{invitation['campaign_id']}"},
+                    {"lock_key": f"campaign-state:{invitation['campaign_id']}"},
                 )
             campaign = asdict(c.execute(text("SELECT * FROM campaigns WHERE id=:id"), {"id": invitation["campaign_id"]}).fetchone())
             if not campaign or campaign.get("status") != "active":

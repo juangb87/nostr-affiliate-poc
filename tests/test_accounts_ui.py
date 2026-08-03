@@ -603,7 +603,7 @@ def test_merchant_creates_hashed_single_use_invitation_for_owned_campaign(tmp_pa
 
     merchant_page = client.get("/app/merchant?view=affiliates")
     assert merchant_page.status_code == 200
-    assert '/static/app.js?v=20260803-merchant-i18n1' in merchant_page.text
+    assert '/static/app.js?v=20260803-commission1' in merchant_page.text
     assert 'data-invite-origin="https://mrt.st"' in merchant_page.text
 
     invitation = create_invitation(client, campaign["campaign_id"])
@@ -2578,7 +2578,7 @@ def test_all_merchant_views_render_application_copy_in_english(tmp_path, monkeyp
 
     expected = {
         "overview": ("Next actions", "Clicks, conversions, and commissions."),
-        "campaigns": ("Invitation only", "Save mode", "30-day attribution window"),
+        "campaigns": ("Invitation only", "Save mode", "Commission (%)", "Save commission", "Applies to conversions recorded from now on", "Existing conversions and payouts will not change.", "30-day attribution window"),
         "affiliates": ("Pending applications", "Approved npubs linked to your programs.", "Approve", "Reject"),
         "activity": ("Confirmed conversions and commissions.",),
         "payouts": ("Generate Lightning invoice and QR", "Lightning evidence (64 hexadecimal characters)", "This records a merchant-signed declaration."),
@@ -2591,7 +2591,7 @@ def test_all_merchant_views_render_application_copy_in_english(tmp_path, monkeyp
 
     forbidden = (
         "Npubs aprobados y vinculados", "Solicitudes pendientes", "Revisá cada identidad",
-        "Guardar modo", "Solo invitación", "Requiere aprobación", "Inscripción abierta",
+        "Guardar modo", "Guardar comisión", "Aplica a conversiones registradas", "Solo invitación", "Requiere aprobación", "Inscripción abierta",
         "ventana 30 días", "Conversiones y comisiones confirmadas", "Evidencia Lightning",
         "Esto registra una declaración", "Webhook orders/paid de Shopify", "Recibiendo eventos",
         "Creá un píxel", "Configurá este endpoint", "PNG, JPG o WebP público. Si falta",
@@ -2697,6 +2697,218 @@ def test_approval_campaign_stays_pending_until_merchant_decides(tmp_path, monkey
         ).mappings().one()
     assert row["status"] == "approved"
     assert ["status", "approved"] in json.loads(row["nostr_event_json"])["tags"]
+
+
+def test_merchant_can_update_commission_and_only_future_conversions_use_it(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    merchant = Keys.generate()
+    affiliate = Keys.generate()
+    campaign = create_campaign(client, merchant, name="Lightning Koffee", enrollment_mode="private")
+    enrollment = create_enrollment(client, campaign["campaign_id"], affiliate)
+    first_click = client.post("/clicks/simulate", json={"ref_code": enrollment["ref_code"]}).json()["click_id"]
+    first = client.post(
+        "/conversions",
+        json={"order_id": "before-rate-change", "click_id": first_click, "order_total": 100000, "currency": "SATS"},
+    )
+    assert first.status_code == 200, first.text
+    first_data = first.json()
+    assert first_data["commission_sats"] == 8000
+    assert ["commission_bps", "800"] in first_data["nostr_event"]["tags"]
+    with main.engine().connect() as connection:
+        first_conversion_before = dict(connection.execute(
+            text("SELECT commission_sats, nostr_event_json FROM conversions WHERE id=:id"),
+            {"id": first_data["conversion_id"]},
+        ).mappings().one())
+        first_payout_before = dict(connection.execute(
+            text("SELECT amount_sats, fee_sats, reserved_sats FROM payouts WHERE conversion_id=:id"),
+            {"id": first_data["conversion_id"]},
+        ).mappings().one())
+
+    login(client, merchant, "merchant")
+    changed = client.put(
+        f"/app/merchant/campaigns/{campaign['campaign_id']}/commission",
+        headers={"Origin": "https://testserver"},
+        json={"commission_percent": "12.50"},
+    )
+    assert changed.status_code == 200, changed.text
+    assert changed.json()["commission_percent"] == "12.5"
+    assert changed.json()["commission_bps"] == 1250
+    assert changed.json()["duplicate"] is False
+    duplicate = client.put(
+        f"/app/merchant/campaigns/{campaign['campaign_id']}/commission",
+        headers={"Origin": "https://testserver"},
+        json={"commission_percent": "12.5"},
+    )
+    assert duplicate.status_code == 200
+    assert duplicate.json()["duplicate"] is True
+
+    second_click = client.post("/clicks/simulate", json={"ref_code": enrollment["ref_code"]}).json()["click_id"]
+    second = client.post(
+        "/conversions",
+        json={"order_id": "after-rate-change", "click_id": second_click, "order_total": 100000, "currency": "SATS"},
+    )
+    assert second.status_code == 200, second.text
+    second_data = second.json()
+    assert second_data["commission_sats"] == 12500
+    assert ["commission_bps", "1250"] in second_data["nostr_event"]["tags"]
+    with main.engine().connect() as connection:
+        first_conversion_after = dict(connection.execute(
+            text("SELECT commission_sats, nostr_event_json FROM conversions WHERE id=:id"),
+            {"id": first_data["conversion_id"]},
+        ).mappings().one())
+        first_payout_after = dict(connection.execute(
+            text("SELECT amount_sats, fee_sats, reserved_sats FROM payouts WHERE conversion_id=:id"),
+            {"id": first_data["conversion_id"]},
+        ).mappings().one())
+        stored = connection.execute(
+            text("SELECT commission_sats FROM conversions ORDER BY created_at, id")
+        ).scalars().all()
+        campaign_row = connection.execute(
+            text("SELECT commission_bps, nostr_event_json FROM campaigns WHERE id=:id"),
+            {"id": campaign["campaign_id"]},
+        ).fetchone()
+    assert first_conversion_after == first_conversion_before
+    assert first_payout_after == first_payout_before
+    assert sorted(stored) == [8000, 12500]
+    assert campaign_row.commission_bps == 1250
+    event = json.loads(campaign_row.nostr_event_json)
+    assert ["commission_bps", "1250"] in event["tags"]
+
+    page = client.get("/app/merchant?view=campaigns&lang=en")
+    assert page.status_code == 200
+    assert 'name="commission_percent"' in page.text
+    assert 'value="12.5"' in page.text
+    assert "Commission (%)" in page.text
+    assert "Save commission" in page.text
+    assert "Applies to conversions recorded from now on" in page.text
+    assert "Existing conversions and payouts will not change." in page.text
+
+
+def test_commission_change_serializes_with_conversion_ingestion(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    merchant = Keys.generate()
+    affiliate = Keys.generate()
+    campaign = create_campaign(client, merchant, name="Serialized rate")
+    enrollment = create_enrollment(client, campaign["campaign_id"], affiliate)
+    click_id = client.post("/clicks/simulate", json={"ref_code": enrollment["ref_code"]}).json()["click_id"]
+    login(client, merchant, "merchant")
+
+    entered = threading.Event()
+    release = threading.Event()
+    original_build = main.build_campaign_event
+
+    def blocking_build(campaign_row, terms_url=None):
+        if int(campaign_row["commission_bps"]) == 1250:
+            entered.set()
+            assert release.wait(timeout=5)
+        return original_build(campaign_row, terms_url)
+
+    monkeypatch.setattr(main, "build_campaign_event", blocking_build)
+    results = {}
+
+    def update_rate():
+        results["update"] = client.put(
+            f"/app/merchant/campaigns/{campaign['campaign_id']}/commission",
+            headers={"Origin": "https://testserver"},
+            json={"commission_percent": "12.5"},
+        )
+
+    def record_conversion():
+        conversion_client = TestClient(main.app, base_url="https://testserver")
+        results["conversion"] = conversion_client.post(
+            "/conversions",
+            json={"order_id": "concurrent-rate-boundary", "click_id": click_id, "order_total": 100000, "currency": "SATS"},
+        )
+
+    update_thread = threading.Thread(target=update_rate)
+    conversion_thread = threading.Thread(target=record_conversion)
+    update_thread.start()
+    assert entered.wait(timeout=5)
+    conversion_thread.start()
+    time.sleep(0.1)
+    assert conversion_thread.is_alive()
+    release.set()
+    update_thread.join(timeout=5)
+    conversion_thread.join(timeout=5)
+    assert not update_thread.is_alive()
+    assert not conversion_thread.is_alive()
+
+    assert results["update"].status_code == 200
+    assert results["conversion"].status_code == 200
+    assert results["conversion"].json()["commission_sats"] == 12500
+
+
+def test_campaign_commission_events_are_monotonic_and_stale_finalization_is_safe(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    merchant = Keys.generate()
+    campaign = create_campaign(client, merchant, name="Monotonic campaign")
+    login(client, merchant, "merchant")
+
+    first = client.put(
+        f"/app/merchant/campaigns/{campaign['campaign_id']}/commission",
+        headers={"Origin": "https://testserver"},
+        json={"commission_percent": "12"},
+    )
+    second = client.put(
+        f"/app/merchant/campaigns/{campaign['campaign_id']}/commission",
+        headers={"Origin": "https://testserver"},
+        json={"commission_percent": "13"},
+    )
+    assert first.status_code == second.status_code == 200
+    first_event = first.json()["nostr_event"]
+    second_event = second.json()["nostr_event"]
+    assert second_event["created_at"] > first_event["created_at"]
+
+    main.finalize_committed_nostr_event(first_event, "campaign", campaign["campaign_id"])
+    with main.engine().connect() as connection:
+        row = connection.execute(
+            text("SELECT commission_bps, nostr_event_id, nostr_event_json FROM campaigns WHERE id=:id"),
+            {"id": campaign["campaign_id"]},
+        ).mappings().one()
+    assert row["commission_bps"] == 1300
+    assert row["nostr_event_id"] == second_event["id"]
+    assert json.loads(row["nostr_event_json"])["id"] == second_event["id"]
+
+
+def test_merchant_commission_update_validates_input_and_tenant_ownership(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    owner = Keys.generate()
+    stranger = Keys.generate()
+    campaign = create_campaign(client, owner, name="Owner campaign")
+    create_campaign(client, stranger, name="Stranger campaign")
+    login(client, stranger, "merchant")
+
+    denied = client.put(
+        f"/app/merchant/campaigns/{campaign['campaign_id']}/commission",
+        headers={"Origin": "https://testserver"},
+        json={"commission_percent": "10"},
+    )
+    assert denied.status_code == 404
+    login(client, owner, "merchant")
+    for invalid in ("0", "100.01", "12.345", "not-a-number"):
+        response = client.put(
+            f"/app/merchant/campaigns/{campaign['campaign_id']}/commission",
+            headers={"Origin": "https://testserver"},
+            json={"commission_percent": invalid},
+        )
+        assert response.status_code == 422
+    with main.engine().begin() as connection:
+        connection.execute(
+            text("UPDATE campaigns SET status='paused' WHERE id=:id"),
+            {"id": campaign["campaign_id"]},
+        )
+    inactive = client.put(
+        f"/app/merchant/campaigns/{campaign['campaign_id']}/commission",
+        headers={"Origin": "https://testserver"},
+        json={"commission_percent": "10"},
+    )
+    assert inactive.status_code == 409
+    with main.engine().connect() as connection:
+        bps = connection.execute(
+            text("SELECT commission_bps FROM campaigns WHERE id=:id"),
+            {"id": campaign["campaign_id"]},
+        ).scalar_one()
+    assert bps == 800
 
 
 def test_private_campaign_rejects_public_join_and_non_owner_cannot_change_mode(tmp_path, monkeypatch):

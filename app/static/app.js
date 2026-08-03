@@ -462,6 +462,29 @@ document.addEventListener("click", (event) => {
 document.querySelectorAll("[data-merchant-onboarding-wizard]").forEach((form) => setMerchantOnboardingStep(form, 1));
 
 document.addEventListener("submit", async (event) => {
+  const commissionForm = event.target.closest("[data-campaign-commission]");
+  if (commissionForm) {
+    event.preventDefault();
+    if (!commissionForm.reportValidity()) return;
+    const status = commissionForm.querySelector("[data-commission-status]");
+    const button = commissionForm.querySelector("button[type='submit']");
+    button.disabled = true;
+    status.classList.remove("error");
+    try {
+      await jsonFetch(`/app/merchant/campaigns/${encodeURIComponent(commissionForm.dataset.campaignCommission)}/commission`, {
+        method: "PUT",
+        body: JSON.stringify({commission_percent: new FormData(commissionForm).get("commission_percent")})
+      });
+      status.textContent = tr("Comisión actualizada.");
+      window.location.reload();
+    } catch (error) {
+      status.textContent = readableError(error);
+      status.classList.add("error");
+      button.disabled = false;
+    }
+    return;
+  }
+
   const modeForm = event.target.closest("[data-enrollment-mode]");
   if (modeForm) {
     event.preventDefault();
