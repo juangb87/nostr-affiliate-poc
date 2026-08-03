@@ -6515,12 +6515,49 @@ def merchant_decide_enrollment(
     return {"ok": True, "enrollment_id": enrollment_id, "status": body.status, "duplicate": False, "relay_results": relay_results}
 
 
+def _affiliate_lander_presentation(campaign: dict[str, Any]) -> dict[str, str | None]:
+    profile_name = safe_text(campaign.get("display_name"), 120)
+    campaign_name = str(campaign["campaign_name"] if "campaign_name" in campaign else campaign["name"])
+    fallback_name = re.sub(
+        r"\s+(?:affiliate\s+program|affiliate\s+programme|programa\s+de\s+afiliados|programa\s+affiliate)$",
+        "",
+        campaign_name,
+        flags=re.IGNORECASE,
+    ).strip()
+    display_name = profile_name or fallback_name or campaign_name
+    custom_tagline = safe_text(campaign.get("tagline"), 180)
+    custom_eyebrow = safe_text(campaign.get("invite_eyebrow"), 100)
+    custom_headline = safe_text(campaign.get("invite_headline"), 120)
+    custom_description = safe_text(campaign.get("invite_description"), 360)
+    words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]+", display_name)
+    return {
+        "display_name": display_name,
+        "initials": "".join(word[0] for word in words[:2]).upper() or "₿",
+        "logo_url": campaign.get("logo_url"),
+        "tagline_es": custom_tagline or "Comunidad, recomendaciones y sats",
+        "tagline_en": custom_tagline or "Community, recommendations and sats",
+        "invite_eyebrow_es": custom_eyebrow or "Programa de afiliados · Valor por valor",
+        "invite_eyebrow_en": custom_eyebrow or "Affiliate program · Value for value",
+        "invite_headline_es": custom_headline or f"Recomendá {display_name}. Ganá sats.",
+        "invite_headline_en": custom_headline or f"Recommend {display_name}. Earn sats.",
+        "invite_description_es": custom_description or (
+            f"Sumate al programa de afiliados de {display_name}. Compartí tu link con tu comunidad "
+            "y recibí sats cuando tu recomendación termina en una compra."
+        ),
+        "invite_description_en": custom_description or (
+            f"Join {display_name}'s affiliate program. Share your link with your community "
+            "and earn sats when your recommendation leads to a purchase."
+        ),
+    }
+
+
 def _campaign_join_data(campaign_id: str) -> dict[str, Any]:
     init_db()
     with engine().connect() as c:
         row = c.execute(text("""
             SELECT c.id, c.name, c.commission_bps, c.window_days, c.terms_url,
-                   c.enrollment_mode, c.status, c.archived_at,
+                   c.enrollment_mode, c.status, c.archived_at, c.invite_eyebrow,
+                   c.invite_headline, c.invite_description,
                    mp.display_name, mp.tagline, mp.logo_url
             FROM campaigns c
             LEFT JOIN merchant_profiles mp ON mp.merchant_pubkey_hex=c.merchant_pubkey_hex
@@ -6532,12 +6569,18 @@ def _campaign_join_data(campaign_id: str) -> dict[str, Any]:
     if campaign.get("status") != "active":
         raise HTTPException(409, "La campaña no está activa.")
     campaign["commission_percent"] = format((Decimal(int(campaign["commission_bps"])) / Decimal(100)).normalize(), "f")
+    campaign.update(_affiliate_lander_presentation(campaign))
     return campaign
 
 
 @app.get("/campaigns/{campaign_id}/join", response_class=HTMLResponse)
 def campaign_join_page(request: Request, campaign_id: str) -> Response:
-    return templates.TemplateResponse(request=request, name="campaign_join.html", context={"campaign": _campaign_join_data(campaign_id)}, headers={"Cache-Control": "no-store", "Referrer-Policy": "same-origin"})
+    return templates.TemplateResponse(
+        request=request,
+        name="affiliate_lander.html",
+        context={"campaign": _campaign_join_data(campaign_id), "lander_flow": "campaign"},
+        headers={"Cache-Control": "no-store", "Referrer-Policy": "same-origin"},
+    )
 
 
 @app.post("/campaigns/{campaign_id}/join/challenge", tags=["Accounts"])
@@ -6638,9 +6681,9 @@ def campaign_join(campaign_id: str, body: CampaignJoinIn, request: Request, resp
 def affiliate_invitation_page(request: Request) -> Response:
     return templates.TemplateResponse(
         request=request,
-        name="invite.html",
+        name="affiliate_lander.html",
         headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
-        context={},
+        context={"campaign": None, "lander_flow": "invite"},
     )
 
 
@@ -6653,7 +6696,7 @@ def resolve_affiliate_invitation(request: Request, response: Response, body: Aff
             c.execute(
                 text(
                     """
-                    SELECT i.*, c.name AS campaign_name, c.commission_bps, c.window_days,
+                    SELECT i.*, c.name AS campaign_name, c.commission_bps, c.window_days, c.terms_url,
                            c.status AS campaign_status, c.invite_eyebrow, c.invite_headline,
                            c.invite_description, c.enrollment_mode, mp.display_name, mp.tagline, mp.logo_url
                     FROM affiliate_invitations i
@@ -6677,24 +6720,9 @@ def resolve_affiliate_invitation(request: Request, response: Response, body: Aff
         raise HTTPException(409, "La campaña no está activa.")
     if invitation.get("enrollment_mode", "private") != "private":
         raise HTTPException(409, "La campaña ya no acepta invitaciones privadas.")
-    profile_name = safe_text(invitation.get("display_name"), 120)
-    fallback_name = re.sub(
-        r"\s+(?:affiliate\s+program|affiliate\s+programme|programa\s+de\s+afiliados|programa\s+affiliate)$",
-        "",
-        invitation["campaign_name"],
-        flags=re.IGNORECASE,
-    ).strip()
-    display_name = profile_name or fallback_name or invitation["campaign_name"]
-    tagline = safe_text(invitation.get("tagline"), 180) or "Comunidad, recomendaciones y sats"
-    words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]+", display_name)
-    initials = "".join(word[0] for word in words[:2]).upper() or "₿"
+    presentation = _affiliate_lander_presentation(invitation)
+    display_name = str(presentation["display_name"])
     commission_percent = f"{int(invitation['commission_bps']) / 100:g}"
-    invite_eyebrow = safe_text(invitation.get("invite_eyebrow"), 100) or "Programa de afiliados · Valor por valor"
-    invite_headline = safe_text(invitation.get("invite_headline"), 120) or f"Recomendá {display_name}. Ganá sats."
-    invite_description = safe_text(invitation.get("invite_description"), 360) or (
-        f"Sumate al programa de afiliados de {display_name}. Compartí tu link con tu comunidad "
-        "y recibí sats cuando tu recomendación termina en una compra."
-    )
     return {
         "ok": True,
         "auth_event_kind": AUTH_EVENT_KIND,
@@ -6703,16 +6731,26 @@ def resolve_affiliate_invitation(request: Request, response: Response, body: Aff
         "window_days": invitation["window_days"],
         "merchant": {
             "display_name": display_name,
-            "tagline": tagline,
-            "logo_url": invitation.get("logo_url"),
-            "initials": initials,
+            "tagline": presentation["tagline_es"],
+            "tagline_es": presentation["tagline_es"],
+            "tagline_en": presentation["tagline_en"],
+            "logo_url": presentation["logo_url"],
+            "initials": presentation["initials"],
         },
         "campaign": {
             "name": invitation["campaign_name"],
             "commission_percent": commission_percent,
-            "invite_eyebrow": invite_eyebrow,
-            "invite_headline": invite_headline,
-            "invite_description": invite_description,
+            "window_days": invitation["window_days"],
+            "terms_url": invitation.get("terms_url"),
+            "invite_eyebrow": presentation["invite_eyebrow_es"],
+            "invite_eyebrow_es": presentation["invite_eyebrow_es"],
+            "invite_eyebrow_en": presentation["invite_eyebrow_en"],
+            "invite_headline": presentation["invite_headline_es"],
+            "invite_headline_es": presentation["invite_headline_es"],
+            "invite_headline_en": presentation["invite_headline_en"],
+            "invite_description": presentation["invite_description_es"],
+            "invite_description_es": presentation["invite_description_es"],
+            "invite_description_en": presentation["invite_description_en"],
         },
         "expires_at": invitation["expires_at"],
     }

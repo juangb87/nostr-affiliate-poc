@@ -1,0 +1,27 @@
+html [data-copy-lang="en"]{display:none}
+html[data-lang="en"] [data-copy-lang="es"]{display:none}
+html[data-lang="en"] [data-copy-lang="en"]{display:initial}
+.invite-language-switch{display:inline-flex;border:1px solid var(--line);padding:3px;gap:2px}
+.invite-language-switch button{min-width:34px;min-height:30px;border:0;background:transparent;color:var(--muted);font:11px var(--mono);cursor:pointer}
+.invite-language-switch button[aria-pressed="true"]{background:var(--sage);color:var(--night)}
+.invite-language-switch button:focus-visible{outline:2px solid var(--arena);outline-offset:2px}
+.invite-button [data-copy-lang]{pointer-events:none}
+.invite-alt-signer{display:block;width:100%;min-height:38px;margin:-5px 0 2px;border:0;background:transparent;color:var(--night);font:600 12px var(--sans);text-decoration:underline;text-underline-offset:3px;cursor:pointer}
+.invite-alt-signer:hover{color:#4f6f3d}
+.invite-alt-signer:focus-visible{outline:2px solid var(--night);outline-offset:2px}
+.invite-terms{display:grid;gap:5px;color:#596257;font:10px/1.5 var(--mono)}
+.invite-terms a{color:inherit;text-underline-offset:3px}
+.invite-status:empty{display:none}
+@media(max-width:900px){
+  .invite-hero{grid-template-columns:1fr}
+  .invite-card{order:1}
+  .invite-copy{order:2}
+  .invite-nav-side{gap:10px}
+  .invite-fine{display:none}
+}
+@media(max-width:560px){
+  .invite-nav{height:auto;min-height:72px;padding-top:12px;padding-bottom:12px}
+  .invite-brand{font-size:19px}
+  .invite-pill{display:none}
+  .invite-language-switch button{min-width:38px;min-height:34px}
+}

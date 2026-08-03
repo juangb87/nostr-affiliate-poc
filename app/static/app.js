@@ -156,6 +156,30 @@ async function signWithNostr(unsignedEvent, requestedMethod = "auto") {
 let affiliateInvitationToken = null;
 let affiliateInvitationEventKind = null;
 
+function inviteLanguage() {
+  return document.documentElement.dataset.lang === "en" ? "en" : "es";
+}
+
+function setInviteStatus(element, es, en) {
+  if (!element) return;
+  element.dataset.statusEs = es;
+  element.dataset.statusEn = en;
+  element.textContent = inviteLanguage() === "en" ? en : es;
+}
+
+function inviteErrorCopy(error) {
+  const raw = readableError(error);
+  const translations = new Map([
+    ["No se encontró la invitación.", "The invitation was not found."],
+    ["La invitación expiró.", "The invitation has expired."],
+    ["La invitación ya fue utilizada o revocada.", "The invitation has already been used or revoked."],
+    ["La campaña no está activa.", "The campaign is not active."],
+    ["La campaña ya no acepta invitaciones privadas.", "The campaign no longer accepts private invitations."],
+    ["No encontramos una extensión Nostr. Usá una app Nostr o el QR para continuar.", "No Nostr extension was found. Use a Nostr app or QR code to continue."]
+  ]);
+  return [raw, translations.get(raw) || "The invitation could not be completed. Check the link and try again."];
+}
+
 function clearPreparedInvoice(form) {
   const panel = form.querySelector("[data-invoice-panel]");
   const image = panel.querySelector("[data-invoice-qr]");
@@ -175,16 +199,20 @@ async function resolveAffiliateInvitation() {
   if (!page) return;
   const status = page.querySelector("[data-invite-status]");
   const errorStatus = page.querySelector("[data-invite-error-status]");
-  const fail = (message) => {
+  const fail = (es, en = "The invitation could not be opened. Ask the Merchant for a new link.") => {
     affiliateInvitationToken = null;
     page.classList.remove("is-loading");
     page.classList.add("is-error");
-    status.textContent = message;
+    setInviteStatus(status, es, en);
     status.classList.add("error");
-    if (errorStatus) errorStatus.textContent = message;
+    setInviteStatus(errorStatus, es, en);
   };
   const setAllText = (selector, value) => {
     page.querySelectorAll(selector).forEach((element) => { element.textContent = value; });
+  };
+  const setLocalizedText = (selector, es, en) => {
+    page.querySelectorAll(`${selector}[data-copy-lang='es']`).forEach((element) => { element.textContent = es; });
+    page.querySelectorAll(`${selector}[data-copy-lang='en']`).forEach((element) => { element.textContent = en; });
   };
   const params = new URLSearchParams(window.location.hash.slice(1));
   const fragmentToken = params.get("token");
@@ -194,7 +222,7 @@ async function resolveAffiliateInvitation() {
     window.history.replaceState({inviteToken: fragmentToken}, "", "/invite");
   }
   if (!token) {
-    fail("El enlace no contiene una invitación válida. Pedile uno nuevo al comerciante.");
+    fail("El enlace no contiene una invitación válida. Pedile uno nuevo al comerciante.", "This link does not contain a valid invitation. Ask the Merchant for a new one.");
     return;
   }
   affiliateInvitationToken = token;
@@ -212,11 +240,17 @@ async function resolveAffiliateInvitation() {
     const initials = merchant.initials || "₿";
     setAllText("[data-invite-merchant-name]", displayName);
     setAllText("[data-invite-initials]", initials);
-    setAllText("[data-invite-tagline]", merchant.tagline || "Comunidad, recomendaciones y sats");
-    setAllText("[data-invite-eyebrow]", campaign.invite_eyebrow || "Programa de afiliados · Valor por valor");
-    setAllText("[data-invite-headline]", campaign.invite_headline || `Recomendá ${displayName}. Ganá sats.`);
-    setAllText("[data-invite-description]", campaign.invite_description || `Sumate al programa de afiliados de ${displayName}.`);
+    setLocalizedText("[data-invite-tagline]", merchant.tagline_es || merchant.tagline || "Comunidad, recomendaciones y sats", merchant.tagline_en || merchant.tagline || "Community, recommendations and sats");
+    setLocalizedText("[data-invite-eyebrow]", campaign.invite_eyebrow_es || campaign.invite_eyebrow || "Programa de afiliados · Valor por valor", campaign.invite_eyebrow_en || campaign.invite_eyebrow || "Affiliate program · Value for value");
+    setLocalizedText("[data-invite-headline]", campaign.invite_headline_es || campaign.invite_headline || `Recomendá ${displayName}. Ganá sats.`, campaign.invite_headline_en || campaign.invite_headline || `Recommend ${displayName}. Earn sats.`);
+    setLocalizedText("[data-invite-description]", campaign.invite_description_es || campaign.invite_description || `Sumate al programa de afiliados de ${displayName}.`, campaign.invite_description_en || campaign.invite_description || `Join ${displayName}'s affiliate program.`);
     setAllText("[data-invite-commission]", campaign.commission_percent || result.commission_percent);
+    setAllText("[data-invite-window]", String(campaign.window_days || result.window_days || "—"));
+    const termsLink = page.querySelector("[data-invite-terms]");
+    if (termsLink && campaign.terms_url) {
+      termsLink.href = campaign.terms_url;
+      termsLink.hidden = false;
+    }
     if (merchant.logo_url) {
       page.querySelectorAll("[data-invite-logo]").forEach((image) => {
         image.alt = `Logo de ${displayName}`;
@@ -229,12 +263,12 @@ async function resolveAffiliateInvitation() {
       });
       page.querySelectorAll("[data-invite-initials]").forEach((mark) => { mark.hidden = true; });
     }
-    document.title = `${displayName} · Programa de afiliados`;
-    page.querySelector("[data-invite-accept]").hidden = false;
+    document.title = inviteLanguage() === "en" ? `${displayName} · Affiliate program` : `${displayName} · Programa de afiliados`;
+    page.querySelectorAll("[data-invite-accept]").forEach((button) => { button.hidden = false; });
     page.classList.remove("is-loading");
-    status.textContent = "Usá la identidad Nostr que querés asociar a este programa.";
+    setInviteStatus(status, "Usá la identidad Nostr que querés asociar a este programa.", "Use the Nostr identity you want to associate with this program.");
   } catch (error) {
-    fail(readableError(error));
+    fail(...inviteErrorCopy(error));
   }
 }
 
@@ -305,7 +339,7 @@ document.addEventListener("click", async (event) => {
     const status = document.querySelector("[data-invite-status]");
     invite.disabled = true;
     status.classList.remove("error");
-    status.textContent = "Conectá tu app Nostr y confirmá la aceptación…";
+    setInviteStatus(status, "Conectá tu app Nostr y confirmá la aceptación…", "Connect your Nostr app and confirm acceptance…");
     try {
       const token = affiliateInvitationToken;
       if (!token) throw new Error("La invitación no está disponible");
@@ -319,16 +353,17 @@ document.addEventListener("click", async (event) => {
         ],
         content: ""
       };
-      const signedEvent = await signWithNostr(eventToSign, "auto");
-      status.textContent = "Creando tu inscripción y tu enlace único…";
+      const signedEvent = await signWithNostr(eventToSign, invite.dataset.signMethod || "auto");
+      setInviteStatus(status, "Creando tu inscripción y tu enlace único…", "Creating your enrollment and unique link…");
       const result = await jsonFetch("/invite/accept", {
         method: "POST", body: JSON.stringify({token, event: signedEvent})
       });
-      status.textContent = "Invitación aceptada. Abriendo tu espacio de trabajo…";
+      setInviteStatus(status, "Invitación aceptada. Abriendo tu espacio de trabajo…", "Invitation accepted. Opening your workspace…");
       window.history.replaceState(null, "", "/invite");
       window.location.assign(result.redirect);
     } catch (error) {
-      status.textContent = readableError(error);
+      const [es, en] = inviteErrorCopy(error);
+      setInviteStatus(status, es, en);
       status.classList.add("error");
       invite.disabled = false;
     }

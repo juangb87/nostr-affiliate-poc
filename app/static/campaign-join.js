@@ -19,6 +19,8 @@
     return translations.get(raw) || "The enrollment could not be completed. Check your Nostr signer and try again.";
   };
   const setStatus = (es, en, error = false) => {
+    status.dataset.statusEs = es;
+    status.dataset.statusEn = en;
     status.textContent = message(es, en);
     status.classList.toggle("error", error);
   };

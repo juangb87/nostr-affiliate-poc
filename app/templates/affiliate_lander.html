@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="{{ language|default('es') }}" data-lang="{{ language|default('es') }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#141914">
+  <meta name="referrer" content="{% if lander_flow == 'invite' %}no-referrer{% else %}same-origin{% endif %}">
+  <title>{% if campaign %}{{ campaign.display_name }} · Programa de afiliados{% else %}Programa de afiliados{% endif %}</title>
+  <link rel="stylesheet" href="/static/invite.css?v=20260803-invite-unified1">
+  <link rel="stylesheet" href="/static/affiliate-lander.css?v=20260803-invite-unified1">
+  <link rel="stylesheet" href="/static/nostr-connect.css?v=20260803-invite-unified1">
+  <script id="nostr-connect-config" type="application/json">{{ nostr_connect_config | tojson }}</script>
+  <script src="/static/vendor/qrcode-generator-1.4.4.js" defer></script>
+  <script type="module" src="/static/nostr-connect.js?v=20260803-invite-unified1"></script>
+  <script src="/static/app.js?v=20260803-invite-unified1" defer></script>
+  <script src="/static/invite-language.js?v=20260803-invite-unified1" defer></script>
+  {% if lander_flow == 'campaign' %}<script src="/static/campaign-join.js?v=20260803-invite-unified1" defer></script>{% endif %}
+</head>
+<body>
+<main class="invite-lander {% if lander_flow == 'invite' %}is-loading{% endif %}" data-affiliate-lander {% if lander_flow == 'invite' %}data-invite-page{% else %}data-campaign-join data-campaign-id="{{ campaign.id }}" data-enrollment-mode="{{ campaign.enrollment_mode }}"{% endif %}>
+  <header class="invite-nav">
+    <div class="invite-brand">
+      {% if campaign and campaign.logo_url %}<img class="invite-brand-logo" src="{{ campaign.logo_url }}" alt="" referrerpolicy="no-referrer" decoding="async">{% else %}<img class="invite-brand-logo" data-invite-logo alt="" referrerpolicy="no-referrer" decoding="async" hidden>{% endif %}
+      <span class="invite-brand-mark" {% if lander_flow == 'invite' %}data-invite-initials{% endif %}{% if campaign and campaign.logo_url %} hidden{% endif %}>{{ campaign.initials if campaign else '₿' }}</span>
+      <span class="invite-brand-name" {% if lander_flow == 'invite' %}data-invite-merchant-name{% endif %}>{{ campaign.display_name if campaign else 'Programa de afiliados' }}</span>
+    </div>
+    <div class="invite-nav-side">
+      <span class="invite-fine"><span data-copy-lang="es">PROGRAMA DE AFILIADOS</span><span data-copy-lang="en">AFFILIATE PROGRAM</span></span>
+      <div class="invite-language-switch" role="group" aria-label="Idioma / Language">
+        <button type="button" data-invite-language="es" aria-pressed="true">ES</button><button type="button" data-invite-language="en" aria-pressed="false">EN</button>
+      </div>
+      <span class="invite-pill"><i class="invite-dot"></i><span data-copy-lang="es">{% if lander_flow == 'invite' %}Invitación activa{% else %}Programa activo{% endif %}</span><span data-copy-lang="en">{% if lander_flow == 'invite' %}Active invitation{% else %}Active program{% endif %}</span></span>
+    </div>
+  </header>
+
+  {% if lander_flow == 'invite' %}<section class="invite-error-shell" data-invite-error>
+    <p class="invite-eyebrow"><span data-copy-lang="es">Invitación no disponible</span><span data-copy-lang="en">Invitation unavailable</span></p>
+    <h1><span data-copy-lang="es">No pudimos abrir este enlace.</span><span data-copy-lang="en">We couldn't open this link.</span></h1>
+    <p><span data-copy-lang="es">Pedile al Merchant una nueva invitación para participar en su programa de afiliados.</span><span data-copy-lang="en">Ask the Merchant for a new invitation to join their affiliate program.</span></p>
+    <p class="invite-status error" data-invite-error-status aria-live="polite"></p>
+  </section>{% endif %}
+
+  <div class="invite-hero invite-dynamic">
+    <section class="invite-copy">
+      <p class="invite-eyebrow"><span data-copy-lang="es" {% if lander_flow == 'invite' %}data-invite-eyebrow{% endif %}>{{ campaign.invite_eyebrow_es if campaign else 'Programa de afiliados · Valor por valor' }}</span><span data-copy-lang="en" {% if lander_flow == 'invite' %}data-invite-eyebrow{% endif %}>{{ campaign.invite_eyebrow_en if campaign else 'Affiliate program · Value for value' }}</span></p>
+      <h1 class="invite-title"><span data-copy-lang="es" {% if lander_flow == 'invite' %}data-invite-headline{% endif %}>{{ campaign.invite_headline_es if campaign else 'Recomendá valor. Ganá sats.' }}</span><span data-copy-lang="en" {% if lander_flow == 'invite' %}data-invite-headline{% endif %}>{{ campaign.invite_headline_en if campaign else 'Recommend value. Earn sats.' }}</span></h1>
+      <p class="invite-lede"><span data-copy-lang="es" {% if lander_flow == 'invite' %}data-invite-description{% endif %}>{{ campaign.invite_description_es if campaign else 'Estamos recuperando los detalles de tu invitación segura.' }}</span><span data-copy-lang="en" {% if lander_flow == 'invite' %}data-invite-description{% endif %}>{{ campaign.invite_description_en if campaign else 'We are retrieving your secure invitation details.' }}</span></p>
+      <div class="invite-value-row" aria-label="Cómo funciona / How it works">
+        <div class="invite-value"><strong><span data-copy-lang="es">01 · Creá tu link</span><span data-copy-lang="en">01 · Create your link</span></strong><span data-copy-lang="es">Personal, corto y listo para compartir.</span><span data-copy-lang="en">Personal, short and ready to share.</span></div>
+        <div class="invite-value"><strong><span data-copy-lang="es">02 · Recomendá</span><span data-copy-lang="en">02 · Recommend</span></strong><span data-copy-lang="es">Presentá la marca a las personas que confían en vos.</span><span data-copy-lang="en">Introduce the brand to people who trust you.</span></div>
+        <div class="invite-value"><strong><span data-copy-lang="es">03 · Ganá sats</span><span data-copy-lang="en">03 · Earn sats</span></strong><span data-copy-lang="es">Recibí una comisión cuando alguien compra.</span><span data-copy-lang="en">Earn a commission when someone buys.</span></div>
+      </div>
+    </section>
+
+    <aside class="invite-card">
+      <div class="invite-merchant">
+        {% if campaign and campaign.logo_url %}<img class="invite-merchant-logo" src="{{ campaign.logo_url }}" alt="" referrerpolicy="no-referrer" decoding="async">{% else %}<img class="invite-merchant-logo" data-invite-logo alt="" referrerpolicy="no-referrer" decoding="async" hidden>{% endif %}
+        <span class="invite-merchant-mark" {% if lander_flow == 'invite' %}data-invite-initials{% endif %}{% if campaign and campaign.logo_url %} hidden{% endif %}>{{ campaign.initials if campaign else '₿' }}</span>
+        <div><strong {% if lander_flow == 'invite' %}data-invite-merchant-name{% endif %}>{{ campaign.display_name if campaign else 'Merchant' }}</strong><small><span data-copy-lang="es" {% if lander_flow == 'invite' %}data-invite-tagline{% endif %}>{{ campaign.tagline_es if campaign else 'Comunidad, recomendaciones y sats' }}</span><span data-copy-lang="en" {% if lander_flow == 'invite' %}data-invite-tagline{% endif %}>{{ campaign.tagline_en if campaign else 'Community, recommendations and sats' }}</span></small></div>
+      </div>
+      <h2><span data-copy-lang="es">Convertí tus recomendaciones en sats.</span><span data-copy-lang="en">Turn your recommendations into sats.</span></h2>
+      <p><span data-copy-lang="es">Creá tu link personal y compartí los productos de <strong {% if lander_flow == 'invite' %}data-invite-merchant-name{% endif %}>{{ campaign.display_name if campaign else 'esta marca' }}</strong> con las personas que confían en vos.</span><span data-copy-lang="en">Create your personal link and share products from <strong {% if lander_flow == 'invite' %}data-invite-merchant-name{% endif %}>{{ campaign.display_name if campaign else 'this brand' }}</strong> with people who trust you.</span></p>
+      <div class="invite-reward">
+        <small><span data-copy-lang="es">Tu recompensa</span><span data-copy-lang="en">Your reward</span></small>
+        <div class="invite-reward-copy"><strong><span {% if lander_flow == 'invite' %}data-invite-commission{% endif %}>{{ campaign.commission_percent if campaign else '—' }}</span>% <span data-copy-lang="es">por venta</span><span data-copy-lang="en">per sale</span></strong><span><span data-copy-lang="es">pagado en sats</span><span data-copy-lang="en">paid in sats</span></span></div>
+      </div>
+      {% if lander_flow == 'invite' %}
+      <button class="invite-button" type="button" data-invite-accept data-sign-method="auto" hidden><span data-copy-lang="es">Crear mi link de afiliado</span><span data-copy-lang="en">Create my affiliate link</span> <span aria-hidden="true">→</span></button>
+      <button class="invite-alt-signer" type="button" data-invite-accept data-sign-method="nip46" hidden><span data-copy-lang="es">Usar otra app Nostr o QR</span><span data-copy-lang="en">Use another Nostr app or QR</span></button>
+      {% else %}
+      <button class="invite-button" type="button" data-join-method="auto"><span data-copy-lang="es">{% if campaign.enrollment_mode == 'open' %}Crear mi link de afiliado{% else %}Solicitar mi link de afiliado{% endif %}</span><span data-copy-lang="en">{% if campaign.enrollment_mode == 'open' %}Create my affiliate link{% else %}Request my affiliate link{% endif %}</span> <span aria-hidden="true">→</span></button>
+      <button class="invite-alt-signer" type="button" data-join-method="nip46"><span data-copy-lang="es">Usar otra app Nostr o QR</span><span data-copy-lang="en">Use another Nostr app or QR</span></button>
+      {% endif %}
+      <div class="invite-trust"><i></i><span><span data-copy-lang="es">Firmás con tu identidad Nostr. Nunca compartís tus claves privadas.</span><span data-copy-lang="en">You sign with your Nostr identity. Your private keys are never shared.</span></span></div>
+      <div class="invite-terms">
+        <span><span data-copy-lang="es">Ventana de atribución: <strong {% if lander_flow == 'invite' %}data-invite-window{% endif %}>{{ campaign.window_days if campaign else '—' }}</strong> días.</span><span data-copy-lang="en">Attribution window: <strong {% if lander_flow == 'invite' %}data-invite-window{% endif %}>{{ campaign.window_days if campaign else '—' }}</strong> days.</span></span>
+        {% if lander_flow == 'campaign' and campaign.terms_url %}<a href="{{ campaign.terms_url }}" target="_blank" rel="noopener noreferrer"><span data-copy-lang="es">Ver términos del programa</span><span data-copy-lang="en">View program terms</span></a>{% elif lander_flow == 'invite' %}<a href="#" data-invite-terms target="_blank" rel="noopener noreferrer" hidden><span data-copy-lang="es">Ver términos del programa</span><span data-copy-lang="en">View program terms</span></a>{% endif %}
+        <span><span data-copy-lang="es">Al continuar, aceptás las condiciones de este programa.</span><span data-copy-lang="en">By continuing, you accept this program's terms.</span></span>
+      </div>
+      <p class="invite-status" {% if lander_flow == 'invite' %}data-invite-status{% else %}data-join-status{% endif %} aria-live="polite"><span data-copy-lang="es">{% if lander_flow == 'invite' %}Validando la invitación…{% else %}Usá la identidad Nostr que querés asociar a este programa.{% endif %}</span><span data-copy-lang="en">{% if lander_flow == 'invite' %}Validating invitation…{% else %}Use the Nostr identity you want to associate with this program.{% endif %}</span></p>
+    </aside>
+  </div>
+</main>
+</body>
+</html>

@@ -290,7 +290,7 @@ def test_nip46_mobile_signer_assets_are_self_hosted_and_secret_safe(tmp_path, mo
     assert '/static/vendor/qrcode-generator-1.4.4.js' in login_page.text
     assert invite_page.status_code == 200
     assert 'id="nostr-connect-config"' in invite_page.text
-    assert '/static/nostr-connect.js?v=20260730-nip46-3' in invite_page.text
+    assert '/static/nostr-connect.js?v=20260803-invite-unified1' in invite_page.text
     assert connect_script.status_code == nip46_bundle.status_code == pure_bundle.status_code == qr_script.status_code == 200
     assert "createNostrConnectURI" in connect_script.text
     assert "BunkerSigner.fromURI" in connect_script.text
@@ -697,13 +697,19 @@ def test_invitation_resolve_uses_structured_merchant_brand_and_campaign_copy(tmp
     assert payload["merchant"] == {
         "display_name": "Lightning Koffee",
         "tagline": "Café, Bitcoin y comunidad",
+        "tagline_es": "Café, Bitcoin y comunidad",
+        "tagline_en": "Café, Bitcoin y comunidad",
         "logo_url": "https://lightningkoffee.io/logo.png",
         "initials": "LK",
     }
     assert payload["campaign"]["name"] == "Lightning Koffee Affiliate Program"
     assert payload["campaign"]["commission_percent"] == "8"
+    assert payload["campaign"]["window_days"] == 30
+    assert "terms_url" in payload["campaign"]
     assert payload["campaign"]["invite_eyebrow"] == "Programa de afiliados · Value for value"
     assert payload["campaign"]["invite_headline"] == "Recomendá café. Ganá sats."
+    assert payload["campaign"]["invite_headline_es"] == "Recomendá café. Ganá sats."
+    assert payload["campaign"]["invite_headline_en"] == "Recomendá café. Ganá sats."
     assert payload["campaign"]["invite_description"].startswith("Compartí Lightning Koffee")
 
 
@@ -719,9 +725,18 @@ def test_affiliate_accepts_invitation_with_nip07_and_gets_session(tmp_path, monk
 
     page = client.get("/invite")
     assert page.status_code == 200
+    assert "data-affiliate-lander" in page.text
+    assert 'data-invite-language="es"' in page.text
+    assert 'data-invite-language="en"' in page.text
+    assert page.text.count("data-invite-accept") == 2
+    assert 'data-sign-method="nip46"' in page.text
+    assert "Ventana de atribución" in page.text
+    assert "Attribution window" in page.text
+    assert "Crear mi link de afiliado" in page.text
+    assert "Create my affiliate link" in page.text
     assert token not in page.text
     assert "Meerat" not in page.text
-    assert "data-invite-window" not in page.text
+    assert page.text.count("data-invite-window") == 2
     assert "data-invite-merchant-name" in page.text
     assert "Crear mi link de afiliado" in page.text
     assert page.headers["cache-control"] == "no-store"
@@ -2628,8 +2643,15 @@ def test_open_campaign_join_requires_fresh_signed_challenge_and_creates_session(
 
     page = client.get(f"/campaigns/{campaign_id}/join?lang=en")
     assert page.status_code == 200
-    assert "Join now" in page.text
-    assert "/static/campaign-join.js?v=20260803-enrollment-modes1" in page.text
+    assert "data-affiliate-lander" in page.text
+    assert "Create my affiliate link" in page.text
+    assert 'data-invite-language="es"' in page.text
+    assert 'data-invite-language="en"' in page.text
+    assert 'data-join-method="auto"' in page.text
+    assert 'data-join-method="nip46"' in page.text
+    assert "Attribution window" in page.text
+    assert "By continuing, you accept this program's terms." in page.text
+    assert "/static/campaign-join.js?v=20260803-invite-unified1" in page.text
 
     challenge_response = client.post(
         f"/campaigns/{campaign_id}/join/challenge", headers={"Origin": "https://testserver"}, json={}
