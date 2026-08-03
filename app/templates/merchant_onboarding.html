@@ -48,7 +48,7 @@
     <section class="onboarding-step" data-onboarding-step="3" hidden>
       <div class="onboarding-step-head"><span class="step-number">03</span><div><p class="eyebrow">Conversión</p><h2>Prepará la invitación</h2><p>Personalizá el mensaje de inscripción. Si dejás el texto vacío, usamos una versión predeterminada basada en tu marca.</p></div></div>
       <div class="onboarding-fields two-columns">
-        <label class="field-wide"><span>Antetítulo</span><input name="invite_eyebrow" maxlength="100" value="Programa de afiliados · Valor por valor" placeholder="Programa de afiliados · Valor por valor"></label>
+        <label class="field-wide"><span>Antetítulo</span><input name="invite_eyebrow" maxlength="100" value="{% if language == 'en' %}Affiliate program · Value for value{% else %}Programa de afiliados · Valor por valor{% endif %}" placeholder="Programa de afiliados · Valor por valor"></label>
         <label class="field-wide"><span>Título principal</span><input name="invite_headline" maxlength="120" placeholder="Recomendá café. Ganá sats."></label>
         <label class="field-wide"><span>Descripción</span><textarea name="invite_description" maxlength="360" rows="5" placeholder="Sumate al programa de afiliados…"></textarea></label>
       </div>

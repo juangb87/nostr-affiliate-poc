@@ -22,7 +22,11 @@ function tr(message) {
     [/^(.+) no debe contener credenciales\.$/, "$1 must not contain credentials."],
     [/^(.+) contiene un host no válido\.$/, "$1 contains an invalid host."],
     [/^El pago con estado (.+) no se puede liquidar manualmente\.$/, "A payout in $1 state cannot be settled manually."],
-    [/^La inscripción del afiliado tiene el estado (.+)\.$/, "The affiliate enrollment is in $1 state."]
+    [/^La inscripción del afiliado tiene el estado (.+)\.$/, "The affiliate enrollment is in $1 state."],
+    [/^Invitación lista para (.+)\. Expira: (.+)\.$/, "Invitation ready for $1. Expires: $2."],
+    [/^Expira: (.+)$/, "Expires: $1"],
+    [/^Factura Lightning lista por ([\d.,]+) sats\. Generarlo no realiza el pago\.$/, "Lightning invoice for $1 sats is ready. Generating it does not make the payment."],
+    [/^La solicitud ya tiene el estado (.+)\.$/, "The application is already in the $1 state."]
   ];
   for (const [pattern, replacement] of patterns) {
     if (pattern.test(message)) return message.replace(pattern, replacement);
@@ -30,8 +34,17 @@ function tr(message) {
   return message;
 }
 
+const APP_LOCALE = document.documentElement.lang === "en" ? "en-US" : "es-AR";
+const formatAppNumber = (value) => new Intl.NumberFormat(APP_LOCALE).format(Number(value));
+const formatAppDateTime = (value) => new Intl.DateTimeFormat(APP_LOCALE, {
+  dateStyle: "medium",
+  timeStyle: "short"
+}).format(new Date(value));
+
 function translateUiNode(root) {
   if (!Object.keys(APP_I18N).length || !root) return;
+  const translationHost = root.nodeType === Node.TEXT_NODE ? root.parentElement : root;
+  if (translationHost?.closest?.("[data-i18n-ignore]")) return;
   if (root.nodeType === Node.TEXT_NODE) {
     const trimmed = root.nodeValue.trim();
     if (!trimmed) return;
@@ -362,17 +375,17 @@ document.addEventListener("click", async (event) => {
         throw new Error("El servidor devolvió una factura Lightning inválida");
       }
       panel.querySelector("[data-invoice-qr]").src = result.qr_data_uri;
-      panel.querySelector("[data-invoice-amount]").textContent = String(result.amount_sats);
+      panel.querySelector("[data-invoice-amount]").textContent = formatAppNumber(result.amount_sats);
       panel.querySelector("[data-invoice-destination]").textContent = result.lightning_address;
       panel.querySelector("[data-invoice-text]").textContent = result.invoice;
       const copyInvoice = panel.querySelector("[data-invoice-copy]");
       copyInvoice.dataset.copy = result.invoice;
       form.dataset.preparedPaymentHash = result.payment_hash;
       form.dataset.preparedExpiresAt = result.expires_at;
-      panel.querySelector("[data-invoice-expiry]").textContent = `Expira: ${new Date(expiresAt).toLocaleString()}`;
+      panel.querySelector("[data-invoice-expiry]").textContent = tr(`Expira: ${formatAppDateTime(expiresAt)}`);
       panel.hidden = false;
-      prepareInvoice.textContent = "Regenerar factura Lightning y QR";
-      status.textContent = `Factura Lightning lista por ${result.amount_sats} sats. Generarlo no realiza el pago.`;
+      prepareInvoice.textContent = tr("Regenerar factura Lightning y QR");
+      status.textContent = tr(`Factura Lightning lista por ${formatAppNumber(result.amount_sats)} sats. Generarlo no realiza el pago.`);
     } catch (error) {
       clearPreparedInvoice(form);
       status.textContent = readableError(error);
@@ -666,8 +679,8 @@ document.addEventListener("submit", async (event) => {
     link.textContent = safeUrl.href;
     copy.dataset.copy = safeUrl.href;
     resultBox.hidden = false;
-    const expiresAt = new Date(result.expires_at).toLocaleString();
-    status.textContent = `Invitación lista para ${result.campaign_name}. Expira: ${expiresAt}.`;
+    const expiresAt = formatAppDateTime(result.expires_at);
+    status.textContent = tr(`Invitación lista para ${result.campaign_name}. Expira: ${expiresAt}.`);
   } catch (error) {
     status.textContent = readableError(error);
     status.classList.add("error");

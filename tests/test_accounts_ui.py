@@ -603,7 +603,7 @@ def test_merchant_creates_hashed_single_use_invitation_for_owned_campaign(tmp_pa
 
     merchant_page = client.get("/app/merchant?view=affiliates")
     assert merchant_page.status_code == 200
-    assert '/static/app.js?v=20260803-enrollment-modes1' in merchant_page.text
+    assert '/static/app.js?v=20260803-merchant-i18n1' in merchant_page.text
     assert 'data-invite-origin="https://mrt.st"' in merchant_page.text
 
     invitation = create_invitation(client, campaign["campaign_id"])
@@ -1100,10 +1100,17 @@ def test_merchant_onboarding_page_keeps_campaignless_bound_tenant_eligible(tmp_p
     login(client, owner, "merchant")
 
     page = client.get("/app/merchant/onboarding", follow_redirects=False)
+    english = client.get("/app/merchant/onboarding?lang=en", follow_redirects=False)
 
     assert page.status_code == 200
     assert f'value="{campaignless.public_key().to_bech32()}"' in page.text
     assert f'value="{configured.public_key().to_bech32()}"' not in page.text
+    assert english.status_code == 200
+    assert "Set up your program." in english.text
+    assert "Who can join?" in english.text
+    assert 'value="Affiliate program · Value for value"' in english.text
+    assert "Configurá tu programa" not in english.text
+    assert "¿Quién puede sumarse?" not in english.text
 
 
 def test_merchant_onboarding_conflict_does_not_modify_profile(tmp_path, monkeypatch):
@@ -2521,6 +2528,95 @@ def test_authenticated_merchant_and_affiliate_views_render_in_english(tmp_path, 
     assert "My links" in affiliate_page.text
     assert ">Mis enlaces<" not in affiliate_page.text
     assert "Lightning Koffee" in affiliate_page.text
+
+
+def test_all_merchant_views_render_application_copy_in_english(tmp_path, monkeypatch):
+    from app.i18n import translate_html, translate_text
+    from html.parser import HTMLParser
+
+    class VisibleTextParser(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.hidden_depth = 0
+            self.parts = []
+
+        def handle_starttag(self, tag, attrs):
+            if tag in {"script", "style"}:
+                self.hidden_depth += 1
+
+        def handle_endtag(self, tag):
+            if tag in {"script", "style"} and self.hidden_depth:
+                self.hidden_depth -= 1
+
+        def handle_data(self, data):
+            if not self.hidden_depth and data.strip():
+                self.parts.append(data.strip())
+
+    client = configured_client(tmp_path, monkeypatch)
+    merchant = Keys.generate()
+    approved_affiliate = Keys.generate()
+    pending_affiliate = Keys.generate()
+    private_campaign = create_campaign(client, merchant, name="Privada", enrollment_mode="private")
+    approval_campaign = create_campaign(client, merchant, name="Approval Rewards", enrollment_mode="approval")
+    create_campaign(client, merchant, name="Open Rewards", enrollment_mode="open")
+    approved = create_enrollment(client, private_campaign["campaign_id"], approved_affiliate)
+    pending = create_enrollment(client, approval_campaign["campaign_id"], pending_affiliate)
+    with main.engine().begin() as connection:
+        connection.execute(
+            text("UPDATE enrollments SET status='pending' WHERE id=:id"),
+            {"id": pending["enrollment_id"]},
+        )
+    seed_payable_payout(private_campaign, approved, approved_affiliate, amount_sats=321)
+
+    monkeypatch.setenv("SHOPIFY_MERCHANT_PUBKEY", merchant.public_key().to_bech32())
+    login(client, merchant, "merchant")
+    pages = {
+        view: client.get(f"/app/merchant?view={view}&lang=en")
+        for view in ("overview", "campaigns", "affiliates", "activity", "payouts", "integration", "settings")
+    }
+    assert all(page.status_code == 200 for page in pages.values())
+
+    expected = {
+        "overview": ("Next actions", "Clicks, conversions, and commissions."),
+        "campaigns": ("Invitation only", "Save mode", "30-day attribution window"),
+        "affiliates": ("Pending applications", "Approved npubs linked to your programs.", "Approve", "Reject"),
+        "activity": ("Confirmed conversions and commissions.",),
+        "payouts": ("Generate Lightning invoice and QR", "Lightning evidence (64 hexadecimal characters)", "This records a merchant-signed declaration."),
+        "integration": ("Shopify orders/paid webhook", "Shopify theme script", "Create a pixel under"),
+        "settings": ("Public PNG, JPG, or WebP. If omitted, we use the initials.", "Join the affiliate program…"),
+    }
+    for view, phrases in expected.items():
+        for phrase in phrases:
+            assert phrase in pages[view].text, f"{view}: missing {phrase}"
+
+    forbidden = (
+        "Npubs aprobados y vinculados", "Solicitudes pendientes", "Revisá cada identidad",
+        "Guardar modo", "Solo invitación", "Requiere aprobación", "Inscripción abierta",
+        "ventana 30 días", "Conversiones y comisiones confirmadas", "Evidencia Lightning",
+        "Esto registra una declaración", "Webhook orders/paid de Shopify", "Recibiendo eventos",
+        "Creá un píxel", "Configurá este endpoint", "PNG, JPG o WebP público. Si falta",
+        "campañas", "afiliados", "comerciante", "Configuración", "Copiar", "Generar",
+        "Guardá", "dirección Lightning", "factura Lightning", "píxel", "invitación",
+        "solicitud", "pagos", "condiciones", "aprobados",
+    )
+    visible = {}
+    for view, page in pages.items():
+        parser = VisibleTextParser()
+        parser.feed(page.text)
+        visible[view] = " ".join(parser.parts)
+
+    for view, page_text in visible.items():
+        for phrase in forbidden:
+            assert phrase not in page_text, f"{view}: leaked Spanish copy {phrase}"
+
+    assert 'data-i18n-ignore>Privada</strong>' in pages["campaigns"].text
+    assert translate_html('<h3 data-i18n-ignore>Privada</h3><span>Privada</span>', "en") == '<h3 data-i18n-ignore>Privada</h3><span>Private</span>'
+    assert translate_text("1 webhook de orders/paid aprobado", "en") == "1 approved orders/paid webhook"
+    assert translate_text("2 webhooks de orders/paid aprobados", "en") == "2 approved orders/paid webhooks"
+    assert translate_text("1 pago requiere atención.", "en") == "1 payment needs attention."
+    assert translate_text("2 pagos requieren atención.", "en") == "2 payments need attention."
+    assert translate_text("1 eventos asociados a tus campañas.", "en") == "1 event associated with your campaigns."
+    assert translate_text("de 1 programas", "en") == "out of 1 program"
 
 
 def test_open_campaign_join_requires_fresh_signed_challenge_and_creates_session(tmp_path, monkeypatch):

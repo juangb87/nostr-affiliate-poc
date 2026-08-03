@@ -318,6 +318,85 @@ ES_TO_EN: dict[str, str] = {
     "Café, Bitcoin y comunidad": "Coffee, Bitcoin, and community",
 }
 
+# Merchant workspace coverage. Keep application-owned copy here; merchant-authored
+# names, taglines, destinations, and invitation text must remain untouched.
+ES_TO_EN.update({
+    "Clics, conversiones y comisiones.": "Clicks, conversions, and commissions.",
+    "Revisá destino y monto, pagá desde tu billetera y registrá la evidencia sin ceder custodia a Meerat.": "Review the destination and amount, pay from your wallet, and record the evidence without giving Meerat custody of funds.",
+    "Configurado; esperando el primer webhook orders/paid válido.": "Configured; waiting for the first valid orders/paid webhook.",
+    "No hay campañas privadas activas": "There are no active private campaigns",
+    "PNG, JPG o WebP público. Si falta, usamos las iniciales.": "Public PNG, JPG, or WebP. If omitted, we use the initials.",
+    "Sumate al programa de afiliados…": "Join the affiliate program…",
+    "Solo invitación": "Invitation only",
+    "Requiere aprobación": "Approval required",
+    "Inscripción abierta": "Open enrollment",
+    "Modo": "Mode",
+    "Privada": "Private",
+    "Con aprobación": "Approval required",
+    "Abierta": "Open",
+    "Guardar modo": "Save mode",
+    "Copiar inscripción": "Copy enrollment link",
+    "No hay campañas asociadas a esta cuenta de comerciante.": "There are no campaigns associated with this merchant account.",
+    "Solicitudes pendientes": "Pending applications",
+    "Revisá cada identidad antes de activar su enlace.": "Review each identity before activating its link.",
+    "Aprobar": "Approve",
+    "Rechazar": "Reject",
+    "Npubs aprobados y vinculados a tus programas.": "Approved npubs linked to your programs.",
+    "Conversiones y comisiones confirmadas.": "Confirmed conversions and commissions.",
+    "Preimagen (64 caracteres hexadecimales; se calcula el hash localmente)": "Preimage (64 hexadecimal characters; the hash is calculated locally)",
+    "Evidencia Lightning (64 caracteres hex)": "Lightning evidence (64 hexadecimal characters)",
+    "64 caracteres: 0-9 y a-f": "64 characters: 0-9 and a-f",
+    "No pegues el ID UUID de Strike. Para la factura generada arriba, usá “cargar el hash de la factura”.": "Do not paste the Strike UUID. For the invoice generated above, use “load invoice hash.”",
+    "Esto registra una declaración firmada del comerciante.": "This records a merchant-signed declaration.",
+    "Webhook orders/paid de Shopify": "Shopify orders/paid webhook",
+    "Recibiendo eventos": "Receiving events",
+    "El píxel registra evidencia del navegador. El webhook firmado sigue siendo la fuente autoritativa para comisiones y pagos.": "The pixel records browser evidence. The signed webhook remains the authoritative source for commissions and payments.",
+    "Tienda configurada:": "Configured store:",
+    "¿Quién puede sumarse?": "Who can join?",
+    "Privada · Solo con invitación": "Private · Invitation only",
+    "Compartís enlaces únicos y de un solo uso.": "You share unique, one-time links.",
+    "Con aprobación · Revisás cada solicitud": "Approval required · Review each application",
+    "La campaña es pública y vos aprobás cada Affiliate.": "The campaign is public, and you approve each affiliate.",
+    "Abierta · Inscripción inmediata": "Open · Immediate enrollment",
+    "Cualquier persona puede firmar con Nostr y sumarse.": "Anyone can sign with Nostr and join.",
+    "Podés cambiar el modo más adelante. Las inscripciones existentes no se modifican.": "You can change the mode later. Existing enrollments will not be changed.",
+    "Modo actualizado.": "Mode updated.",
+    "Affiliate aprobado.": "Affiliate approved.",
+    "Solicitud rechazada.": "Application rejected.",
+    "Creando programa y guardando su prueba Nostr…": "Creating program and saving its Nostr proof…",
+    "Guardando marca, programa e invitación…": "Saving brand, program, and invitation…",
+    "Programa listo. Abriendo tu resumen…": "Program ready. Opening your overview…",
+    "Programa creado. Cargando condiciones…": "Program created. Loading terms…",
+    "Guardando identidad de marca…": "Saving brand identity…",
+    "Guardando el texto de la invitación…": "Saving invitation copy…",
+    "Marca e invitación guardadas. Actualizando la vista…": "Brand and invitation saved. Refreshing the view…",
+    "Generando enlace privado de un solo uso…": "Generating a private one-time link…",
+    "El servidor devolvió un enlace inválido": "The server returned an invalid link.",
+    "Generá nuevamente la factura Lightning antes de registrar el pago.": "Generate the Lightning invoice again before recording the payment.",
+    "Esta factura Lightning expiró. Generá una nueva antes de pagar.": "This Lightning invoice has expired. Generate a new one before paying.",
+    "Hash de la factura cargado. Confirmá abajo únicamente si tu billetera mostró que el pago fue exitoso.": "Invoice hash loaded. Confirm below only if your wallet showed that the payment succeeded.",
+    "Resolviendo la dirección Lightning y generando la factura…": "Resolving the Lightning address and generating the invoice…",
+    "El servidor devolvió una factura Lightning inválida": "The server returned an invalid Lightning invoice.",
+    "Regenerar factura Lightning y QR": "Regenerate Lightning invoice and QR code",
+    "Ingresá el hash de pago Lightning: exactamente 64 caracteres hexadecimales, sin guiones. El ID UUID de Strike no es un hash de pago.": "Enter the Lightning payment hash: exactly 64 hexadecimal characters, without hyphens. A Strike UUID is not a payment hash.",
+    "Marcá la confirmación únicamente si tu billetera mostró que el pago fue exitoso.": "Check the confirmation only if your wallet showed that the payment succeeded.",
+    "Registrando atestación y publicando prueba…": "Recording attestation and publishing proof…",
+    "Pago registrado.": "Payment recorded.",
+    "No hay contenido para copiar": "There is no content to copy.",
+    "Copiado": "Copied",
+    "Contenido copiado": "Content copied",
+    "Copiá manualmente": "Copy manually",
+    "No se pudo copiar automáticamente": "Could not copy automatically",
+    "NostrKey no devolvió un evento firmado. Verificá que esté desbloqueado y aprobá la solicitud de firma.": "NostrKey did not return a signed event. Make sure it is unlocked and approve the signing request.",
+    "No se pudo cargar la conexión con la app Nostr. Recargá la página e intentá nuevamente.": "The Nostr app connection could not be loaded. Reload the page and try again.",
+    "La conexión con la app Nostr no está disponible.": "The Nostr app connection is unavailable.",
+    "Método de firma no válido.": "Invalid signing method.",
+    "Esta campaña usa una página pública de inscripción y no necesita invitaciones privadas.": "This campaign uses a public enrollment page and does not need private invitations.",
+    "No se encontró la solicitud.": "Application not found.",
+    "La solicitud fue modificada simultáneamente.": "The application was modified concurrently.",
+    "Cerrar": "Close",
+})
+
 
 # Error messages returned by /app APIs and rendered by the frontend.
 ES_TO_EN.update({'El afiliado todavía no configuró una dirección Lightning.': 'affiliate has not configured a Lightning '
@@ -355,7 +434,7 @@ ES_TO_EN.update({'El afiliado todavía no configuró una dirección Lightning.':
                                                                                'configuration is invalid',
  'La cuenta del afiliado no está activa.': 'affiliate account is not active',
  'La dirección Lightning no es válida.': 'invalid Lightning Address',
- 'La dirección Lightning no existe o no ofrece LNURL-pay.': 'La Lightning Address no existe o no ofrece '
+ 'La dirección Lightning no existe o no ofrece LNURL-pay.': 'The Lightning address does not exist or does not support '
                                                             'LNURL-pay.',
  'La factura BOLT11 es demasiado grande para mostrarla de forma segura.': 'BOLT11 invoice is too large to '
                                                                           'render safely',
@@ -392,8 +471,20 @@ ES_TO_EN.update({'El afiliado todavía no configuró una dirección Lightning.':
  'program_name es obligatorio.': 'program_name is required'})
 
 _DYNAMIC = [
-    (re.compile(r"^de (\d+) programas$"), r"out of \1 programs"),
-    (re.compile(r"^(\d+) eventos asociados a tus campañas\.$"), r"\1 events associated with your campaigns."),
+    (re.compile(r"^de (\d+) programas$"), lambda match: f"out of {match.group(1)} {'program' if match.group(1) == '1' else 'programs'}"),
+    (re.compile(r"^(\d+) eventos asociados a tus campañas\.$"), lambda match: f"{match.group(1)} {'event' if match.group(1) == '1' else 'events'} associated with your campaigns."),
+    (re.compile(r"^(\d+) webhooks? de orders/paid aprobados?$"), lambda match: f"{match.group(1)} approved orders/paid {'webhook' if match.group(1) == '1' else 'webhooks'}"),
+    (re.compile(r"^(\d+) pagos? requieren? atención\.$"), lambda match: f"{match.group(1)} {'payment needs' if match.group(1) == '1' else 'payments need'} attention."),
+    (re.compile(r"^(.+)% · ventana (.+) días$"), r"\1% · \2-day attribution window"),
+    (re.compile(r"^(\d+) pendientes?$"), r"\1 pending"),
+    (re.compile(r"^(\d+) total$"), r"Total: \1"),
+    (re.compile(r"^Liquidable después de (.+)$"), r"Payable after \1"),
+    (re.compile(r"^La factura Lightning se genera directamente desde (.+)\.$"), r"The Lightning invoice is generated directly from \1."),
+    (re.compile(r"^QR de la factura Lightning para (\d+) sats$"), r"Lightning invoice QR code for \1 sats"),
+    (re.compile(r"^Confirmo que pagué (\d+) sats a (.+)$"), r"I confirm that I paid \1 sats to \2"),
+    (re.compile(r"^(\d+) webhooks? orders/paid procesados?\.$"), lambda match: f"{match.group(1)} orders/paid {'webhook' if match.group(1) == '1' else 'webhooks'} processed."),
+    (re.compile(r"^Logo de (.+)$"), r"\1 logo"),
+    (re.compile(r"^La solicitud ya tiene el estado (.+)\.$"), r"The application is already in the \1 state."),
     (re.compile(r"^(\d+) sats pagados$"), r"\1 sats paid"),
     (re.compile(r"^(\d+) activos$"), r"\1 active links"),
     (re.compile(r"^(\d+) activo$"), r"\1 active link"),
@@ -432,21 +523,28 @@ def translate_text(value: str, language: str) -> str:
 class _HTMLTranslator(HTMLParser):
     _translated_attributes = {"aria-label", "placeholder", "title", "alt"}
     _raw_tags = {"script", "style", "code", "pre", "textarea"}
+    _void_tags = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
 
     def __init__(self, language: str):
         super().__init__(convert_charrefs=False)
         self.language = language
         self.parts: list[str] = []
         self.raw_depth = 0
+        self.ignore_stack: list[tuple[str, bool]] = []
 
     def handle_decl(self, decl: str) -> None:
         self.parts.append(f"<!{decl}>")
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         raw = self.get_starttag_text()
+        ignored = (self.ignore_stack[-1][1] if self.ignore_stack else False) or any(
+            name == "data-i18n-ignore" for name, _ in attrs
+        )
+        if tag not in self._void_tags:
+            self.ignore_stack.append((tag, ignored))
         if tag in self._raw_tags:
             self.raw_depth += 1
-        if not any(name in self._translated_attributes for name, _ in attrs):
+        if ignored or not any(name in self._translated_attributes for name, _ in attrs):
             self.parts.append(raw)
             return
         for name, value in attrs:
@@ -465,9 +563,12 @@ class _HTMLTranslator(HTMLParser):
         self.parts.append(f"</{tag}>")
         if tag in self._raw_tags:
             self.raw_depth = max(0, self.raw_depth - 1)
+        if self.ignore_stack and self.ignore_stack[-1][0] == tag:
+            self.ignore_stack.pop()
 
     def handle_data(self, data: str) -> None:
-        if self.raw_depth or not data.strip():
+        ignored = self.ignore_stack[-1][1] if self.ignore_stack else False
+        if ignored or self.raw_depth or not data.strip():
             self.parts.append(data)
             return
         leading = data[: len(data) - len(data.lstrip())]
