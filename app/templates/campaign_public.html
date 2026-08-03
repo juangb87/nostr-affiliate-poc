@@ -15,7 +15,7 @@
     </div>
   </div>
   <div class="hero-actions">
-    {% if campaign.enrollment_mode in ['open', 'approval'] %}<a class="button" href="/campaigns/{{ campaign.id }}/join"><span data-copy-lang="es">{% if campaign.enrollment_mode == 'open' %}Sumarme al programa{% else %}Solicitar acceso{% endif %}</span><span data-copy-lang="en">{% if campaign.enrollment_mode == 'open' %}Join the program{% else %}Request access{% endif %}</span></a>{% else %}<span class="badge neutral"><span data-copy-lang="es">Solo con invitación</span><span data-copy-lang="en">Invitation only</span></span>{% endif %}
+    {% if campaign.enrollment_mode in ['open', 'approval'] %}<a class="button" href="/c/{{ campaign.join_short_code }}"><span data-copy-lang="es">{% if campaign.enrollment_mode == 'open' %}Sumarme al programa{% else %}Solicitar acceso{% endif %}</span><span data-copy-lang="en">{% if campaign.enrollment_mode == 'open' %}Join the program{% else %}Request access{% endif %}</span></a>{% else %}<span class="badge neutral"><span data-copy-lang="es">Solo con invitación</span><span data-copy-lang="en">Invitation only</span></span>{% endif %}
     <a class="button secondary" href="{{ campaign.destination_url }}" rel="nofollow"><span data-copy-lang="es">Visitar tienda</span><span data-copy-lang="en">Visit store</span></a>
     <a class="button secondary" href="/app?role=merchant"><span data-copy-lang="es">Gestionar como Merchant</span><span data-copy-lang="en">Manage as Merchant</span></a>
     <a class="button secondary" href="/campaigns/{{ campaign.id }}/summary">JSON</a>

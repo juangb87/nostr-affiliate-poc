@@ -1,5 +1,6 @@
 import base64
 import json
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -2632,6 +2633,47 @@ def test_all_merchant_views_render_application_copy_in_english(tmp_path, monkeyp
     assert translate_text("2 pagos requieren atención.", "en") == "2 payments need attention."
     assert translate_text("1 eventos asociados a tus campañas.", "en") == "1 event associated with your campaigns."
     assert translate_text("de 1 programas", "en") == "out of 1 program"
+
+
+def test_campaign_join_shortlink_renders_same_landing_and_is_emitted_by_merchant_ui(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    merchant = Keys.generate()
+    campaign = create_campaign(client, merchant, enrollment_mode="open")
+    campaign_id = campaign["campaign_id"]
+    short_code = campaign_id.removeprefix("camp_")
+
+    short_page = client.get(f"/c/{short_code}?lang=en")
+    assert short_page.status_code == 200
+    assert "data-affiliate-lander" in short_page.text
+    assert f'data-campaign-id="{campaign_id}"' in short_page.text
+    assert "Create my affiliate link" in short_page.text
+
+    login(client, merchant, "merchant")
+    merchant_page = client.get("/app/merchant?view=campaigns")
+    assert merchant_page.status_code == 200
+    copy_values = re.findall(r'data-copy="([^"]+)"', merchant_page.text)
+    assert any(value.endswith(f"/c/{short_code}") for value in copy_values), copy_values
+    assert not any(value.endswith(f"/campaigns/{campaign_id}/join") for value in copy_values)
+
+    public_page = client.get(f"/campaigns/{campaign_id}/page")
+    assert public_page.status_code == 200
+    assert f'href="/c/{short_code}"' in public_page.text
+
+
+def test_default_campaign_ids_get_compact_stable_join_codes():
+    campaign_id = "camp_default_c19621bcad2c9d502618dfaf25a6be0fde23bd730e51889dc883376c91cca6c4"
+    assert main.campaign_join_short_code(campaign_id) == "c19621bcad2c"
+
+
+def test_campaign_join_shortlink_rejects_private_and_unknown_campaigns(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    merchant = Keys.generate()
+    campaign = create_campaign(client, merchant, enrollment_mode="private")
+    short_code = campaign["campaign_id"].removeprefix("camp_")
+
+    assert client.get(f"/c/{short_code}").status_code == 404
+    assert client.get("/c/not-a-real-campaign").status_code == 404
+    assert client.get("/c/%2Fetc").status_code == 404
 
 
 def test_open_campaign_join_requires_fresh_signed_challenge_and_creates_session(tmp_path, monkeypatch):

@@ -2283,6 +2283,7 @@ def public_campaign_directory_data() -> list[dict[str, Any]]:
     for campaign in campaigns:
         percent = Decimal(int(campaign["commission_bps"])) / Decimal(100)
         campaign["commission_percent"] = format(percent.normalize(), "f")
+        campaign["join_short_code"] = campaign_join_short_code(str(campaign["id"]))
         campaign["affiliates"] = int(campaign.get("affiliates") or 0)
         campaign["conversions"] = int(campaign.get("conversions") or 0)
         campaign["commission_sats"] = int(campaign.get("commission_sats") or 0)
@@ -5008,6 +5009,7 @@ def _short(value: Any, front: int = 12, back: int = 8) -> str:
 @app.get("/campaigns/{campaign_id}/page", response_class=HTMLResponse)
 def campaign_public_page(request: Request, campaign_id: str) -> Response:
     data = campaign_public_data(campaign_id)
+    data["campaign"]["join_short_code"] = campaign_join_short_code(str(data["campaign"]["id"]))
     return templates.TemplateResponse(
         request=request,
         name="campaign_public.html",
@@ -5443,6 +5445,8 @@ def merchant_account_page(request: Request, view: str = "overview") -> Response:
         detail = "La integración de Shopify todavía no está configurada para este comerciante."
     with engine().connect() as c:
         data = merchant_workspace_data(c, session, base_url=BASE_URL, shopify_ready=shopify_ready, shopify_detail=detail)
+    for campaign in data["campaigns"]:
+        campaign["join_short_code"] = campaign_join_short_code(str(campaign["id"]))
     if not data["totals"]["campaigns"]:
         return RedirectResponse("/app/merchant/onboarding", status_code=303)
     view_meta = {
@@ -6551,6 +6555,38 @@ def _affiliate_lander_presentation(campaign: dict[str, Any]) -> dict[str, str | 
     }
 
 
+def campaign_join_short_code(campaign_id: str) -> str:
+    raw = str(campaign_id or "")
+    if raw.startswith("camp_default_"):
+        suffix = raw.removeprefix("camp_default_")
+        return suffix[:12]
+    if raw.startswith("camp_"):
+        return raw.removeprefix("camp_")
+    raise ValueError("invalid campaign id")
+
+
+def _campaign_id_from_short_code(short_code: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{6,32}", short_code or ""):
+        raise HTTPException(404, "No se encontró la campaña.")
+    init_db()
+    with engine().connect() as c:
+        rows = c.execute(
+            text(
+                """
+                SELECT id FROM campaigns
+                WHERE id=:regular_id OR id LIKE :default_prefix
+                ORDER BY id
+                LIMIT 3
+                """
+            ),
+            {"regular_id": f"camp_{short_code}", "default_prefix": f"camp_default_{short_code}%"},
+        ).fetchall()
+    matches = [str(row._mapping["id"]) for row in rows if campaign_join_short_code(str(row._mapping["id"])) == short_code]
+    if len(matches) != 1:
+        raise HTTPException(404, "No se encontró la campaña.")
+    return matches[0]
+
+
 def _campaign_join_data(campaign_id: str) -> dict[str, Any]:
     init_db()
     with engine().connect() as c:
@@ -6573,14 +6609,23 @@ def _campaign_join_data(campaign_id: str) -> dict[str, Any]:
     return campaign
 
 
-@app.get("/campaigns/{campaign_id}/join", response_class=HTMLResponse)
-def campaign_join_page(request: Request, campaign_id: str) -> Response:
+def _render_campaign_join(request: Request, campaign_id: str) -> Response:
     return templates.TemplateResponse(
         request=request,
         name="affiliate_lander.html",
         context={"campaign": _campaign_join_data(campaign_id), "lander_flow": "campaign"},
         headers={"Cache-Control": "no-store", "Referrer-Policy": "same-origin"},
     )
+
+
+@app.get("/c/{short_code}", response_class=HTMLResponse)
+def campaign_join_short_page(request: Request, short_code: str) -> Response:
+    return _render_campaign_join(request, _campaign_id_from_short_code(short_code))
+
+
+@app.get("/campaigns/{campaign_id}/join", response_class=HTMLResponse)
+def campaign_join_page(request: Request, campaign_id: str) -> Response:
+    return _render_campaign_join(request, campaign_id)
 
 
 @app.post("/campaigns/{campaign_id}/join/challenge", tags=["Accounts"])

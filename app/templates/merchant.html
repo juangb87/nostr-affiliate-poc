@@ -84,7 +84,7 @@
       </div>
       <footer class="campaign-card__actions">
         <a class="action campaign-card__secondary-action" href="/campaigns/{{ campaign.id }}/page">Página pública</a>
-        {% if campaign.enrollment_mode != 'private' %}<button class="action" type="button" data-copy="{{ request.base_url }}campaigns/{{ campaign.id }}/join">Copiar inscripción</button>{% endif %}
+        {% if campaign.enrollment_mode != 'private' %}<button class="action" type="button" data-copy="{{ request.base_url }}c/{{ campaign.join_short_code }}">Copiar inscripción</button>{% endif %}
       </footer>
     </article>
   {% else %}<div class="empty">No hay campañas asociadas a esta cuenta de comerciante.</div>{% endfor %}
