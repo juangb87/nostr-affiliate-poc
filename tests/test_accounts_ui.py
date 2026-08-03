@@ -2578,7 +2578,7 @@ def test_all_merchant_views_render_application_copy_in_english(tmp_path, monkeyp
 
     expected = {
         "overview": ("Next actions", "Clicks, conversions, and commissions."),
-        "campaigns": ("Invitation only", "Save mode", "Commission (%)", "Save commission", "Applies to conversions recorded from now on", "Existing conversions and payouts will not change.", "30-day attribution window"),
+        "campaigns": ("Invitation only", "Save mode", "Commission (%)", "Save commission", "30-day attribution window"),
         "affiliates": ("Pending applications", "Approved npubs linked to your programs.", "Approve", "Reject"),
         "activity": ("Confirmed conversions and commissions.",),
         "payouts": ("Generate Lightning invoice and QR", "Lightning evidence (64 hexadecimal characters)", "This records a merchant-signed declaration."),
@@ -2780,8 +2780,8 @@ def test_merchant_can_update_commission_and_only_future_conversions_use_it(tmp_p
     assert 'value="12.5"' in page.text
     assert "Commission (%)" in page.text
     assert "Save commission" in page.text
-    assert "Applies to conversions recorded from now on" in page.text
-    assert "Existing conversions and payouts will not change." in page.text
+    assert "Applies to conversions recorded from now on" not in page.text
+    assert "Existing conversions and payouts will not change." not in page.text
 
 
 def test_commission_change_serializes_with_conversion_ingestion(tmp_path, monkeypatch):

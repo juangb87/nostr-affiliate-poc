@@ -337,7 +337,6 @@ ES_TO_EN.update({
     "Guardar modo": "Save mode",
     "Comisión (%)": "Commission (%)",
     "Guardar comisión": "Save commission",
-    "Aplica a conversiones registradas desde ahora, incluso pedidos o clics anteriores aún no procesados. Las conversiones y pagos existentes no cambian.": "Applies to conversions recorded from now on, including earlier orders or clicks that have not been processed yet. Existing conversions and payouts will not change.",
     "Comisión actualizada.": "Commission updated.",
     "Copiar inscripción": "Copy enrollment link",
     "No hay campañas asociadas a esta cuenta de comerciante.": "There are no campaigns associated with this merchant account.",
