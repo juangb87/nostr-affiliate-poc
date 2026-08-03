@@ -42,7 +42,7 @@ def signed_login_event(keys: Keys, challenge: dict, *, role: str | None = None, 
     return json.loads(event.as_json())
 
 
-def create_campaign(client: TestClient, merchant: Keys, *, name: str = "Merchant campaign") -> dict:
+def create_campaign(client: TestClient, merchant: Keys, *, name: str = "Merchant campaign", enrollment_mode: str = "private") -> dict:
     response = client.post(
         "/campaigns",
         json={
@@ -51,6 +51,7 @@ def create_campaign(client: TestClient, merchant: Keys, *, name: str = "Merchant
             "commission_bps": 800,
             "attribution_window_days": 30,
             "destination_url": "https://merchant.example/shop",
+            "enrollment_mode": enrollment_mode,
         },
     )
     assert response.status_code == 200, response.text
@@ -602,7 +603,7 @@ def test_merchant_creates_hashed_single_use_invitation_for_owned_campaign(tmp_pa
 
     merchant_page = client.get("/app/merchant?view=affiliates")
     assert merchant_page.status_code == 200
-    assert '/static/app.js?v=20260730-app-i18n1' in merchant_page.text
+    assert '/static/app.js?v=20260803-enrollment-modes1' in merchant_page.text
     assert 'data-invite-origin="https://mrt.st"' in merchant_page.text
 
     invitation = create_invitation(client, campaign["campaign_id"])
@@ -2520,3 +2521,172 @@ def test_authenticated_merchant_and_affiliate_views_render_in_english(tmp_path, 
     assert "My links" in affiliate_page.text
     assert ">Mis enlaces<" not in affiliate_page.text
     assert "Lightning Koffee" in affiliate_page.text
+
+
+def test_open_campaign_join_requires_fresh_signed_challenge_and_creates_session(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    merchant = Keys.generate()
+    affiliate = Keys.generate()
+    campaign = create_campaign(client, merchant, enrollment_mode="open")
+    campaign_id = campaign["campaign_id"]
+
+    page = client.get(f"/campaigns/{campaign_id}/join?lang=en")
+    assert page.status_code == 200
+    assert "Join now" in page.text
+    assert "/static/campaign-join.js?v=20260803-enrollment-modes1" in page.text
+
+    challenge_response = client.post(
+        f"/campaigns/{campaign_id}/join/challenge", headers={"Origin": "https://testserver"}, json={}
+    )
+    assert challenge_response.status_code == 200
+    challenge = challenge_response.json()
+    assert challenge["role"] == f"campaign_join:{campaign_id}"
+    event = signed_login_event(affiliate, challenge)
+
+    joined = client.post(
+        f"/campaigns/{campaign_id}/join",
+        headers={"Origin": "https://testserver"},
+        json={"event": event},
+    )
+    assert joined.status_code == 200, joined.text
+    assert joined.json()["status"] == "approved"
+    assert joined.json()["ref_url"].endswith(joined.json()["ref_code"])
+    assert "meerat_session=" in joined.headers["set-cookie"]
+    assert client.get("/auth/me").json()["account"]["role"] == "affiliate"
+
+    replay = client.post(
+        f"/campaigns/{campaign_id}/join",
+        headers={"Origin": "https://testserver"},
+        json={"event": event},
+    )
+    assert replay.status_code == 409
+
+
+def test_approval_campaign_stays_pending_until_merchant_decides(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    merchant = Keys.generate()
+    affiliate = Keys.generate()
+    campaign = create_campaign(client, merchant, enrollment_mode="approval")
+    campaign_id = campaign["campaign_id"]
+    challenge = client.post(
+        f"/campaigns/{campaign_id}/join/challenge", headers={"Origin": "https://testserver"}, json={}
+    ).json()
+
+    requested = client.post(
+        f"/campaigns/{campaign_id}/join",
+        headers={"Origin": "https://testserver"},
+        json={"event": signed_login_event(affiliate, challenge)},
+    )
+    assert requested.status_code == 202, requested.text
+    enrollment_id = requested.json()["enrollment_id"]
+    assert requested.json()["status"] == "pending"
+    assert "meerat_session=" not in requested.headers.get("set-cookie", "")
+
+    login(client, merchant, "merchant")
+    queue = client.get("/app/merchant?view=affiliates")
+    assert queue.status_code == 200
+    assert "Solicitudes pendientes" in queue.text
+    assert affiliate.public_key().to_bech32() in queue.text
+
+    approved = client.post(
+        f"/app/merchant/enrollments/{enrollment_id}/decision",
+        headers={"Origin": "https://testserver"},
+        json={"status": "approved"},
+    )
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["status"] == "approved"
+    with main.engine().begin() as connection:
+        row = connection.execute(
+            text("SELECT status, nostr_event_json FROM enrollments WHERE id=:id"), {"id": enrollment_id}
+        ).mappings().one()
+    assert row["status"] == "approved"
+    assert ["status", "approved"] in json.loads(row["nostr_event_json"])["tags"]
+
+
+def test_private_campaign_rejects_public_join_and_non_owner_cannot_change_mode(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    owner = Keys.generate()
+    stranger = Keys.generate()
+    campaign = create_campaign(client, owner, enrollment_mode="private")
+    campaign_id = campaign["campaign_id"]
+
+    assert client.get(f"/campaigns/{campaign_id}/join").status_code == 404
+    assert client.post(
+        f"/campaigns/{campaign_id}/join/challenge", headers={"Origin": "https://testserver"}, json={}
+    ).status_code == 404
+
+    create_campaign(client, stranger, name="Stranger campaign")
+    login(client, stranger, "merchant")
+    denied = client.put(
+        f"/app/merchant/campaigns/{campaign_id}/enrollment-mode",
+        headers={"Origin": "https://testserver"},
+        json={"enrollment_mode": "open"},
+    )
+    assert denied.status_code == 404
+
+
+def test_switching_private_campaign_revokes_old_invitations(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    merchant = Keys.generate()
+    campaign = create_campaign(client, merchant, enrollment_mode="private")
+    campaign_id = campaign["campaign_id"]
+    login(client, merchant, "merchant")
+    invitation = create_invitation(client, campaign_id)
+    token = invitation["invite_url"].split("#token=", 1)[1]
+
+    changed = client.put(
+        f"/app/merchant/campaigns/{campaign_id}/enrollment-mode",
+        headers={"Origin": "https://testserver"},
+        json={"enrollment_mode": "approval"},
+    )
+    assert changed.status_code == 200, changed.text
+    resolved = client.post(
+        "/invite/resolve",
+        headers={"Origin": "https://testserver"},
+        json={"token": token},
+    )
+    assert resolved.status_code == 409
+    with main.engine().connect() as connection:
+        status = connection.execute(
+            text("SELECT status FROM affiliate_invitations WHERE id=:id"),
+            {"id": invitation["invitation_id"]},
+        ).scalar_one()
+    assert status == "revoked"
+
+
+def test_open_enrollment_outbox_survives_post_commit_publication_gap(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    merchant = Keys.generate()
+    affiliate = Keys.generate()
+    campaign = create_campaign(client, merchant, enrollment_mode="open")
+    campaign_id = campaign["campaign_id"]
+    challenge = client.post(
+        f"/campaigns/{campaign_id}/join/challenge",
+        headers={"Origin": "https://testserver"},
+        json={},
+    ).json()
+    real_finalize = main.finalize_committed_nostr_event
+    monkeypatch.setattr(main, "finalize_committed_nostr_event", lambda *_args, **_kwargs: [])
+
+    joined = client.post(
+        f"/campaigns/{campaign_id}/join",
+        headers={"Origin": "https://testserver"},
+        json={"event": signed_login_event(affiliate, challenge)},
+    )
+    assert joined.status_code == 200, joined.text
+    enrollment_id = joined.json()["enrollment_id"]
+    with main.engine().connect() as connection:
+        relay_status = connection.execute(
+            text("SELECT relay_status FROM nostr_events WHERE entity_type='enrollment' AND entity_id=:id"),
+            {"id": enrollment_id},
+        ).scalar_one()
+    assert relay_status == "pending_publication"
+
+    monkeypatch.setattr(main, "finalize_committed_nostr_event", real_finalize)
+    main.retry_pending_nostr_outbox()
+    with main.engine().connect() as connection:
+        recovered = connection.execute(
+            text("SELECT relay_status FROM nostr_events WHERE entity_type='enrollment' AND entity_id=:id"),
+            {"id": enrollment_id},
+        ).scalar_one()
+    assert recovered == "skipped"

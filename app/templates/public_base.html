@@ -9,8 +9,9 @@
   <link rel="icon" href="/static/brand/favicon.svg?v=salvia-8a1" type="image/svg+xml">
   <link rel="preload" href="/static/fonts/space-grotesk-latin.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="preload" href="/static/fonts/dm-mono-regular-latin.woff2" as="font" type="font/woff2" crossorigin>
-  <link rel="stylesheet" href="/static/public.css?v=20260730-campaign-directory1">
-  <script src="/static/public.js?v=20260730-campaign-directory1" defer></script>
+  <link rel="stylesheet" href="/static/public.css?v=20260803-enrollment-modes1">
+  <script src="/static/public.js?v=20260803-enrollment-modes1" defer></script>
+  {% block head_extra %}{% endblock %}
 </head>
 <body class="public-page {% block body_class %}{% endblock %}" {% block body_attrs %}{% endblock %} data-title-es="{% block title_es %}Meerat · Evidencia pública{% endblock %}" data-title-en="{% block title_en %}Meerat · Public evidence{% endblock %}">
   <a class="skip-link" href="#main-content"><span data-copy-lang="es">Saltar al contenido</span><span data-copy-lang="en">Skip to content</span></a>

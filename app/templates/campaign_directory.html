@@ -41,7 +41,7 @@
             <h3 id="campaign-{{ campaign.id }}-title">{{ campaign.name }}</h3>
           </div>
         </div>
-        <span class="badge success"><span data-copy-lang="es">Activa</span><span data-copy-lang="en">Active</span></span>
+        <span class="badge success"><span data-copy-lang="es">{% if campaign.enrollment_mode == 'open' %}Abierta{% elif campaign.enrollment_mode == 'approval' %}Con aprobación{% else %}Solo invitación{% endif %}</span><span data-copy-lang="en">{% if campaign.enrollment_mode == 'open' %}Open{% elif campaign.enrollment_mode == 'approval' %}Approval required{% else %}Invitation only{% endif %}</span></span>
       </div>
 
       {% if campaign.tagline or campaign.invite_description or campaign.invite_headline %}
@@ -58,9 +58,9 @@
 
       <div class="actions">
         <a class="button" href="/campaigns/{{ campaign.id }}/page" aria-label="Ver campaña {{ campaign.name }}" data-label-es="Ver campaña {{ campaign.name }}" data-label-en="View campaign {{ campaign.name }}"><span data-copy-lang="es">Ver campaña</span><span data-copy-lang="en">View campaign</span></a>
-        <a class="button secondary" href="/app?role=affiliate" aria-label="Entrar como Affiliate para {{ campaign.name }}" data-label-es="Entrar como Affiliate para {{ campaign.name }}" data-label-en="Enter as an Affiliate for {{ campaign.name }}"><span data-copy-lang="es">Soy Affiliate</span><span data-copy-lang="en">I'm an Affiliate</span></a>
+        {% if campaign.enrollment_mode != 'private' %}<a class="button secondary" href="/campaigns/{{ campaign.id }}/join" aria-label="Sumarse a {{ campaign.name }}" data-label-es="Sumarse a {{ campaign.name }}" data-label-en="Join {{ campaign.name }}"><span data-copy-lang="es">{% if campaign.enrollment_mode == 'open' %}Sumarme{% else %}Solicitar acceso{% endif %}</span><span data-copy-lang="en">{% if campaign.enrollment_mode == 'open' %}Join now{% else %}Request access{% endif %}</span></a>{% endif %}
       </div>
-      <p class="notice"><span data-copy-lang="es">La inscripción requiere una invitación del Merchant y tu firma Nostr.</span><span data-copy-lang="en">Enrollment requires a Merchant invitation and your Nostr signature.</span></p>
+      <p class="notice"><span data-copy-lang="es">{% if campaign.enrollment_mode == 'open' %}Inscripción inmediata con tu identidad Nostr.{% elif campaign.enrollment_mode == 'approval' %}El Merchant revisará tu solicitud firmada.{% else %}La inscripción requiere una invitación privada del Merchant.{% endif %}</span><span data-copy-lang="en">{% if campaign.enrollment_mode == 'open' %}Join instantly with your Nostr identity.{% elif campaign.enrollment_mode == 'approval' %}The Merchant will review your signed request.{% else %}Enrollment requires a private Merchant invitation.{% endif %}</span></p>
     </article>
     {% endfor %}
   </div>

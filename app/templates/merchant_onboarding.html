@@ -35,6 +35,12 @@
         <label><span>Ventana de atribución (días)</span><input name="attribution_window_days" type="number" min="1" max="365" step="1" value="{{ program_defaults.window_days }}" required inputmode="numeric"><small>Se aplica internamente; no aparece en el encabezado destacado de la invitación.</small></label>
         <label class="field-wide"><span>URL de destino</span><input name="destination_url" type="url" maxlength="3000" value="{{ program_defaults.destination_url }}" required placeholder="https://tienda.example/"></label>
         <label class="field-wide"><span>URL de términos</span><input name="terms_url" type="url" maxlength="3000" value="{{ program_defaults.terms_url }}" required placeholder="https://tienda.example/terminos-afiliados"></label>
+        <fieldset class="field-wide enrollment-mode-picker"><legend>¿Quién puede sumarse?</legend>
+          <label><input type="radio" name="enrollment_mode" value="private" checked><span><strong>Privada · Solo con invitación</strong><small>Compartís enlaces únicos y de un solo uso.</small></span></label>
+          <label><input type="radio" name="enrollment_mode" value="approval"><span><strong>Con aprobación · Revisás cada solicitud</strong><small>La campaña es pública y vos aprobás cada Affiliate.</small></span></label>
+          <label><input type="radio" name="enrollment_mode" value="open"><span><strong>Abierta · Inscripción inmediata</strong><small>Cualquier persona puede firmar con Nostr y sumarse.</small></span></label>
+          <small>Podés cambiar el modo más adelante. Las inscripciones existentes no se modifican.</small>
+        </fieldset>
       </div>
       <div class="onboarding-actions"><button class="button secondary" type="button" data-wizard-back>← Volver</button><button class="button" type="button" data-wizard-next>Continuar a la invitación →</button></div>
     </section>

@@ -449,6 +449,35 @@ document.addEventListener("click", (event) => {
 document.querySelectorAll("[data-merchant-onboarding-wizard]").forEach((form) => setMerchantOnboardingStep(form, 1));
 
 document.addEventListener("submit", async (event) => {
+  const modeForm = event.target.closest("[data-enrollment-mode]");
+  if (modeForm) {
+    event.preventDefault();
+    const status = modeForm.querySelector("[data-mode-status]");
+    const button = modeForm.querySelector("button[type='submit']");
+    button.disabled = true;
+    try {
+      await jsonFetch(`/app/merchant/campaigns/${encodeURIComponent(modeForm.dataset.enrollmentMode)}/enrollment-mode`, {method: "PUT", body: JSON.stringify({enrollment_mode: new FormData(modeForm).get("enrollment_mode")})});
+      status.textContent = "Modo actualizado.";
+      window.location.reload();
+    } catch (error) { status.textContent = readableError(error); status.classList.add("error"); button.disabled = false; }
+    return;
+  }
+
+  const decisionForm = event.target.closest("[data-enrollment-decision]");
+  if (decisionForm) {
+    event.preventDefault();
+    const status = decisionForm.querySelector("[data-decision-status]");
+    const buttons = [...decisionForm.querySelectorAll("button")];
+    const decision = event.submitter?.value;
+    buttons.forEach((button) => { button.disabled = true; });
+    try {
+      await jsonFetch(`/app/merchant/enrollments/${encodeURIComponent(decisionForm.dataset.enrollmentDecision)}/decision`, {method: "POST", body: JSON.stringify({status: decision})});
+      status.textContent = decision === "approved" ? "Affiliate aprobado." : "Solicitud rechazada.";
+      window.location.reload();
+    } catch (error) { status.textContent = readableError(error); status.classList.add("error"); buttons.forEach((button) => { button.disabled = false; }); }
+    return;
+  }
+
   const bootstrapForm = event.target.closest("[data-merchant-bootstrap]");
   if (bootstrapForm) {
     event.preventDefault();
@@ -473,7 +502,8 @@ document.addEventListener("submit", async (event) => {
       attribution_window_days: Number(fields.get("attribution_window_days") || 0),
       destination_url: String(fields.get("destination_url") || "").trim(),
       terms_url: String(fields.get("terms_url") || "").trim(),
-      logo_url: String(fields.get("logo_url") || "").trim() || null
+      logo_url: String(fields.get("logo_url") || "").trim() || null,
+      enrollment_mode: String(fields.get("enrollment_mode") || "private")
     };
     if (isOnboarding) {
       Object.assign(payload, {

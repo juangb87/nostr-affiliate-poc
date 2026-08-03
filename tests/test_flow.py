@@ -12,8 +12,8 @@ app = main.app
 
 def assert_meerat_public_shell(response, expected_role_link: str) -> None:
     assert response.status_code == 200
-    assert '/static/public.css?v=20260730-campaign-directory1' in response.text
-    assert '/static/public.js?v=20260730-campaign-directory1' in response.text
+    assert '/static/public.css?v=20260803-enrollment-modes1' in response.text
+    assert '/static/public.js?v=20260803-enrollment-modes1' in response.text
     assert '/static/brand/wordmark-night.png' in response.text
     assert '/static/brand/wordmark-arena.png' in response.text
     assert expected_role_link in response.text

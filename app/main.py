@@ -18,7 +18,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from app.nostr_kinds import (
     CAMPAIGN_KIND,
@@ -106,6 +106,7 @@ _INVITATION_ACCEPT_LOCK = threading.Lock()
 _INVOICE_PREPARE_LOCK = threading.Lock()
 _INVOICE_PREPARE_LAST: dict[str, float] = {}
 _INVOICE_PREPARE_ACTIVE: set[str] = set()
+CAMPAIGN_ENROLLMENT_MODES = {"private", "approval", "open"}
 
 app = FastAPI(
     title="Nostr Affiliate POC",
@@ -615,6 +616,7 @@ def build_campaign_event(campaign: dict[str, Any], terms_url: Optional[str] = No
             ["p", merchant_hex, "", "merchant"],
             ["campaign", campaign["id"]],
             ["status", campaign.get("status") or "active"],
+            ["enrollment_mode", campaign.get("enrollment_mode") or "private"],
             ["state_revision", str(time.time_ns())],
             ["commission_bps", str(campaign["commission_bps"])],
             ["window_days", str(campaign["window_days"])],
@@ -697,7 +699,7 @@ def publish_event(event_json: dict[str, Any]) -> list[dict[str, str]]:
 def persist_nostr_event(c: Any, event: dict[str, Any], entity_type: str, entity_id: str, relay_results: list[dict[str, str]]) -> None:
     published_count = sum(1 for r in relay_results if r["status"] == "published")
     retryable_failure = (
-        entity_type in {"conversion", "campaign"}
+        entity_type in {"conversion", "campaign", "enrollment"}
         and not published_count
         and any(r["status"] == "failed" for r in relay_results)
     )
@@ -705,7 +707,7 @@ def persist_nostr_event(c: Any, event: dict[str, Any], entity_type: str, entity_
         "published" if published_count
         else "pending_publication" if retryable_failure
         else relay_results[0]["status"] if relay_results
-        else "pending_publication" if entity_type in {"conversion", "campaign"}
+        else "pending_publication" if entity_type in {"conversion", "campaign", "enrollment"}
         else "unknown"
     )
     event["relay_status"] = relay_status
@@ -714,9 +716,9 @@ def persist_nostr_event(c: Any, event: dict[str, Any], entity_type: str, entity_
         text(
             """
             INSERT INTO nostr_events (event_id, kind, pubkey, content, tags_json, event_json,
-            entity_type, entity_id, relay_status, created_at, published_at)
+            entity_type, entity_id, relay_status, created_at, updated_at, published_at)
             VALUES (:event_id, :kind, :pubkey, :content, :tags_json, :event_json,
-            :entity_type, :entity_id, :relay_status, :created_at, :published_at)
+            :entity_type, :entity_id, :relay_status, :created_at, :updated_at, :published_at)
             ON CONFLICT(event_id) DO UPDATE SET
                 event_json=CASE
                     WHEN nostr_events.relay_status='published' AND excluded.relay_status<>'published'
@@ -724,6 +726,7 @@ def persist_nostr_event(c: Any, event: dict[str, Any], entity_type: str, entity_
                 relay_status=CASE
                     WHEN nostr_events.relay_status='published' AND excluded.relay_status<>'published'
                     THEN nostr_events.relay_status ELSE excluded.relay_status END,
+                updated_at=excluded.updated_at,
                 published_at=COALESCE(excluded.published_at, nostr_events.published_at)
             """
         ),
@@ -738,6 +741,7 @@ def persist_nostr_event(c: Any, event: dict[str, Any], entity_type: str, entity_
             "entity_id": entity_id,
             "relay_status": relay_status,
             "created_at": now(),
+            "updated_at": now(),
             "published_at": now() if published_count else None,
         },
     )
@@ -845,6 +849,22 @@ def _finalize_committed_nostr_event_unlocked(
                     "event_json": json.dumps(event),
                 },
             )
+        elif entity_type == "enrollment":
+            c.execute(
+                text("""
+                    UPDATE enrollments SET nostr_event_json=:event_json
+                    WHERE id=:id AND nostr_event_id=:event_id AND EXISTS (
+                        SELECT 1 FROM nostr_events
+                        WHERE event_id=:event_id AND relay_status=:relay_status
+                    )
+                """),
+                {
+                    "id": entity_id,
+                    "event_id": event["id"],
+                    "relay_status": event["relay_status"],
+                    "event_json": json.dumps(event),
+                },
+            )
 
     try:
         if publication_connection is not None:
@@ -923,6 +943,38 @@ def retry_conversion_outbox(conversion_id: str) -> None:
             logger.exception("invalid pending Nostr outbox event for %s %s", row["entity_type"], row["entity_id"])
 
 
+def retry_pending_nostr_outbox(batch_limit: int = 50, max_batches: int = 20) -> None:
+    """Best-effort recovery for committed campaign, conversion, and enrollment proofs."""
+    try:
+        for _ in range(max_batches):
+            with engine().connect() as c:
+                rows = [dict(row._mapping) for row in c.execute(text("""
+                    SELECT event_json, entity_type, entity_id
+                    FROM nostr_events
+                    WHERE relay_status IN ('pending_publication', 'skipped')
+                      AND entity_type IN ('campaign', 'conversion', 'enrollment')
+                    ORDER BY updated_at, created_at
+                    LIMIT :limit
+                """), {"limit": batch_limit}).fetchall()]
+            for row in rows:
+                try:
+                    pending_event = json.loads(row["event_json"])
+                    finalize_committed_nostr_event(pending_event, row["entity_type"], row["entity_id"])
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    logger.exception("invalid pending Nostr outbox event for %s %s", row["entity_type"], row["entity_id"])
+            if len(rows) < batch_limit:
+                break
+    except Exception:
+        logger.exception("failed to retry pending Nostr outbox events")
+
+
+def nostr_outbox_retry_worker() -> None:
+    interval = max(5, int(os.getenv("NOSTR_OUTBOX_RETRY_SECONDS", "60")))
+    while True:
+        retry_pending_nostr_outbox()
+        time.sleep(interval)
+
+
 def _init_db_unlocked() -> None:
     ddl = """
     CREATE TABLE IF NOT EXISTS campaigns (
@@ -938,6 +990,7 @@ def _init_db_unlocked() -> None:
         invite_eyebrow TEXT,
         invite_headline TEXT,
         invite_description TEXT,
+        enrollment_mode TEXT NOT NULL DEFAULT 'private',
         status TEXT NOT NULL DEFAULT 'active',
         archived_at TEXT,
         nostr_event_id TEXT NOT NULL,
@@ -1125,6 +1178,7 @@ def _init_db_unlocked() -> None:
         entity_id TEXT NOT NULL,
         relay_status TEXT NOT NULL,
         created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
         published_at TEXT
     );
     CREATE TABLE IF NOT EXISTS nostr_event_relays (
@@ -1224,6 +1278,8 @@ def _init_db_unlocked() -> None:
             c.execute(text("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS invite_eyebrow TEXT"))
             c.execute(text("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS invite_headline TEXT"))
             c.execute(text("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS invite_description TEXT"))
+            c.execute(text("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS enrollment_mode TEXT NOT NULL DEFAULT 'private'"))
+            c.execute(text("ALTER TABLE nostr_events ADD COLUMN IF NOT EXISTS updated_at TEXT"))
             c.execute(text("ALTER TABLE merchant_profiles ADD COLUMN IF NOT EXISTS display_name TEXT"))
             c.execute(text("ALTER TABLE merchant_profiles ADD COLUMN IF NOT EXISTS tagline TEXT"))
             c.execute(text("ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS affiliate_pubkey_hex TEXT"))
@@ -1269,9 +1325,14 @@ def _init_db_unlocked() -> None:
             attempt_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(payment_attempts)")).fetchall()}
             challenge_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(auth_challenges)")).fetchall()}
             merchant_profile_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(merchant_profiles)")).fetchall()}
+            nostr_event_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(nostr_events)")).fetchall()}
             for column in ("invite_eyebrow", "invite_headline", "invite_description"):
                 if column not in campaign_cols:
                     c.execute(text(f"ALTER TABLE campaigns ADD COLUMN {column} TEXT"))
+            if "enrollment_mode" not in campaign_cols:
+                c.execute(text("ALTER TABLE campaigns ADD COLUMN enrollment_mode TEXT NOT NULL DEFAULT 'private'"))
+            if "updated_at" not in nostr_event_cols:
+                c.execute(text("ALTER TABLE nostr_events ADD COLUMN updated_at TEXT"))
             for column in ("display_name", "tagline"):
                 if column not in merchant_profile_cols:
                     c.execute(text(f"ALTER TABLE merchant_profiles ADD COLUMN {column} TEXT"))
@@ -1330,6 +1391,7 @@ def _init_db_unlocked() -> None:
                 c.execute(text("ALTER TABLE enrollments ADD COLUMN status TEXT NOT NULL DEFAULT 'approved'"))
             if "client_hash" not in challenge_cols:
                 c.execute(text("ALTER TABLE auth_challenges ADD COLUMN client_hash TEXT"))
+        c.execute(text("UPDATE nostr_events SET updated_at=created_at WHERE updated_at IS NULL"))
         legacy_campaigns = c.execute(
             text(
                 """
@@ -1364,6 +1426,17 @@ def _init_db_unlocked() -> None:
                     updates,
                 )
         c.execute(text("CREATE INDEX IF NOT EXISTS idx_auth_challenges_rate ON auth_challenges(client_hash, created_at)"))
+        duplicate_enrollment = c.execute(text("""
+            SELECT 1 FROM enrollments
+            WHERE affiliate_pubkey_hex IS NOT NULL
+            GROUP BY campaign_id, affiliate_pubkey_hex
+            HAVING COUNT(*) > 1
+            LIMIT 1
+        """)).fetchone()
+        if not duplicate_enrollment:
+            c.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_enrollments_campaign_affiliate_hex ON enrollments(campaign_id, affiliate_pubkey_hex) WHERE affiliate_pubkey_hex IS NOT NULL"))
+        else:
+            logger.warning("skipping enrollment uniqueness index because historical duplicates require reconciliation")
         c.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_conversions_merchant_order_key ON conversions(merchant_order_key) WHERE merchant_order_key IS NOT NULL"))
         c.execute(text("""
             UPDATE payouts SET state=CASE
@@ -1605,6 +1678,8 @@ def release_campaign_budget(
 def startup() -> None:
     validate_runtime_security()
     init_db()
+    if nostr_publish_enabled():
+        threading.Thread(target=nostr_outbox_retry_worker, name="nostr-outbox-retry", daemon=True).start()
 
 
 class CampaignIn(BaseModel):
@@ -1614,6 +1689,7 @@ class CampaignIn(BaseModel):
     attribution_window_days: int = 30
     destination_url: str = DEFAULT_DESTINATION
     terms_url: str = "https://bumbei.com/terms/affiliate"
+    enrollment_mode: Literal["private", "approval", "open"] = "private"
 
 
 class MerchantBootstrapIn(BaseModel):
@@ -1628,6 +1704,7 @@ class MerchantBootstrapIn(BaseModel):
     destination_url: str | None = Field(default=None, max_length=3000)
     terms_url: str | None = Field(default=None, max_length=3000)
     logo_url: str | None = Field(default=None, max_length=2048)
+    enrollment_mode: Literal["private", "approval", "open"] | None = None
 
 
 class MerchantProfileIn(BaseModel):
@@ -1794,6 +1871,21 @@ class AffiliateInvitationTokenIn(BaseModel):
 
 class AffiliateInvitationAcceptIn(AffiliateInvitationTokenIn):
     event: dict[str, Any]
+
+
+class CampaignJoinIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    event: dict[str, Any]
+
+
+class CampaignEnrollmentModeIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    enrollment_mode: Literal["private", "approval", "open"]
+
+
+class MerchantEnrollmentDecisionIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["approved", "rejected"]
 
 
 @app.get("/health")
@@ -2084,6 +2176,7 @@ def create_campaign(body: CampaignIn) -> dict[str, Any]:
         "window_days": body.attribution_window_days,
         "destination_url": body.destination_url,
         "terms_hash": terms_hash,
+        "enrollment_mode": body.enrollment_mode,
         "status": "active",
     }
     event = build_campaign_event(campaign_row, body.terms_url)
@@ -2094,9 +2187,9 @@ def create_campaign(body: CampaignIn) -> dict[str, Any]:
             text(
                 """
                 INSERT INTO campaigns (id, merchant_pubkey, merchant_pubkey_hex, name, commission_bps, window_days,
-                destination_url, terms_url, terms_hash, status, nostr_event_id, nostr_event_json, created_at)
+                destination_url, terms_url, terms_hash, enrollment_mode, status, nostr_event_id, nostr_event_json, created_at)
                 VALUES (:id, :merchant_pubkey, :merchant_pubkey_hex, :name, :commission_bps, :window_days,
-                :destination_url, :terms_url, :terms_hash, :status, :nostr_event_id, :nostr_event_json, :created_at)
+                :destination_url, :terms_url, :terms_hash, :enrollment_mode, :status, :nostr_event_id, :nostr_event_json, :created_at)
                 """
             ),
             {
@@ -2109,6 +2202,7 @@ def create_campaign(body: CampaignIn) -> dict[str, Any]:
                 "destination_url": body.destination_url,
                 "terms_url": body.terms_url,
                 "terms_hash": terms_hash,
+                "enrollment_mode": body.enrollment_mode,
                 "status": "active",
                 "nostr_event_id": event["id"],
                 "nostr_event_json": json.dumps(event),
@@ -2133,6 +2227,7 @@ def public_campaign_directory_data() -> list[dict[str, Any]]:
                     c.invite_eyebrow,
                     c.invite_headline,
                     c.invite_description,
+                    c.enrollment_mode,
                     c.created_at,
                     mp.display_name,
                     mp.tagline,
@@ -4771,7 +4866,7 @@ def campaign_public_data(campaign_id: str) -> dict[str, Any]:
             "merchant_pubkey_hex": campaign.get("merchant_pubkey_hex"),
             "logo_url": None,
         }
-        enrollments = [dict(r._mapping) for r in c.execute(text("SELECT * FROM enrollments WHERE campaign_id=:id ORDER BY created_at DESC"), {"id": campaign_id}).fetchall()]
+        enrollments = [dict(r._mapping) for r in c.execute(text("SELECT * FROM enrollments WHERE campaign_id=:id AND status='approved' ORDER BY created_at DESC"), {"id": campaign_id}).fetchall()]
         clicks = [dict(r._mapping) for r in c.execute(text("SELECT * FROM clicks WHERE campaign_id=:id ORDER BY created_at DESC"), {"id": campaign_id}).fetchall()]
         conversions = [dict(r._mapping) for r in c.execute(text("SELECT * FROM conversions WHERE campaign_id=:id ORDER BY created_at DESC"), {"id": campaign_id}).fetchall()]
         payouts = [dict(r._mapping) for r in c.execute(text("SELECT p.* FROM payouts p JOIN conversions v ON p.conversion_id=v.id WHERE v.campaign_id=:id ORDER BY p.created_at DESC"), {"id": campaign_id}).fetchall()]
@@ -5485,6 +5580,7 @@ def _merchant_requested_program(body: MerchantBootstrapIn) -> dict[str, Any]:
         "destination_url": destination_url,
         "terms_url": terms_url,
         "logo_url": logo_url,
+        "enrollment_mode": body.enrollment_mode or "private",
     }
 
 
@@ -5703,6 +5799,7 @@ def merchant_bootstrap(body: MerchantBootstrapIn, request: Request) -> dict[str,
                     or (requested_fields["window_days"] is not None and int(existing["window_days"]) != program["window_days"])
                     or (requested_fields["destination_url"] is not None and existing["destination_url"] != program["destination_url"])
                     or (requested_fields["terms_url"] is not None and existing.get("terms_url") != program["terms_url"])
+                    or ("enrollment_mode" in body.model_fields_set and existing.get("enrollment_mode", "private") != program["enrollment_mode"])
                 )
                 if conflicts:
                     raise HTTPException(409, "El programa ya existe con una configuración diferente.")
@@ -5723,6 +5820,7 @@ def merchant_bootstrap(body: MerchantBootstrapIn, request: Request) -> dict[str,
                     "destination_url": program["destination_url"],
                     "terms_url": program["terms_url"],
                     "terms_hash": terms_hash,
+                    "enrollment_mode": program["enrollment_mode"],
                     "status": "active",
                 }
                 event = build_campaign_event(campaign, program["terms_url"])
@@ -5731,10 +5829,10 @@ def merchant_bootstrap(body: MerchantBootstrapIn, request: Request) -> dict[str,
                         """
                         INSERT INTO campaigns
                           (id, merchant_pubkey, merchant_pubkey_hex, name, commission_bps, window_days,
-                           destination_url, terms_url, terms_hash, status, nostr_event_id, nostr_event_json, created_at)
+                           destination_url, terms_url, terms_hash, enrollment_mode, status, nostr_event_id, nostr_event_json, created_at)
                         VALUES
                           (:id, :merchant_pubkey, :merchant_pubkey_hex, :name, :commission_bps, :window_days,
-                           :destination_url, :terms_url, :terms_hash, :status, :nostr_event_id, :nostr_event_json, :created_at)
+                           :destination_url, :terms_url, :terms_hash, :enrollment_mode, :status, :nostr_event_id, :nostr_event_json, :created_at)
                         ON CONFLICT(id) DO NOTHING
                         """
                     ),
@@ -5842,6 +5940,7 @@ def merchant_complete_onboarding(body: MerchantOnboardingIn, request: Request) -
                     or (body.attribution_window_days is not None and int(existing["window_days"]) != program["window_days"])
                     or (body.destination_url is not None and existing["destination_url"] != program["destination_url"])
                     or (body.terms_url is not None and existing.get("terms_url") != program["terms_url"])
+                    or ("enrollment_mode" in body.model_fields_set and existing.get("enrollment_mode", "private") != program["enrollment_mode"])
                 )
                 if existing.get("merchant_pubkey_hex") != merchant["hex"]:
                     raise HTTPException(409, "La identidad no coincide con la del programa predeterminado.")
@@ -5863,6 +5962,7 @@ def merchant_complete_onboarding(body: MerchantOnboardingIn, request: Request) -
                     "destination_url": program["destination_url"],
                     "terms_url": program["terms_url"],
                     "terms_hash": sha(program["terms_url"]),
+                    "enrollment_mode": program["enrollment_mode"],
                     "status": "active",
                 }
                 event = build_campaign_event(campaign, program["terms_url"])
@@ -5871,10 +5971,10 @@ def merchant_complete_onboarding(body: MerchantOnboardingIn, request: Request) -
                         """
                         INSERT INTO campaigns
                           (id, merchant_pubkey, merchant_pubkey_hex, name, commission_bps, window_days,
-                           destination_url, terms_url, terms_hash, status, nostr_event_id, nostr_event_json, created_at)
+                           destination_url, terms_url, terms_hash, enrollment_mode, status, nostr_event_id, nostr_event_json, created_at)
                         VALUES
                           (:id, :merchant_pubkey, :merchant_pubkey_hex, :name, :commission_bps, :window_days,
-                           :destination_url, :terms_url, :terms_hash, :status, :nostr_event_id, :nostr_event_json, :created_at)
+                           :destination_url, :terms_url, :terms_hash, :enrollment_mode, :status, :nostr_event_id, :nostr_event_json, :created_at)
                         """
                     ),
                     {
@@ -5905,9 +6005,11 @@ def merchant_complete_onboarding(body: MerchantOnboardingIn, request: Request) -
                     "created_at": timestamp, "updated_at": timestamp,
                 },
             )
-            invitation = _persist_merchant_campaign_invite(
-                c, session, campaign_id, invite_eyebrow, invite_headline, invite_description
-            )
+            invitation = None
+            if program["enrollment_mode"] == "private":
+                invitation = _persist_merchant_campaign_invite(
+                    c, session, campaign_id, invite_eyebrow, invite_headline, invite_description
+                )
 
     assert event is not None
     if publish_needed:
@@ -6213,6 +6315,8 @@ def merchant_create_invitation(request: Request, body: MerchantInvitationIn) -> 
             raise HTTPException(404, "No se encontró la campaña.")
         if campaign.get("status") != "active":
             raise HTTPException(409, "La campaña no está activa.")
+        if campaign.get("enrollment_mode", "private") != "private":
+            raise HTTPException(409, "Esta campaña usa una página pública de inscripción y no necesita invitaciones privadas.")
         c.execute(
             text(
                 """
@@ -6244,6 +6348,196 @@ def merchant_create_invitation(request: Request, body: MerchantInvitationIn) -> 
     }
 
 
+@app.put("/app/merchant/campaigns/{campaign_id}/enrollment-mode", tags=["Accounts"])
+def merchant_update_enrollment_mode(
+    campaign_id: str, body: CampaignEnrollmentModeIn, request: Request
+) -> dict[str, Any]:
+    session = require_account_session(request, "merchant")
+    _require_same_origin(request)
+    init_db()
+    event: dict[str, Any]
+    with _INVITATION_ACCEPT_LOCK:
+        with engine().begin() as c:
+            if c.engine.dialect.name == "postgresql":
+                c.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"), {"key": f"campaign-enrollment:{campaign_id}"})
+            campaign = _owned_merchant_campaign(c, session, campaign_id)
+            if not campaign:
+                raise HTTPException(404, "No se encontró la campaña.")
+            if campaign.get("status") != "active":
+                raise HTTPException(409, "La campaña no está activa.")
+            if campaign.get("enrollment_mode", "private") == body.enrollment_mode:
+                return {"ok": True, "campaign_id": campaign_id, "enrollment_mode": body.enrollment_mode, "duplicate": True}
+            campaign["enrollment_mode"] = body.enrollment_mode
+            event = build_campaign_event(campaign, campaign.get("terms_url"))
+            c.execute(text("UPDATE campaigns SET enrollment_mode=:mode, nostr_event_id=:event_id, nostr_event_json=:event_json WHERE id=:id"), {
+                "mode": body.enrollment_mode, "event_id": event["id"], "event_json": json.dumps(event), "id": campaign_id,
+            })
+            if body.enrollment_mode != "private":
+                c.execute(text("""
+                    UPDATE affiliate_invitations
+                    SET status='revoked'
+                    WHERE campaign_id=:campaign_id AND status='pending'
+                """), {"campaign_id": campaign_id})
+            persist_nostr_event(c, event, "campaign", campaign_id, [])
+    relay_results = finalize_committed_nostr_event(event, "campaign", campaign_id)
+    return {"ok": True, "campaign_id": campaign_id, "enrollment_mode": body.enrollment_mode, "duplicate": False, "relay_results": relay_results}
+
+
+@app.post("/app/merchant/enrollments/{enrollment_id}/decision", tags=["Accounts"])
+def merchant_decide_enrollment(
+    enrollment_id: str, body: MerchantEnrollmentDecisionIn, request: Request
+) -> dict[str, Any]:
+    session = require_account_session(request, "merchant")
+    _require_same_origin(request)
+    init_db()
+    event: dict[str, Any] | None = None
+    campaign: dict[str, Any]
+    with _INVITATION_ACCEPT_LOCK:
+        with engine().begin() as c:
+            enrollment = asdict(c.execute(text("SELECT * FROM enrollments WHERE id=:id LIMIT 1"), {"id": enrollment_id}).fetchone())
+            if not enrollment:
+                raise HTTPException(404, "No se encontró la solicitud.")
+            campaign = _owned_merchant_campaign(c, session, enrollment["campaign_id"])
+            if not campaign:
+                raise HTTPException(404, "No se encontró la solicitud.")
+            if enrollment["status"] == body.status:
+                return {"ok": True, "enrollment_id": enrollment_id, "status": body.status, "duplicate": True}
+            if enrollment["status"] != "pending":
+                raise HTTPException(409, f"La solicitud ya tiene el estado {enrollment['status']}.")
+            enrollment["status"] = body.status
+            event = build_enrollment_event(enrollment, campaign)
+            updated = c.execute(text("UPDATE enrollments SET status=:status, nostr_event_id=:event_id, nostr_event_json=:event_json WHERE id=:id AND status='pending'"), {
+                "status": body.status, "event_id": event["id"], "event_json": json.dumps(event), "id": enrollment_id,
+            })
+            if updated.rowcount != 1:
+                raise HTTPException(409, "La solicitud fue modificada simultáneamente.")
+            if body.status == "approved":
+                persist_nostr_event(c, event, "enrollment", enrollment_id, [])
+    relay_results: list[dict[str, str]] = []
+    if body.status == "approved" and event is not None:
+        relay_results = finalize_committed_nostr_event(event, "enrollment", enrollment_id)
+    return {"ok": True, "enrollment_id": enrollment_id, "status": body.status, "duplicate": False, "relay_results": relay_results}
+
+
+def _campaign_join_data(campaign_id: str) -> dict[str, Any]:
+    init_db()
+    with engine().connect() as c:
+        row = c.execute(text("""
+            SELECT c.id, c.name, c.commission_bps, c.window_days, c.terms_url,
+                   c.enrollment_mode, c.status, c.archived_at,
+                   mp.display_name, mp.tagline, mp.logo_url
+            FROM campaigns c
+            LEFT JOIN merchant_profiles mp ON mp.merchant_pubkey_hex=c.merchant_pubkey_hex
+            WHERE c.id=:id LIMIT 1
+        """), {"id": campaign_id}).fetchone()
+    campaign = asdict(row)
+    if not campaign or campaign.get("archived_at") or campaign.get("enrollment_mode", "private") == "private":
+        raise HTTPException(404, "No se encontró una inscripción pública para esta campaña.")
+    if campaign.get("status") != "active":
+        raise HTTPException(409, "La campaña no está activa.")
+    campaign["commission_percent"] = format((Decimal(int(campaign["commission_bps"])) / Decimal(100)).normalize(), "f")
+    return campaign
+
+
+@app.get("/campaigns/{campaign_id}/join", response_class=HTMLResponse)
+def campaign_join_page(request: Request, campaign_id: str) -> Response:
+    return templates.TemplateResponse(request=request, name="campaign_join.html", context={"campaign": _campaign_join_data(campaign_id)}, headers={"Cache-Control": "no-store", "Referrer-Policy": "same-origin"})
+
+
+@app.post("/campaigns/{campaign_id}/join/challenge", tags=["Accounts"])
+def campaign_join_challenge(campaign_id: str, request: Request) -> dict[str, Any]:
+    _require_same_origin(request)
+    _campaign_join_data(campaign_id)
+    challenge = random_token(32)
+    role = f"campaign_join:{campaign_id}"
+    created_at = datetime.now(timezone.utc)
+    expires_at = created_at + timedelta(minutes=3)
+    client_hash = hmac.new(APP_SECRET.encode(), _request_ip(request).encode(), hashlib.sha256).hexdigest()
+    cutoff = (created_at - timedelta(minutes=1)).isoformat()
+    with engine().begin() as c:
+        c.execute(text("DELETE FROM auth_challenges WHERE expires_at<:now"), {"now": created_at.isoformat()})
+        recent_client = int(c.execute(text("SELECT COUNT(*) FROM auth_challenges WHERE client_hash=:client_hash AND created_at>=:cutoff"), {"client_hash": client_hash, "cutoff": cutoff}).scalar_one())
+        recent_global = int(c.execute(text("SELECT COUNT(*) FROM auth_challenges WHERE created_at>=:cutoff"), {"cutoff": cutoff}).scalar_one())
+        if recent_client >= 20:
+            raise HTTPException(429, "Se solicitaron demasiados desafíos. Intentá nuevamente en unos instantes.")
+        if recent_global >= 3000:
+            raise HTTPException(429, "El servicio de autenticación está ocupado. Intentá nuevamente en unos instantes.")
+        c.execute(text("""
+            INSERT INTO auth_challenges
+              (id, challenge_hash, client_hash, role, relay, expires_at, consumed_at, created_at)
+            VALUES (:id, :challenge_hash, :client_hash, :role, :relay, :expires_at, NULL, :created_at)
+        """), {"id": hid("chl"), "challenge_hash": auth_digest(challenge), "client_hash": client_hash, "role": role, "relay": BASE_URL, "expires_at": expires_at.isoformat(), "created_at": created_at.isoformat()})
+    return {"challenge": challenge, "role": role, "relay": BASE_URL, "kind": AUTH_EVENT_KIND, "expires_at": expires_at.isoformat()}
+
+
+@app.post("/campaigns/{campaign_id}/join", tags=["Accounts"])
+def campaign_join(campaign_id: str, body: CampaignJoinIn, request: Request, response: Response) -> Any:
+    _require_same_origin(request)
+    challenge = _auth_event_challenge(body.event)
+    init_db()
+    event: dict[str, Any] | None = None
+    session_token: str | None = None
+    session_expires_at: str | None = None
+    with _INVITATION_ACCEPT_LOCK:
+        with engine().begin() as c:
+            challenge_row = asdict(c.execute(text("SELECT * FROM auth_challenges WHERE challenge_hash=:hash LIMIT 1"), {"hash": auth_digest(challenge)}).fetchone())
+            if not challenge_row:
+                raise HTTPException(404, "No se encontró el desafío de inscripción.")
+            if challenge_row["consumed_at"]:
+                raise HTTPException(409, "El desafío de inscripción ya fue utilizado.")
+            if parse_iso(challenge_row["expires_at"]) <= datetime.now(timezone.utc):
+                raise HTTPException(410, "El desafío de inscripción expiró.")
+            expected_role = f"campaign_join:{campaign_id}"
+            if challenge_row["role"] != expected_role:
+                raise HTTPException(400, "El desafío no pertenece a esta campaña.")
+            try:
+                identity = verify_auth_event(body.event, expected_challenge=challenge, expected_role=expected_role, expected_relay=challenge_row["relay"])
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
+            if c.engine.dialect.name == "postgresql":
+                c.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"), {"key": f"campaign-enrollment:{campaign_id}"})
+                c.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"), {"key": f"affiliate-enrollment:{campaign_id}:{identity['hex']}"})
+            campaign = asdict(c.execute(text("SELECT * FROM campaigns WHERE id=:id LIMIT 1"), {"id": campaign_id}).fetchone())
+            if not campaign or campaign.get("archived_at") or campaign.get("enrollment_mode", "private") == "private":
+                raise HTTPException(404, "No se encontró una inscripción pública para esta campaña.")
+            if campaign.get("status") != "active":
+                raise HTTPException(409, "La campaña no está activa.")
+            consumed = c.execute(text("UPDATE auth_challenges SET consumed_at=:now WHERE id=:id AND consumed_at IS NULL"), {"now": now(), "id": challenge_row["id"]})
+            if consumed.rowcount != 1:
+                raise HTTPException(409, "El desafío de inscripción ya fue utilizado.")
+            enrollment = asdict(c.execute(text("""
+                SELECT * FROM enrollments WHERE campaign_id=:campaign_id AND
+                  (affiliate_pubkey_hex=:hex OR affiliate_pubkey=:hex OR affiliate_pubkey=:npub)
+                LIMIT 1
+            """), {"campaign_id": campaign_id, "hex": identity["hex"], "npub": identity["npub"]}).fetchone())
+            duplicate = bool(enrollment)
+            if enrollment and enrollment["status"] in {"rejected", "terminated"}:
+                raise HTTPException(409, f"La inscripción tiene el estado {enrollment['status']}.")
+            if not enrollment:
+                status = "approved" if campaign["enrollment_mode"] == "open" else "pending"
+                enrollment = {"id": hid("enr"), "campaign_id": campaign_id, "affiliate_pubkey": identity["npub"], "affiliate_pubkey_hex": identity["hex"], "lightning_address": None, "destination_verified_at": None, "ref_code": hid("ref"), "status": status, "created_at": now()}
+                event = build_enrollment_event(enrollment, campaign)
+                enrollment["nostr_event_id"] = event["id"]
+                enrollment["nostr_event_json"] = json.dumps(event)
+                c.execute(text("""
+                    INSERT INTO enrollments (id, campaign_id, affiliate_pubkey, affiliate_pubkey_hex,
+                      lightning_address, destination_verified_at, ref_code, status, nostr_event_id, nostr_event_json, created_at)
+                    VALUES (:id, :campaign_id, :affiliate_pubkey, :affiliate_pubkey_hex,
+                      :lightning_address, :destination_verified_at, :ref_code, :status, :nostr_event_id, :nostr_event_json, :created_at)
+                """), enrollment)
+                if status == "approved":
+                    persist_nostr_event(c, event, "enrollment", enrollment["id"], [])
+            if enrollment["status"] == "approved":
+                session_token, session_expires_at = _create_affiliate_session(c, identity)
+    if event is not None and enrollment["status"] == "approved":
+        finalize_committed_nostr_event(event, "enrollment", enrollment["id"])
+    if enrollment["status"] == "pending":
+        return JSONResponse(status_code=202, content={"ok": True, "duplicate": duplicate, "status": "pending", "enrollment_id": enrollment["id"], "affiliate_pubkey": identity["npub"], "redirect": f"/campaigns/{campaign_id}/page"})
+    assert session_token is not None
+    _set_account_session_cookie(response, session_token)
+    return {"ok": True, "duplicate": duplicate, "status": "approved", "enrollment_id": enrollment["id"], "affiliate_pubkey": identity["npub"], "ref_code": enrollment["ref_code"], "ref_url": referral_url(enrollment["ref_code"]), "session_expires_at": session_expires_at, "redirect": "/app/affiliate?view=links"}
+
+
 @app.get("/invite", response_class=HTMLResponse, tags=["Accounts"])
 def affiliate_invitation_page(request: Request) -> Response:
     return templates.TemplateResponse(
@@ -6265,7 +6559,7 @@ def resolve_affiliate_invitation(request: Request, response: Response, body: Aff
                     """
                     SELECT i.*, c.name AS campaign_name, c.commission_bps, c.window_days,
                            c.status AS campaign_status, c.invite_eyebrow, c.invite_headline,
-                           c.invite_description, mp.display_name, mp.tagline, mp.logo_url
+                           c.invite_description, c.enrollment_mode, mp.display_name, mp.tagline, mp.logo_url
                     FROM affiliate_invitations i
                     JOIN campaigns c ON c.id=i.campaign_id
                     LEFT JOIN merchant_profiles mp ON mp.merchant_pubkey_hex=c.merchant_pubkey_hex
@@ -6285,6 +6579,8 @@ def resolve_affiliate_invitation(request: Request, response: Response, body: Aff
         raise HTTPException(409, "La invitación ya fue utilizada o revocada.")
     if invitation["campaign_status"] != "active":
         raise HTTPException(409, "La campaña no está activa.")
+    if invitation.get("enrollment_mode", "private") != "private":
+        raise HTTPException(409, "La campaña ya no acepta invitaciones privadas.")
     profile_name = safe_text(invitation.get("display_name"), 120)
     fallback_name = re.sub(
         r"\s+(?:affiliate\s+program|affiliate\s+programme|programa\s+de\s+afiliados|programa\s+affiliate)$",
@@ -6477,6 +6773,8 @@ def accept_affiliate_invitation(request: Request, response: Response, body: Affi
             campaign = asdict(c.execute(text("SELECT * FROM campaigns WHERE id=:id"), {"id": invitation["campaign_id"]}).fetchone())
             if not campaign or campaign.get("status") != "active":
                 raise HTTPException(409, "La campaña no está activa.")
+            if campaign.get("enrollment_mode", "private") != "private":
+                raise HTTPException(409, "La campaña ya no acepta invitaciones privadas.")
             if database_url().startswith("postgresql"):
                 c.execute(
                     text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),

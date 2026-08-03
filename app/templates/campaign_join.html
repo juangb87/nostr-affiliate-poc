@@ -1,0 +1,38 @@
+{% extends "public_base.html" %}
+{% block title %}{{ campaign.name }} · Meerat{% endblock %}
+{% block title_es %}{{ campaign.name }} · Inscripción{% endblock %}{% block title_en %}{{ campaign.name }} · Enrollment{% endblock %}
+{% block description %}Inscripción segura con identidad Nostr al programa {{ campaign.name }}.{% endblock %}
+{% block body_class %}campaign-join-page{% endblock %}
+{% block head_extra %}
+  <link rel="stylesheet" href="/static/nostr-connect.css?v=20260803-enrollment-modes1">
+  <script id="nostr-connect-config" type="application/json">{{ nostr_connect_config | tojson }}</script>
+  <script src="/static/vendor/qrcode-generator-1.4.4.js" defer></script>
+  <script type="module" src="/static/nostr-connect.js?v=20260803-enrollment-modes1"></script>
+  <script src="/static/app.js?v=20260803-enrollment-modes1" defer></script>
+  <script src="/static/campaign-join.js?v=20260803-enrollment-modes1" defer></script>
+{% endblock %}
+{% block content %}
+<section class="public-hero campaign-join-hero" data-campaign-join data-campaign-id="{{ campaign.id }}" data-enrollment-mode="{{ campaign.enrollment_mode }}">
+  <div class="hero-identity">
+    {% if campaign.logo_url %}<img class="merchant-logo" src="{{ campaign.logo_url }}" alt="" referrerpolicy="no-referrer">{% endif %}
+    <div>
+      <p class="eyebrow"><span data-copy-lang="es">Programa de afiliados · Valor por valor</span><span data-copy-lang="en">Affiliate program · Value for value</span></p>
+      <h1>{{ campaign.name }}</h1>
+      {% if campaign.display_name %}<p class="lede">{{ campaign.display_name }}{% if campaign.tagline %} · {{ campaign.tagline }}{% endif %}</p>{% endif %}
+    </div>
+  </div>
+</section>
+<div class="content-grid campaign-join-grid">
+  <section class="card campaign-join-card" aria-labelledby="join-title">
+    <div class="card-head"><h2 id="join-title"><span data-copy-lang="es">{% if campaign.enrollment_mode == 'open' %}Sumate ahora{% else %}Solicitá acceso{% endif %}</span><span data-copy-lang="en">{% if campaign.enrollment_mode == 'open' %}Join now{% else %}Request access{% endif %}</span></h2><span class="badge success"><span data-copy-lang="es">{% if campaign.enrollment_mode == 'open' %}Abierta{% else %}Con aprobación{% endif %}</span><span data-copy-lang="en">{% if campaign.enrollment_mode == 'open' %}Open{% else %}Approval required{% endif %}</span></span></div>
+    <p><span data-copy-lang="es">Firmá una solicitud con tu identidad Nostr. Tus claves privadas nunca salen de tu signer.</span><span data-copy-lang="en">Sign a request with your Nostr identity. Your private keys never leave your signer.</span></p>
+    <dl class="join-terms"><dt><span data-copy-lang="es">Comisión</span><span data-copy-lang="en">Commission</span></dt><dd><strong>{{ campaign.commission_percent }}%</strong></dd><dt><span data-copy-lang="es">Ventana</span><span data-copy-lang="en">Window</span></dt><dd>{{ campaign.window_days }} <span data-copy-lang="es">días</span><span data-copy-lang="en">days</span></dd><dt><span data-copy-lang="es">Términos</span><span data-copy-lang="en">Terms</span></dt><dd>{% if campaign.terms_url %}<a href="{{ campaign.terms_url }}" rel="nofollow noopener" target="_blank"><span data-copy-lang="es">Ver términos ↗</span><span data-copy-lang="en">View terms ↗</span></a>{% else %}—{% endif %}</dd></dl>
+    <div class="join-actions">
+      <button class="button" type="button" data-join-method="auto"><span data-copy-lang="es">{% if campaign.enrollment_mode == 'open' %}Sumarme con Nostr{% else %}Firmar y solicitar acceso{% endif %}</span><span data-copy-lang="en">{% if campaign.enrollment_mode == 'open' %}Join with Nostr{% else %}Sign and request access{% endif %}</span></button>
+      <button class="button secondary" type="button" data-join-method="nip46"><span data-copy-lang="es">Usar app Nostr / QR</span><span data-copy-lang="en">Use Nostr app / QR</span></button>
+    </div>
+    <p class="notice" data-join-status role="status" aria-live="polite"><span data-copy-lang="es">Al continuar aceptás los términos del programa.</span><span data-copy-lang="en">By continuing, you accept the program terms.</span></p>
+  </section>
+  <aside class="card evidence"><h2><span data-copy-lang="es">Qué ocurre después</span><span data-copy-lang="en">What happens next</span></h2>{% if campaign.enrollment_mode == 'open' %}<p><span data-copy-lang="es">Tu enlace se crea al instante. Después configurás una dirección Lightning para recibir sats.</span><span data-copy-lang="en">Your link is created instantly. Then you configure a Lightning address to receive sats.</span></p>{% else %}<p><span data-copy-lang="es">El Merchant revisará tu solicitud. Cuando la apruebe, vas a poder entrar con el mismo npub y activar tu enlace.</span><span data-copy-lang="en">The Merchant will review your request. Once approved, sign in with the same npub to activate your link.</span></p>{% endif %}</aside>
+</div>
+{% endblock %}

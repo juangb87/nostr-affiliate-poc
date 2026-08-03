@@ -40,7 +40,8 @@ def merchant_workspace_data(connection: Any, session: dict[str, Any], *, base_ur
     campaign_stmt = text(
         """
         SELECT c.*, mp.logo_url, mp.display_name, mp.tagline,
-          (SELECT COUNT(*) FROM enrollments e WHERE e.campaign_id=c.id) AS affiliates,
+          (SELECT COUNT(*) FROM enrollments e WHERE e.campaign_id=c.id AND e.status='approved') AS affiliates,
+          (SELECT COUNT(*) FROM enrollments e WHERE e.campaign_id=c.id AND e.status='pending') AS pending_affiliates,
           (SELECT COUNT(*) FROM conversions v WHERE v.campaign_id=c.id) AS conversions
         FROM campaigns c
         LEFT JOIN merchant_profiles mp ON mp.merchant_pubkey_hex=c.merchant_pubkey_hex
@@ -95,7 +96,7 @@ def merchant_workspace_data(connection: Any, session: dict[str, Any], *, base_ur
         clicks = _rows(connection, clicks_stmt, {"campaign_ids": campaign_ids})
         enrollments_stmt = text(
             """
-            SELECT e.id, e.affiliate_pubkey, e.affiliate_pubkey_hex, e.ref_code,
+            SELECT e.id, e.campaign_id, e.affiliate_pubkey, e.affiliate_pubkey_hex, e.ref_code,
                    e.status, e.created_at, c.name AS campaign_name
             FROM enrollments e JOIN campaigns c ON c.id=e.campaign_id
             WHERE e.campaign_id IN :campaign_ids
@@ -127,7 +128,7 @@ def merchant_workspace_data(connection: Any, session: dict[str, Any], *, base_ur
         aggregate_stmt = text(
             """
             SELECT
-              (SELECT COUNT(DISTINCT e.affiliate_pubkey_hex) FROM enrollments e WHERE e.campaign_id IN :campaign_ids) AS affiliates,
+              (SELECT COUNT(DISTINCT e.affiliate_pubkey_hex) FROM enrollments e WHERE e.campaign_id IN :campaign_ids AND e.status='approved') AS affiliates,
               (SELECT COUNT(*) FROM clicks cl WHERE cl.campaign_id IN :campaign_ids) AS clicks,
               (SELECT COUNT(*) FROM conversions v WHERE v.campaign_id IN :campaign_ids AND v.status='approved') AS conversions,
               (SELECT COALESCE(SUM(v.commission_sats),0) FROM conversions v WHERE v.campaign_id IN :campaign_ids AND v.status='approved') AS commission_sats,
