@@ -2776,6 +2776,10 @@ def test_merchant_can_update_commission_and_only_future_conversions_use_it(tmp_p
 
     page = client.get("/app/merchant?view=campaigns&lang=en")
     assert page.status_code == 200
+    assert 'class="record campaign-mode-record campaign-card"' in page.text
+    assert 'class="campaign-card__header"' in page.text
+    assert 'class="campaign-card__settings"' in page.text
+    assert 'class="campaign-card__actions"' in page.text
     assert 'name="commission_percent"' in page.text
     assert 'value="12.5"' in page.text
     assert "Commission (%)" in page.text

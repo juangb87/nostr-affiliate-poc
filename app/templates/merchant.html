@@ -51,10 +51,45 @@
 </div></section>
 {% endif %}
 {% if view == 'campaigns' %}
-<section class="section" id="campaigns"><div class="section-head"><div><h2>Campañas</h2><p>Actividad y condiciones del programa.</p></div></div><div class="panel record-list">
-{% for campaign in campaigns %}<article class="record campaign-mode-record"><div class="record-main"><strong data-i18n-ignore>{{ campaign.name }}</strong><span>{{ campaign.commission_percent }}% · ventana {{ campaign.window_days }} días</span><span class="badge {% if campaign.status == 'active' %}success{% endif %}">{{ app_status(campaign.status) }}</span><span class="badge neutral">{% if campaign.enrollment_mode == 'private' %}Solo invitación{% elif campaign.enrollment_mode == 'approval' %}Requiere aprobación{% else %}Inscripción abierta{% endif %}</span></div><div><span class="label-mobile">Afiliados</span><strong>{{ campaign.affiliates }}</strong><div class="record-meta">{% if campaign.pending_affiliates %}{{ campaign.pending_affiliates }} pendiente{% if campaign.pending_affiliates != 1 %}s{% endif %}{% else %}afiliados{% endif %}</div></div><div><span class="label-mobile">Conversiones</span><strong>{{ campaign.conversions }}</strong><div class="record-meta">conversiones</div></div><form class="campaign-commission-form" data-campaign-commission="{{ campaign.id }}"><label><span class="commission-field-label">Comisión (%)</span><input name="commission_percent" type="number" inputmode="decimal" min="0.01" max="100" step="0.01" value="{{ campaign.commission_percent }}" required></label><button class="action" type="submit">Guardar comisión</button><small class="form-status" data-commission-status role="status" aria-live="polite"></small></form><form data-enrollment-mode="{{ campaign.id }}"><label><span class="label-mobile">Modo</span><select name="enrollment_mode"><option value="private" {% if campaign.enrollment_mode == 'private' %}selected{% endif %}>Privada</option><option value="approval" {% if campaign.enrollment_mode == 'approval' %}selected{% endif %}>Con aprobación</option><option value="open" {% if campaign.enrollment_mode == 'open' %}selected{% endif %}>Abierta</option></select></label><button class="action" type="submit">Guardar modo</button><small class="form-status" data-mode-status role="status"></small></form><a class="action" href="/campaigns/{{ campaign.id }}/page">Página pública</a>{% if campaign.enrollment_mode != 'private' %}<button class="action" type="button" data-copy="{{ request.base_url }}campaigns/{{ campaign.id }}/join">Copiar inscripción</button>{% endif %}</article>
-{% else %}<div class="empty">No hay campañas asociadas a esta cuenta de comerciante.</div>{% endfor %}
-</div></section>
+<section class="section" id="campaigns">
+  <div class="section-head"><div><h2>Campañas</h2><p>Actividad y condiciones del programa.</p></div></div>
+  <div class="panel record-list campaign-list">
+  {% for campaign in campaigns %}
+    <article class="record campaign-mode-record campaign-card">
+      <header class="campaign-card__header">
+        <div class="campaign-card__summary">
+          <strong class="campaign-card__title" data-i18n-ignore>{{ campaign.name }}</strong>
+          <span class="campaign-card__terms">{{ campaign.commission_percent }}% · ventana {{ campaign.window_days }} días</span>
+          <div class="campaign-card__badges">
+            <span class="badge {% if campaign.status == 'active' %}success{% endif %}">{{ app_status(campaign.status) }}</span>
+            <span class="badge neutral">{% if campaign.enrollment_mode == 'private' %}Solo invitación{% elif campaign.enrollment_mode == 'approval' %}Requiere aprobación{% else %}Inscripción abierta{% endif %}</span>
+          </div>
+        </div>
+        <div class="campaign-card__metrics" aria-label="Rendimiento de la campaña">
+          <div class="campaign-card__metric"><strong>{{ campaign.affiliates }}</strong><span>Afiliados</span>{% if campaign.pending_affiliates %}<small>{{ campaign.pending_affiliates }} pendiente{% if campaign.pending_affiliates != 1 %}s{% endif %}</small>{% endif %}</div>
+          <div class="campaign-card__metric"><strong>{{ campaign.conversions }}</strong><span>Conversiones</span></div>
+        </div>
+      </header>
+      <div class="campaign-card__settings">
+        <form class="campaign-setting campaign-commission-form" data-campaign-commission="{{ campaign.id }}">
+          <label><span class="campaign-setting__label">Comisión (%)</span><input name="commission_percent" type="number" inputmode="decimal" min="0.01" max="100" step="0.01" value="{{ campaign.commission_percent }}" required></label>
+          <button class="action" type="submit">Guardar comisión</button>
+          <small class="form-status" data-commission-status role="status" aria-live="polite"></small>
+        </form>
+        <form class="campaign-setting" data-enrollment-mode="{{ campaign.id }}">
+          <label><span class="campaign-setting__label">Modo de inscripción</span><select name="enrollment_mode"><option value="private" {% if campaign.enrollment_mode == 'private' %}selected{% endif %}>Privada</option><option value="approval" {% if campaign.enrollment_mode == 'approval' %}selected{% endif %}>Con aprobación</option><option value="open" {% if campaign.enrollment_mode == 'open' %}selected{% endif %}>Abierta</option></select></label>
+          <button class="action" type="submit">Guardar modo</button>
+          <small class="form-status" data-mode-status role="status"></small>
+        </form>
+      </div>
+      <footer class="campaign-card__actions">
+        <a class="action campaign-card__secondary-action" href="/campaigns/{{ campaign.id }}/page">Página pública</a>
+        {% if campaign.enrollment_mode != 'private' %}<button class="action" type="button" data-copy="{{ request.base_url }}campaigns/{{ campaign.id }}/join">Copiar inscripción</button>{% endif %}
+      </footer>
+    </article>
+  {% else %}<div class="empty">No hay campañas asociadas a esta cuenta de comerciante.</div>{% endfor %}
+  </div>
+</section>
 {% endif %}
 {% if view == 'affiliates' %}
 {% set pending = enrollments|selectattr('status', 'equalto', 'pending')|list %}

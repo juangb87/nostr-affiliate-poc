@@ -335,6 +335,8 @@ ES_TO_EN.update({
     "Con aprobación": "Approval required",
     "Abierta": "Open",
     "Guardar modo": "Save mode",
+    "Modo de inscripción": "Enrollment mode",
+    "Rendimiento de la campaña": "Campaign performance",
     "Comisión (%)": "Commission (%)",
     "Guardar comisión": "Save commission",
     "Comisión actualizada.": "Commission updated.",
