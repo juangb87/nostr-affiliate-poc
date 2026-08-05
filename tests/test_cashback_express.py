@@ -138,16 +138,37 @@ def test_public_landing_and_claim_are_private_and_fail_safe(tmp_path, monkeypatc
     assert page.status_code == 200
     assert "Cashback café" in page.text and "7.25%" in page.text
     assert "Cashback" in page.text and "reembolso" in page.text
+    assert '/static/cashback-express.css?v=20260805-short-host1' in page.text
+    assert '/static/cashback-express.js?v=20260805-short-host1' in page.text
     assert page.headers["cache-control"] == "no-store"
     assert page.headers["referrer-policy"] == "no-referrer"
     assert "referrer no-referrer" not in page.headers["content-security-policy"]
     assert "default-src 'self'" in page.headers["content-security-policy"]
-    css = client.get("/static/cashback-express.css")
+    css = short_client.get("/static/cashback-express.css", follow_redirects=False)
+    script = short_client.get("/static/cashback-express.js", follow_redirects=False)
+    font = short_client.get("/static/fonts/space-grotesk-latin.woff2", follow_redirects=False)
+    unrelated_asset = short_client.get("/static/app.js", follow_redirects=False)
     assert css.status_code == 200 and "body [lang]{display:none}" in css.text
+    assert script.status_code == 200 and "setLanguage(selector.value" in script.text
+    assert font.status_code == 200 and font.content.startswith(b"wOF2")
+    assert "location" not in css.headers
+    assert "location" not in script.headers
+    assert "location" not in font.headers
+    assert unrelated_asset.status_code == 308
+    assert unrelated_asset.headers["location"] == "https://testserver/static/app.js"
     assert "bb_click_id" not in page.text
 
     observed = []
     monkeypatch.setattr(main, "validate_lightning_address", lambda address: observed.append(address) or {"callback": "ok"})
+    short_claim = short_client.post(
+        f"/x/{code}/claim?response=json",
+        json={"lightning_address": "short-host@wallet.example"},
+        follow_redirects=False,
+    )
+    assert short_claim.status_code == 200
+    assert urlparse(short_claim.json()["redirect_url"]).hostname == "merchant.example"
+    assert "location" not in short_claim.headers
+
     address = "Buyer@Wallet.Example"
     claim = client.post(f"/x/{code}/claim", json={"lightning_address": address}, follow_redirects=False)
     assert claim.status_code == 303
@@ -160,7 +181,10 @@ def test_public_landing_and_claim_are_private_and_fail_safe(tmp_path, monkeypatc
     assert query["bb_click_id"][0].startswith("clk_")
     assert query["bb_campaign"] == [code]
     with main.engine().connect() as connection:
-        row = connection.execute(text("SELECT * FROM cashback_claims")).mappings().one()
+        row = connection.execute(
+            text("SELECT * FROM cashback_claims WHERE lightning_address=:address"),
+            {"address": address.lower()},
+        ).mappings().one()
         assert row["lightning_address"] == address.lower()
         assert address.lower() not in (row.get("redirect_url") or "")
     json_claim = client.post(

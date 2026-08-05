@@ -88,6 +88,11 @@ BASE_URL = os.getenv("BASE_URL", "http://localhost:8000").rstrip("/")
 SHORT_LINK_HOST = os.getenv("SHORT_LINK_HOST", "mrt.st").strip().lower().rstrip(".")
 SHORT_LINK_BASE_URL = os.getenv("SHORT_LINK_BASE_URL", f"https://{SHORT_LINK_HOST}").rstrip("/")
 SHORT_REF_PATH_RE = re.compile(r"^/([A-Za-z0-9][A-Za-z0-9_-]{0,127})/?$")
+SHORT_LINK_CASHBACK_ASSET_PATHS = frozenset({
+    "/static/cashback-express.css",
+    "/static/cashback-express.js",
+    "/static/fonts/space-grotesk-latin.woff2",
+})
 SHORT_LINK_RESERVED_PATHS = {
     "app", "health", "static", "r", "v1", "shopify", "campaigns", "affiliates",
     "flows", "payouts", "docs", "redoc", "openapi.json", "bb.js", "favicon.ico", "invite",
@@ -277,6 +282,7 @@ def legacy_demo_mutations_enabled() -> bool:
 async def redirect_short_link_host(request: Request, call_next: Any) -> Response:
     host = (request.url.hostname or "").lower().rstrip(".")
     cashback_match = re.fullmatch(r"/x/[A-Za-z0-9_-]+", request.url.path)
+    cashback_claim_match = re.fullmatch(r"/x/[A-Za-z0-9_-]+/claim", request.url.path)
     if host != SHORT_LINK_HOST:
         canonical = urlparse(BASE_URL)
         canonical_host = (canonical.hostname or "").lower().rstrip(".")
@@ -296,7 +302,11 @@ async def redirect_short_link_host(request: Request, call_next: Any) -> Response
     netloc = canonical.netloc
     canonical_host = (canonical.hostname or "").lower().rstrip(".")
     match = SHORT_REF_PATH_RE.fullmatch(request.url.path)
+    if request.method in {"GET", "HEAD"} and request.url.path in SHORT_LINK_CASHBACK_ASSET_PATHS:
+        return await call_next(request)
     if request.method in {"GET", "HEAD"} and cashback_match:
+        return await call_next(request)
+    if request.method == "POST" and cashback_claim_match:
         return await call_next(request)
     if (
         request.method in {"GET", "HEAD"}
