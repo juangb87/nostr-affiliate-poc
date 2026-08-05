@@ -318,8 +318,30 @@ document.addEventListener("click", async (event) => {
       });
       window.location.reload();
     } catch (error) {
-      cashbackCampaignStatus.textContent = readableError(error);
+      const globalStatus = document.querySelector("[data-global-status]");
+      if (globalStatus) globalStatus.textContent = readableError(error);
       cashbackCampaignStatus.disabled = false;
+    }
+    return;
+  }
+  const cashbackClaimReveal = event.target.closest("[data-cashback-claim-reveal]");
+  if (cashbackClaimReveal) {
+    const record = cashbackClaimReveal.closest("[data-cashback-claim]");
+    cashbackClaimReveal.disabled = true;
+    try {
+      const result = await jsonFetch(`/app/merchant/cashback-claims/${encodeURIComponent(record.dataset.cashbackClaim)}/destination`, {
+        method: "POST", body: "{}"
+      });
+      const destination = record.querySelector("[data-cashback-claim-destination]");
+      destination.textContent = result.lightning_address;
+      destination.hidden = false;
+      record.querySelector("[data-cashback-claim-masked]").hidden = true;
+      cashbackClaimReveal.hidden = true;
+      destination.focus();
+    } catch (error) {
+      const globalStatus = document.querySelector("[data-global-status]");
+      if (globalStatus) globalStatus.textContent = readableError(error);
+      cashbackClaimReveal.disabled = false;
     }
     return;
   }
@@ -328,15 +350,20 @@ document.addEventListener("click", async (event) => {
     const record = cashbackReveal.closest("[data-cashback-reward]");
     cashbackReveal.disabled = true;
     try {
-      const result = await jsonFetch(`/app/merchant/cashback-rewards/${encodeURIComponent(record.dataset.cashbackReward)}/destination`);
-      record.querySelector("[data-cashback-destination]").textContent = result.lightning_address;
-      record.querySelector("[data-cashback-destination]").hidden = false;
+      const result = await jsonFetch(`/app/merchant/cashback-rewards/${encodeURIComponent(record.dataset.cashbackReward)}/destination`, {
+        method: "POST", body: "{}"
+      });
+      const destination = record.querySelector("[data-cashback-destination]");
+      destination.textContent = result.lightning_address;
+      destination.hidden = false;
       record.querySelector("[data-cashback-masked]").hidden = true;
       record.querySelector("[data-cashback-paid]").hidden = false;
       cashbackReveal.hidden = true;
+      destination.focus();
     } catch (error) {
+      const globalStatus = document.querySelector("[data-global-status]");
+      if (globalStatus) globalStatus.textContent = readableError(error);
       cashbackReveal.disabled = false;
-      cashbackReveal.textContent = readableError(error);
     }
     return;
   }
@@ -782,7 +809,9 @@ document.addEventListener("submit", async (event) => {
           max_reward_sats: Number(fields.get("max_reward_sats"))
         })
       });
-      status.textContent = `Cashback Express listo: ${result.short_url}`;
+      status.textContent = document.documentElement.lang === "en"
+        ? `Cashback Express ready: ${result.short_url}`
+        : `Cashback Express listo: ${result.short_url}`;
       window.location.reload();
     } catch (error) {
       status.textContent = readableError(error); status.classList.add("error"); button.disabled = false;

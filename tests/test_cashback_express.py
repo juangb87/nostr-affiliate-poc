@@ -127,6 +127,7 @@ def test_public_landing_and_claim_are_private_and_fail_safe(tmp_path, monkeypatc
     client = client_for(tmp_path, monkeypatch, merchant)
     login(client, merchant)
     campaign = create_cashback(client, merchant).json()
+    assert campaign["short_url"].startswith("https://mrt.st/x/")
     code = campaign["code"]
     page = client.get(f"/x/{code}?lang=en")
     assert page.status_code == 200
@@ -173,6 +174,60 @@ def test_public_landing_and_claim_are_private_and_fail_safe(tmp_path, monkeypatc
     assert client.post(f"/x/{code}/claim", json={"lightning_address": "buyer@wallet.example"}).status_code == 404
 
 
+def test_short_host_middleware_does_not_redirect_to_itself(tmp_path, monkeypatch):
+    merchant = Keys.generate()
+    client_for(tmp_path, monkeypatch, merchant)
+    monkeypatch.setattr(main, "BASE_URL", "https://mrt.st")
+    short_client = TestClient(main.app, base_url="https://mrt.st")
+
+    response = short_client.get("/x/unknown-code", follow_redirects=False)
+    referral = short_client.get("/affiliate-code", follow_redirects=False)
+
+    assert response.status_code == 404
+    assert "location" not in response.headers
+    assert referral.status_code == 302
+    assert referral.headers["location"] == "https://mrt.st/r/affiliate-code"
+
+
+def test_cashback_has_its_own_dashboard_and_click_destination_is_private(tmp_path, monkeypatch):
+    merchant, outsider = Keys.generate(), Keys.generate()
+    client = client_for(tmp_path, monkeypatch, merchant)
+    login(client, merchant)
+    campaign = create_cashback(client, merchant).json()
+    click_id = _claim_id(client, campaign["code"], "buyer@wallet.example")
+
+    affiliate_program = client.get("/app/merchant?view=campaigns")
+    assert affiliate_program.status_code == 200
+    assert 'id="cashback-express-create"' not in affiliate_program.text
+    assert 'href="/app/merchant?view=cashback"' in affiliate_program.text
+
+    cashback = client.get("/app/merchant?view=cashback")
+    assert cashback.status_code == 200
+    assert 'id="cashback-express-create"' in cashback.text
+    assert 'class="cashback-campaign-card"' in cashback.text
+    assert 'id="cashback-clicks"' in cashback.text
+    assert click_id in cashback.text
+    assert "b***r@w***t.example" in cashback.text
+    assert "buyer@wallet.example" not in cashback.text
+    assert f'data-cashback-claim="{click_id}"' in cashback.text
+
+    assert client.post(f"/app/merchant/cashback-claims/{click_id}/destination").status_code == 403
+    revealed = client.post(f"/app/merchant/cashback-claims/{click_id}/destination", headers={"Origin": "https://testserver"})
+    assert revealed.status_code == 200
+    assert revealed.json()["lightning_address"] == "buyer@wallet.example"
+    assert revealed.headers["cache-control"] == "no-store"
+
+    client.cookies.clear()
+    assert client.post(f"/app/merchant/cashback-claims/{click_id}/destination", headers={"Origin": "https://testserver"}).status_code == 401
+    client.post("/campaigns", json={
+        "merchant_pubkey": outsider.public_key().to_bech32(), "name": "Outsider",
+        "commission_bps": 500, "attribution_window_days": 30,
+        "destination_url": "https://outsider.example", "enrollment_mode": "private",
+    })
+    login(client, outsider)
+    assert client.post(f"/app/merchant/cashback-claims/{click_id}/destination", headers={"Origin": "https://testserver"}).status_code == 404
+
+
 def test_shopify_cashback_reward_is_idempotent_conflict_safe_and_tenant_scoped(tmp_path, monkeypatch):
     merchant = Keys.generate()
     client = client_for(tmp_path, monkeypatch, merchant)
@@ -206,8 +261,8 @@ def test_shopify_cashback_reward_is_idempotent_conflict_safe_and_tenant_scoped(t
     assert conflict.json()["conflict"] is True
     with main.engine().connect() as connection:
         assert connection.execute(text("SELECT COUNT(*) FROM cashback_rewards")).scalar_one() == 1
-    page = client.get("/app/merchant?view=payouts")
-    assert "cashback a pagar" in page.text.lower()
+    page = client.get("/app/merchant?view=cashback")
+    assert "recompensas a compradores" in page.text.lower()
     assert "b***r@w***t.example" in page.text
     assert "buyer@wallet.example" not in page.text
 
@@ -300,14 +355,14 @@ def test_reward_reveal_and_paid_cas_are_authenticated_scoped_and_audited(tmp_pat
         order_total=Decimal("1000"), currency="SATS", authorized_merchant_hex=merchant.public_key().to_hex(),
     )
     reward_id = reward["id"]
-    dashboard = client.get("/app/merchant?view=payouts")
+    dashboard = client.get("/app/merchant?view=cashback")
     assert "buyer@wallet.example" not in dashboard.text
     def outbound_must_not_run(_address):
         raise AssertionError("destination reveal must not perform outbound Lightning calls")
     monkeypatch.setattr(main, "validate_lightning_address", outbound_must_not_run)
 
     client.cookies.clear()
-    assert client.get(f"/app/merchant/cashback-rewards/{reward_id}/destination").status_code == 401
+    assert client.post(f"/app/merchant/cashback-rewards/{reward_id}/destination", headers={"Origin": "https://testserver"}).status_code == 401
     outsider_seed = client.post("/campaigns", json={
         "merchant_pubkey": outsider.public_key().to_bech32(), "name": "Outsider program",
         "commission_bps": 500, "attribution_window_days": 30,
@@ -315,10 +370,11 @@ def test_reward_reveal_and_paid_cas_are_authenticated_scoped_and_audited(tmp_pat
     })
     assert outsider_seed.status_code == 200
     login(client, outsider)
-    assert client.get(f"/app/merchant/cashback-rewards/{reward_id}/destination").status_code == 404
+    assert client.post(f"/app/merchant/cashback-rewards/{reward_id}/destination", headers={"Origin": "https://testserver"}).status_code == 404
     client.cookies.clear()
     login(client, merchant)
-    reveal = client.get(f"/app/merchant/cashback-rewards/{reward_id}/destination")
+    assert client.post(f"/app/merchant/cashback-rewards/{reward_id}/destination").status_code == 403
+    reveal = client.post(f"/app/merchant/cashback-rewards/{reward_id}/destination", headers={"Origin": "https://testserver"})
     assert reveal.status_code == 200 and reveal.json()["lightning_address"] == "buyer@wallet.example"
     assert reveal.headers["cache-control"] == "no-store"
 
@@ -346,7 +402,7 @@ def test_campaign_pause_resume_is_same_origin_owned_and_reflected_in_ui(tmp_path
     paused = client.post(endpoint, json={"status": "paused"}, headers={"Origin": "https://testserver"})
     assert paused.status_code == 200 and paused.json()["status"] == "paused"
     assert client.get(f"/x/{campaign['code']}").status_code == 404
-    page = client.get("/app/merchant?view=campaigns&lang=en")
+    page = client.get("/app/merchant?view=cashback&lang=en")
     assert "Resume" in page.text and "data-cashback-campaign-status" in page.text
 
     client.cookies.clear()
@@ -410,6 +466,6 @@ def test_pending_cashback_total_is_not_limited_to_visible_fifty(tmp_path, monkey
                 VALUES (:id,:order_key,:claim,:campaign,:merchant,1,'1','SATS',1,10000,1,'pending',:created,0)
             """), {"id": f"aggregate-reward-{index}", "order_key": f"aggregate-order-{index}", "claim": claim_id,
                      "campaign": campaign["campaign_id"], "merchant": merchant.public_key().to_hex(), "created": created})
-    page = client.get("/app/merchant?view=payouts")
+    page = client.get("/app/merchant?view=cashback")
     assert page.status_code == 200
-    assert "<strong>60 sats</strong>" in page.text
+    assert "60 sats pendientes" in page.text

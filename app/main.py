@@ -282,7 +282,16 @@ async def redirect_short_link_host(request: Request, call_next: Any) -> Response
     canonical = urlparse(BASE_URL)
     scheme = canonical.scheme or "https"
     netloc = canonical.netloc
+    canonical_host = (canonical.hostname or "").lower().rstrip(".")
     match = SHORT_REF_PATH_RE.fullmatch(request.url.path)
+    cashback_match = re.fullmatch(r"/x/[A-Za-z0-9_-]+", request.url.path)
+    if request.method in {"GET", "HEAD"} and cashback_match:
+        if canonical_host == SHORT_LINK_HOST:
+            return await call_next(request)
+        target = request.url.replace(scheme=scheme, netloc=netloc)
+        response = RedirectResponse(str(target), status_code=302)
+        response.headers["Cache-Control"] = "no-store"
+        return response
     if (
         request.method in {"GET", "HEAD"}
         and match
@@ -292,6 +301,9 @@ async def redirect_short_link_host(request: Request, call_next: Any) -> Response
         response = RedirectResponse(str(target), status_code=302)
         response.headers["Cache-Control"] = "no-store"
         return response
+
+    if canonical_host == SHORT_LINK_HOST:
+        return await call_next(request)
 
     target = request.url.replace(scheme=scheme, netloc=netloc)
     return RedirectResponse(str(target), status_code=308)
@@ -1104,6 +1116,7 @@ def _init_db_unlocked() -> None:
         lightning_address TEXT NOT NULL,
         created_at TEXT NOT NULL,
         expires_at TEXT NOT NULL,
+        destination_revealed_at TEXT,
         consumed_at TEXT,
         consumed_order_key TEXT
     );
@@ -1352,6 +1365,7 @@ def _init_db_unlocked() -> None:
             c.execute(text(stmt))
         if database_url().startswith("postgresql"):
             c.execute(text("ALTER TABLE cashback_campaigns ADD COLUMN IF NOT EXISTS committed_sats INTEGER NOT NULL DEFAULT 0"))
+            c.execute(text("ALTER TABLE cashback_claims ADD COLUMN IF NOT EXISTS destination_revealed_at TEXT"))
             c.execute(text("ALTER TABLE cashback_claims ADD COLUMN IF NOT EXISTS consumed_at TEXT"))
             c.execute(text("ALTER TABLE cashback_claims ADD COLUMN IF NOT EXISTS consumed_order_key TEXT"))
             cashback_reward_column_ddl = {
@@ -1427,7 +1441,7 @@ def _init_db_unlocked() -> None:
             cashback_reward_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(cashback_rewards)")).fetchall()}
             if "committed_sats" not in cashback_campaign_cols:
                 c.execute(text("ALTER TABLE cashback_campaigns ADD COLUMN committed_sats INTEGER NOT NULL DEFAULT 0"))
-            for column in ("consumed_at", "consumed_order_key"):
+            for column in ("destination_revealed_at", "consumed_at", "consumed_order_key"):
                 if column not in cashback_claim_cols:
                     c.execute(text(f"ALTER TABLE cashback_claims ADD COLUMN {column} TEXT"))
             cashback_reward_column_ddl = {
@@ -5721,7 +5735,7 @@ def merchant_account_page(request: Request, view: str = "overview") -> Response:
     session = _session_account(request, "merchant")
     if not session:
         return RedirectResponse("/app?role=merchant", status_code=303)
-    valid_views = {"overview", "campaigns", "affiliates", "activity", "payouts", "integration", "settings"}
+    valid_views = {"overview", "campaigns", "cashback", "affiliates", "activity", "payouts", "integration", "settings"}
     if view not in valid_views:
         raise HTTPException(404, "No se encontró la vista solicitada del espacio del comerciante.")
     configured_shopify_merchant = os.getenv("SHOPIFY_MERCHANT_PUBKEY", DEFAULT_MERCHANT_NPUB)
@@ -5765,7 +5779,15 @@ def merchant_account_page(request: Request, view: str = "overview") -> Response:
     else:
         detail = "La integración de Shopify todavía no está configurada para este comerciante."
     with engine().connect() as c:
-        data = merchant_workspace_data(c, session, base_url=BASE_URL, shopify_ready=shopify_ready, shopify_detail=detail)
+        data = merchant_workspace_data(
+            c,
+            session,
+            base_url=BASE_URL,
+            short_link_base_url=SHORT_LINK_BASE_URL,
+            include_cashback_details=view == "cashback",
+            shopify_ready=shopify_ready,
+            shopify_detail=detail,
+        )
     for campaign in data["campaigns"]:
         campaign["join_short_code"] = campaign_join_short_code(str(campaign["id"]))
     if not data["totals"]["campaigns"]:
@@ -5773,6 +5795,7 @@ def merchant_account_page(request: Request, view: str = "overview") -> Response:
     view_meta = {
         "overview": {"eyebrow": "Cuenta de comerciante", "title": "Tu programa, bajo control.", "lede": "El estado de tu programa, las próximas acciones y sus resultados en un solo lugar."},
         "campaigns": {"eyebrow": "Programa", "title": "Campañas", "lede": "Condiciones públicas, estado y rendimiento de tus programas de afiliados."},
+        "cashback": {"eyebrow": "Recompensas directas", "title": "Cashback Express", "lede": "Campañas, clics y recompensas para compradores, separadas del programa de afiliados."},
         "affiliates": {"eyebrow": "Comunidad", "title": "Afiliados", "lede": "Invitá personas y administrá las identidades inscritas en tus campañas."},
         "activity": {"eyebrow": "Analítica", "title": "Actividad", "lede": "Clics, conversiones y comisiones confirmadas desde tus enlaces."},
         "payouts": {"eyebrow": "Lightning", "title": "Pagos", "lede": "Obligaciones de pago sin custodia y evidencia verificable de liquidación."},
@@ -5782,6 +5805,7 @@ def merchant_account_page(request: Request, view: str = "overview") -> Response:
     nav_items = [
         ("Resumen", "overview"),
         ("Programa", "campaigns"),
+        ("Cashback", "cashback"),
         ("Afiliados", "affiliates"),
         ("Actividad", "activity"),
         ("Pagos", "payouts"),
@@ -5978,7 +6002,7 @@ def merchant_create_cashback_express(body: CashbackCampaignIn, request: Request)
         })
     return {
         "ok": True, "campaign_id": campaign_id, "code": code,
-        "short_url": f"{BASE_URL}/x/{code}", "cashback_bps": cashback_bps,
+        "short_url": f"{SHORT_LINK_BASE_URL}/x/{code}", "cashback_bps": cashback_bps,
     }
 
 
@@ -6071,6 +6095,33 @@ def cashback_express_claim(code: str, body: CashbackClaimIn, response: str | Non
     return RedirectResponse(location, status_code=303, headers=privacy_headers)
 
 
+@app.post("/app/merchant/cashback-claims/{claim_id}/destination", tags=["Accounts"])
+def merchant_reveal_cashback_claim_destination(claim_id: str, request: Request) -> Response:
+    session = require_account_session(request, "merchant")
+    _require_same_origin(request)
+    init_db()
+    with engine().begin() as connection:
+        claim = asdict(connection.execute(text("""
+            SELECT cl.id, cl.lightning_address, cl.created_at, cl.consumed_at,
+                   c.merchant_pubkey_hex
+            FROM cashback_claims cl
+            JOIN cashback_campaigns c ON c.id=cl.campaign_id
+            WHERE cl.id=:claim_id AND c.archived_at IS NULL
+        """), {"claim_id": claim_id}).fetchone())
+        if not claim or not _merchant_session_owns(connection, session, claim["merchant_pubkey_hex"]):
+            raise HTTPException(404, "Cashback click not found.")
+        connection.execute(text("""
+            UPDATE cashback_claims SET destination_revealed_at=:revealed_at
+            WHERE id=:claim_id AND destination_revealed_at IS NULL
+        """), {"revealed_at": now(), "claim_id": claim_id})
+    return JSONResponse({
+        "claim_id": claim_id,
+        "lightning_address": claim["lightning_address"],
+        "created_at": claim["created_at"],
+        "converted": bool(claim.get("consumed_at")),
+    }, headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
+
+
 def _owned_cashback_reward(connection: Any, session: dict[str, Any], reward_id: str) -> dict[str, Any]:
     row = asdict(connection.execute(text("""
         SELECT r.*, cl.lightning_address
@@ -6082,9 +6133,10 @@ def _owned_cashback_reward(connection: Any, session: dict[str, Any], reward_id: 
     return row
 
 
-@app.get("/app/merchant/cashback-rewards/{reward_id}/destination", tags=["Accounts"])
+@app.post("/app/merchant/cashback-rewards/{reward_id}/destination", tags=["Accounts"])
 def merchant_reveal_cashback_destination(reward_id: str, request: Request) -> Response:
     session = require_account_session(request, "merchant")
+    _require_same_origin(request)
     init_db()
     with engine().begin() as connection:
         reward = _owned_cashback_reward(connection, session, reward_id)

@@ -106,6 +106,8 @@ ES_TO_EN: dict[str, str] = {
     "El estado de tu programa, las próximas acciones y sus resultados en un solo lugar.": "Your program status, next actions, and results in one place.",
     "Campañas": "Campaigns",
     "Condiciones públicas, estado y rendimiento de tus programas de afiliados.": "Public terms, status, and performance of your affiliate programs.",
+    "Recompensas directas": "Direct rewards",
+    "Campañas, clics y recompensas para compradores, separadas del programa de afiliados.": "Buyer campaigns, clicks, and rewards, separate from the affiliate program.",
     "Comunidad": "Community",
     "Invitá personas y administrá las identidades inscritas en tus campañas.": "Invite people and manage the identities enrolled in your campaigns.",
     "Analítica": "Analytics",

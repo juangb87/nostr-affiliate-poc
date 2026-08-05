@@ -39,7 +39,16 @@ def mask_lightning_address(value: Any) -> str:
     return f"{masked(local)}@{masked(first_domain)}{dot}{rest}"
 
 
-def merchant_workspace_data(connection: Any, session: dict[str, Any], *, base_url: str, shopify_ready: bool, shopify_detail: str) -> dict[str, Any]:
+def merchant_workspace_data(
+    connection: Any,
+    session: dict[str, Any],
+    *,
+    base_url: str,
+    shopify_ready: bool,
+    shopify_detail: str,
+    short_link_base_url: str | None = None,
+    include_cashback_details: bool = True,
+) -> dict[str, Any]:
     account_id = session["account_id"]
     identities = {session["nostr_pubkey_hex"]}
     identities.update(
@@ -78,10 +87,11 @@ def merchant_workspace_data(connection: Any, session: dict[str, Any], *, base_ur
     cashback_claims: list[dict[str, Any]] = []
     cashback_rewards: list[dict[str, Any]] = []
     pending_cashback_sats = 0
-    if cashback_ids:
+    if cashback_ids and include_cashback_details:
         ids_param = bindparam("cashback_ids", expanding=True)
         cashback_claims = _rows(connection, text("""
-            SELECT cl.id, cl.campaign_id, cl.created_at, cl.expires_at, c.name AS campaign_name
+            SELECT cl.id, cl.campaign_id, cl.lightning_address, cl.created_at, cl.expires_at,
+                   cl.consumed_at, c.name AS campaign_name
             FROM cashback_claims cl JOIN cashback_campaigns c ON c.id=cl.campaign_id
             WHERE cl.campaign_id IN :cashback_ids ORDER BY cl.created_at DESC LIMIT 50
         """).bindparams(ids_param), {"cashback_ids": cashback_ids})
@@ -198,7 +208,15 @@ def merchant_workspace_data(connection: Any, session: dict[str, Any], *, base_ur
         campaign["commission_percent"] = f"{int(campaign['commission_bps']) / 100:g}"
     for campaign in cashback_campaigns:
         campaign["cashback_percent"] = f"{int(campaign['cashback_bps']) / 100:g}"
-        campaign["short_url"] = f"{base_url.rstrip('/')}/x/{campaign['short_code']}"
+        campaign["short_url"] = f"{(short_link_base_url or base_url).rstrip('/')}/x/{campaign['short_code']}"
+    for claim in cashback_claims:
+        claim["lightning_address_masked"] = mask_lightning_address(claim.pop("lightning_address", ""))
+        claim["id_short"] = short(claim.get("id"), 10, 6)
+        try:
+            expires_at = datetime.fromisoformat(str(claim.get("expires_at") or "").replace("Z", "+00:00"))
+            claim["expired"] = not claim.get("consumed_at") and expires_at <= datetime.now(timezone.utc)
+        except ValueError:
+            claim["expired"] = False
     for reward in cashback_rewards:
         reward["lightning_address_masked"] = mask_lightning_address(reward.pop("lightning_address", ""))
     for click in clicks:
@@ -234,8 +252,26 @@ def merchant_workspace_data(connection: Any, session: dict[str, Any], *, base_ur
             and not return_window_pending
         )
 
+    merchant_options_by_pubkey: dict[str, dict[str, str]] = {}
+    for campaign in campaigns + cashback_campaigns:
+        pubkey = str(campaign.get("merchant_pubkey") or "")
+        if pubkey and pubkey not in merchant_options_by_pubkey:
+            merchant_options_by_pubkey[pubkey] = {
+                "merchant_pubkey": pubkey,
+                "label": str(campaign.get("display_name") or campaign.get("name") or pubkey),
+            }
+
+    if not merchant_options_by_pubkey:
+        session_pubkey = str(session.get("nostr_pubkey") or session.get("nostr_pubkey_hex") or "")
+        if session_pubkey:
+            merchant_options_by_pubkey[session_pubkey] = {
+                "merchant_pubkey": session_pubkey,
+                "label": short(session_pubkey),
+            }
+
     return {
         "campaigns": campaigns,
+        "merchant_options": list(merchant_options_by_pubkey.values()),
         "cashback_campaigns": cashback_campaigns,
         "cashback_claims": cashback_claims,
         "cashback_rewards": cashback_rewards,
@@ -247,7 +283,10 @@ def merchant_workspace_data(connection: Any, session: dict[str, Any], *, base_ur
             "campaigns": len(campaigns) + len(cashback_campaigns),
             "affiliate_campaigns": len(campaigns),
             "cashback_campaigns": len(cashback_campaigns),
+            "cashback_claims": sum(int(row.get("claims") or 0) for row in cashback_campaigns),
+            "cashback_rewards": sum(int(row.get("rewards") or 0) for row in cashback_campaigns),
             "active_campaigns": sum(1 for row in campaigns + cashback_campaigns if row.get("status") == "active"),
+            "active_affiliate_campaigns": sum(1 for row in campaigns if row.get("status") == "active"),
             "pending_cashback_sats": pending_cashback_sats,
             "affiliates": int(totals.get("affiliates") or 0),
             "clicks": int(totals.get("clicks") or 0),

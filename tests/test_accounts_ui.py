@@ -604,7 +604,7 @@ def test_merchant_creates_hashed_single_use_invitation_for_owned_campaign(tmp_pa
 
     merchant_page = client.get("/app/merchant?view=affiliates")
     assert merchant_page.status_code == 200
-    assert '/static/app.js?v=20260803-commission1' in merchant_page.text
+    assert '/static/app.js?v=20260805-cashback-clicks1' in merchant_page.text
     assert 'data-invite-origin="https://mrt.st"' in merchant_page.text
 
     invitation = create_invitation(client, campaign["campaign_id"])
@@ -2588,7 +2588,7 @@ def test_all_merchant_views_render_application_copy_in_english(tmp_path, monkeyp
     login(client, merchant, "merchant")
     pages = {
         view: client.get(f"/app/merchant?view={view}&lang=en")
-        for view in ("overview", "campaigns", "affiliates", "activity", "payouts", "integration", "settings")
+        for view in ("overview", "campaigns", "affiliates", "activity", "payouts", "integration", "settings", "cashback")
     }
     assert all(page.status_code == 200 for page in pages.values())
 
@@ -2600,6 +2600,7 @@ def test_all_merchant_views_render_application_copy_in_english(tmp_path, monkeyp
         "payouts": ("Generate Lightning invoice and QR", "Lightning evidence (64 hexadecimal characters)", "This records a merchant-signed declaration."),
         "integration": ("Shopify orders/paid webhook", "Shopify theme script", "Create a pixel under"),
         "settings": ("Public PNG, JPG, or WebP. If omitted, we use the initials.", "Join the affiliate program…"),
+        "cashback": ("A separate buyer-reward flow.", "Buyer clicks", "Create a campaign"),
     }
     for view, phrases in expected.items():
         for phrase in phrases:
