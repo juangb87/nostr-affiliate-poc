@@ -1,4 +1,4 @@
-@font-face{font-family:Space;src:url('/static/fonts/space-grotesk-latin.woff2?v=20260805-status2') format('woff2');font-display:swap}
+@font-face{font-family:Space;src:url('/static/fonts/space-grotesk-latin.woff2?v=20260805-continue1') format('woff2');font-display:swap}
 *{box-sizing:border-box}
 html{color-scheme:dark}
 body{margin:0;min-height:100vh;background:#151615;color:#f7f5ea;font-family:Space,system-ui,sans-serif}
@@ -25,6 +25,9 @@ button:disabled{opacity:.6;cursor:wait}
 small{color:#aaa}
 a{color:inherit}
 .check-link{display:inline-flex;align-items:center;gap:8px;margin-top:28px;color:#f9c441;font-weight:700;text-underline-offset:4px}
+.skip-cashback{display:flex;align-items:center;justify-content:space-between;gap:18px;margin-top:28px;padding:18px 20px;border:1px solid rgba(255,255,255,.12);border-radius:16px;background:rgba(255,255,255,.035)}
+.skip-cashback p{margin:0;font-size:15px;color:#b9bbb2}
+.continue-link{flex:0 0 auto;display:inline-flex;align-items:center;gap:7px;min-height:44px;padding:10px 0;color:#e3e3d7;font-size:15px;font-weight:700;text-underline-offset:4px}
 
 .status-shell{width:min(900px,100%)}
 .status-shell .brand{margin-bottom:clamp(28px,5vh,54px)}
@@ -79,6 +82,7 @@ html[lang=es] body [lang=es],html[lang=en] body [lang=en]{display:inline}
   .status-notice,.status-empty,.status-result{padding:18px}
   .back-link{margin-bottom:24px}
   input,button{width:100%}
+  .skip-cashback{align-items:flex-start;flex-direction:column;gap:10px;padding:16px}
 }
 
 @media(max-width:340px){

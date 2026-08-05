@@ -133,14 +133,20 @@ def test_public_landing_and_claim_are_private_and_fail_safe(tmp_path, monkeypatc
     assert canonical.status_code == 302
     assert canonical.headers["location"] == f"https://mrt.st/x/{code}?lang=en"
     assert canonical.headers["cache-control"] == "no-store"
+    canonical_continue = client.get(f"/x/{code}/continue", follow_redirects=False)
+    assert canonical_continue.status_code == 302
+    assert canonical_continue.headers["location"] == f"https://mrt.st/x/{code}/continue"
     short_client = TestClient(main.app, base_url="https://mrt.st")
     page = short_client.get(f"/x/{code}?lang=en")
     assert page.status_code == 200
     assert "Cashback café" in page.text and "7.25%" in page.text
     assert "Cashback" in page.text and "reembolso" in page.text
-    assert '/static/cashback-express.css?v=20260805-status2' in page.text
+    assert '/static/cashback-express.css?v=20260805-continue1' in page.text
     assert '/static/cashback-express.js?v=20260805-status2' in page.text
     assert f'href="/x/{code}/check"' in page.text
+    assert f'href="/x/{code}/continue"' in page.text
+    assert "Continuar sin cashback" in page.text
+    assert "Continue without cashback" in page.text
     assert page.headers["cache-control"] == "no-store"
     assert page.headers["referrer-policy"] == "no-referrer"
     assert "referrer no-referrer" not in page.headers["content-security-policy"]
@@ -158,6 +164,17 @@ def test_public_landing_and_claim_are_private_and_fail_safe(tmp_path, monkeypatc
     assert unrelated_asset.status_code == 308
     assert unrelated_asset.headers["location"] == "https://testserver/static/app.js"
     assert "bb_click_id" not in page.text
+
+    skipped = short_client.get(f"/x/{code}/continue", follow_redirects=False)
+    assert skipped.status_code == 302
+    assert skipped.headers["location"] == "https://merchant.example/shop?utm=keep"
+    assert skipped.headers["cache-control"] == "no-store"
+    assert skipped.headers["referrer-policy"] == "no-referrer"
+    assert "set-cookie" not in skipped.headers
+    with main.engine().connect() as connection:
+        assert connection.execute(text(
+            "SELECT COUNT(*) FROM cashback_claims WHERE campaign_id=:campaign"
+        ), {"campaign": campaign["campaign_id"]}).scalar_one() == 0
 
     observed = []
     monkeypatch.setattr(main, "validate_lightning_address", lambda address: observed.append(address) or {"callback": "ok"})
@@ -609,6 +626,8 @@ def test_campaign_pause_resume_is_same_origin_owned_and_reflected_in_ui(tmp_path
     paused = client.post(endpoint, json={"status": "paused"}, headers={"Origin": "https://testserver"})
     assert paused.status_code == 200 and paused.json()["status"] == "paused"
     assert client.get(f"/x/{campaign['code']}").status_code == 404
+    short_client = TestClient(main.app, base_url="https://mrt.st")
+    assert short_client.get(f"/x/{campaign['code']}/continue", follow_redirects=False).status_code == 404
     page = client.get("/app/merchant?view=cashback&lang=en")
     assert "Resume" in page.text and "data-cashback-campaign-status" in page.text
 
@@ -626,6 +645,9 @@ def test_campaign_pause_resume_is_same_origin_owned_and_reflected_in_ui(tmp_path
     resumed = client.post(endpoint, json={"status": "active"}, headers={"Origin": "https://testserver"})
     assert resumed.status_code == 200
     assert client.get(f"/x/{campaign['code']}").status_code == 200
+    continued = short_client.get(f"/x/{campaign['code']}/continue", follow_redirects=False)
+    assert continued.status_code == 302
+    assert continued.headers["location"] == "https://merchant.example/shop?utm=keep"
 
 
 def test_stale_processing_delivery_is_requeued_without_duplicate_reward(tmp_path, monkeypatch):

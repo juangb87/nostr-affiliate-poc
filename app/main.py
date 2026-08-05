@@ -290,10 +290,11 @@ async def redirect_short_link_host(request: Request, call_next: Any) -> Response
     cashback_match = re.fullmatch(r"/x/[A-Za-z0-9_-]+", request.url.path)
     cashback_claim_match = re.fullmatch(r"/x/[A-Za-z0-9_-]+/claim", request.url.path)
     cashback_status_match = re.fullmatch(r"/x/[A-Za-z0-9_-]+/check", request.url.path)
+    cashback_continue_match = re.fullmatch(r"/x/[A-Za-z0-9_-]+/continue", request.url.path)
     forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip().lower()
     effective_scheme = forwarded_proto if forwarded_proto in {"http", "https"} else request.url.scheme
     if (
-        (cashback_match or cashback_claim_match or cashback_status_match)
+        (cashback_match or cashback_claim_match or cashback_status_match or cashback_continue_match)
         and urlparse(SHORT_LINK_BASE_URL).scheme == "https"
         and effective_scheme != "https"
     ):
@@ -309,7 +310,7 @@ async def redirect_short_link_host(request: Request, call_next: Any) -> Response
         canonical_host = (canonical.hostname or "").lower().rstrip(".")
         if (
             request.method in {"GET", "HEAD"}
-            and (cashback_match or cashback_status_match)
+            and (cashback_match or cashback_status_match or cashback_continue_match)
             and host == canonical_host
         ):
             short_origin = urlparse(SHORT_LINK_BASE_URL)
@@ -334,6 +335,8 @@ async def redirect_short_link_host(request: Request, call_next: Any) -> Response
     if request.method == "POST" and cashback_claim_match:
         return await call_next(request)
     if request.method in {"GET", "HEAD", "POST"} and cashback_status_match:
+        return await call_next(request)
+    if request.method in {"GET", "HEAD"} and cashback_continue_match:
         return await call_next(request)
     if (
         request.method in {"GET", "HEAD"}
@@ -6121,6 +6124,18 @@ def cashback_express_landing(request: Request, code: str) -> Response:
         "Content-Security-Policy": "default-src 'self'; img-src 'self' https: data:; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
     })
     return response
+
+
+@app.get("/x/{code}/continue", include_in_schema=False)
+def cashback_express_continue_without_cashback(code: str) -> Response:
+    campaign = _cashback_campaign_by_code(code)
+    # This path intentionally creates no claim, attribution ID, status capability, or cookie.
+    location = urlunparse(urlparse(campaign["destination_url"])._replace(fragment=""))
+    return RedirectResponse(
+        location,
+        status_code=302,
+        headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
+    )
 
 
 @app.post("/x/{code}/claim", include_in_schema=False)
