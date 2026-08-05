@@ -290,12 +290,24 @@ def test_demo_flow_creates_conversion_and_proof(tmp_path, monkeypatch):
     click = client.post('/clicks/simulate', json={'ref_code': data['enrollment']['ref_code']})
     assert click.status_code == 200
     assert click.json()['click_id'].startswith('clk_')
+    conflicting_cookie = client.post(
+        '/conversions',
+        headers={'Cookie': 'mrt_click_id=clk_wrong; bb_click_id=clk_other'},
+        json={
+            'order_id': 'conflicting_cookie_order',
+            'click_id': click.json()['click_id'],
+            'order_total': 125,
+            'currency': 'USD',
+        },
+    )
+    assert conflicting_cookie.status_code == 400
+    assert conflicting_cookie.json()['detail'] == 'conflicting attribution values for mrt_click_id'
     no_auth = client.post('/merchant/conversions', json={'order_id': 'merchant_order_1', 'bb_click_id': click.json()['click_id'], 'order_total': 125, 'currency': 'USD'})
     assert no_auth.status_code == 401
     webhook = client.post(
         '/merchant/conversions',
         headers={'Authorization': 'Bearer bumbei-demo-key'},
-        json={'order_id': 'merchant_order_1', 'bb_click_id': click.json()['click_id'], 'order_total': 125, 'currency': 'USD', 'metadata': {'platform': 'shopify'}},
+        json={'order_id': 'merchant_order_1', 'mrt_click_id': click.json()['click_id'], 'order_total': 125, 'currency': 'USD', 'metadata': {'platform': 'shopify'}},
     )
     assert webhook.status_code == 200, webhook.text
     webhook_json = webhook.json()
@@ -316,7 +328,7 @@ def test_demo_flow_creates_conversion_and_proof(tmp_path, monkeypatch):
     sats_webhook = client.post(
         '/merchant/conversions',
         headers={'Authorization': 'Bearer bumbei-demo-key'},
-        json={'order_id': 'merchant_order_sats', 'bb_click_id': sat_click, 'order_total': 250000, 'currency': 'SATS', 'metadata': {'platform': 'oshigoods'}},
+        json={'order_id': 'merchant_order_sats', 'mrt_click_id': sat_click, 'order_total': 250000, 'currency': 'SATS', 'metadata': {'platform': 'oshigoods'}},
     )
     assert sats_webhook.status_code == 200, sats_webhook.text
     assert sats_webhook.json()['order_total_sats'] == 250000
@@ -326,21 +338,28 @@ def test_demo_flow_creates_conversion_and_proof(tmp_path, monkeypatch):
     btc_webhook = client.post(
         '/merchant/conversions',
         headers={'Authorization': 'Bearer bumbei-demo-key'},
-        json={'order_id': 'merchant_order_btc', 'bb_click_id': btc_click, 'order_total': 0.0025, 'currency': 'BTC'},
+        json={'order_id': 'merchant_order_btc', 'mrt_click_id': btc_click, 'order_total': 0.0025, 'currency': 'BTC'},
     )
     assert btc_webhook.status_code == 200, btc_webhook.text
     assert btc_webhook.json()['order_total_sats'] == 250000
     assert btc_webhook.json()['commission_sats'] == 20000
-    snippet = client.get('/bb.js')
+    snippet = client.get('/mrt.js')
     assert snippet.status_code == 200
-    assert 'window.BumbeiAttribution' in snippet.text
-    assert 'bb_click_id' in snippet.text
-    landing = client.get(f"/demo-merchant?bb_click_id={click.json()['click_id']}&bb_ref={data['enrollment']['ref_code']}")
+    assert 'window.MeeratAttribution' in snippet.text
+    assert 'mrt_click_id' in snippet.text
+    assert "localStorage.setItem('bb_click_id'" not in snippet.text
+    assert "setCookie('bb_click_id'" not in snippet.text
+    legacy_snippet = client.get('/bb.js')
+    assert legacy_snippet.status_code == 200
+    assert "p.get('mrt_click_id')" in legacy_snippet.text
+    assert "p.get('mrt_ref')" in legacy_snippet.text
+    landing = client.get(f"/demo-merchant?mrt_click_id={click.json()['click_id']}&mrt_ref={data['enrollment']['ref_code']}")
     assert landing.status_code == 200
-    assert '/bb.js' in landing.text
+    assert '/mrt.js' in landing.text
+    assert 'Bumbei' not in landing.text
     demo_checkout = client.post(
         '/demo-merchant/checkout',
-        json={'bb_click_id': click.json()['click_id'], 'bb_ref': data['enrollment']['ref_code'], 'order_total': 250000, 'currency': 'SATS'},
+        json={'mrt_click_id': click.json()['click_id'], 'mrt_ref': data['enrollment']['ref_code'], 'order_total': 250000, 'currency': 'SATS'},
     )
     assert demo_checkout.status_code == 200, demo_checkout.text
     assert demo_checkout.json()['ok'] is True

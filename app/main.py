@@ -101,7 +101,7 @@ SHORT_LINK_CASHBACK_ASSET_PATHS = frozenset({
 CASHBACK_STATUS_COOKIE = "meerat_cashback_status"
 SHORT_LINK_RESERVED_PATHS = {
     "app", "health", "static", "r", "v1", "shopify", "campaigns", "affiliates",
-    "flows", "payouts", "docs", "redoc", "openapi.json", "bb.js", "favicon.ico", "invite",
+    "flows", "payouts", "docs", "redoc", "openapi.json", "mrt.js", "bb.js", "favicon.ico", "invite",
 }
 DEFAULT_DESTINATION = os.getenv("DEFAULT_DESTINATION_URL", "https://example.com/checkout")
 DEFAULT_RELAYS = "wss://nos.lol,wss://relay.damus.io,wss://relay.primal.net"
@@ -1932,11 +1932,11 @@ def startup() -> None:
 
 class CampaignIn(BaseModel):
     merchant_pubkey: str = Field(..., examples=[DEFAULT_MERCHANT_NPUB])
-    name: str = "Bumbei BTC Rewards"
+    name: str = "Meerat Affiliate Rewards"
     commission_bps: int = 800
     attribution_window_days: int = 30
     destination_url: str = DEFAULT_DESTINATION
-    terms_url: str = "https://bumbei.com/terms/affiliate"
+    terms_url: str = "https://www.meerat.com/terms/affiliate"
     enrollment_mode: Literal["private", "approval", "open"] = "private"
 
 
@@ -2039,27 +2039,53 @@ class ConversionIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     order_id: str
-    click_id: str
+    mrt_click_id: str
     order_total: Decimal = Field(..., gt=0, max_digits=20, decimal_places=8)
     currency: str = "USD"
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_legacy_click_id(cls, value: Any) -> Any:
+        return canonicalize_attribution_input(value)
 
 
 class SimulateClickIn(BaseModel):
     ref_code: str
 
 
+def canonicalize_attribution_input(value: Any) -> Any:
+    """Map legacy attribution aliases to Meerat keys and reject contradictions."""
+    if not isinstance(value, dict):
+        return value
+    data = dict(value)
+    alias_groups = {
+        "mrt_ref": ("bb_ref", "bumbei_ref", "affiliate", "ref"),
+        "mrt_click_id": ("bb_click_id", "click_id"),
+        "mrt_campaign": ("bb_campaign",),
+    }
+    for canonical, aliases in alias_groups.items():
+        supplied = [
+            (key, data.get(key))
+            for key in (canonical, *aliases)
+            if data.get(key) not in (None, "")
+        ]
+        if len({str(item) for _, item in supplied}) > 1:
+            raise ValueError(f"conflicting attribution values for {canonical}")
+        if supplied:
+            data[canonical] = supplied[0][1]
+        for alias in aliases:
+            data.pop(alias, None)
+    return data
+
+
 class BrowserEventIn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     type: str = Field("page_view", description="Browser event type, e.g. page_view")
     shop: Optional[str] = None
     mrt_ref: Optional[str] = None
     mrt_click_id: Optional[str] = None
     mrt_campaign: Optional[str] = None
-    bb_ref: Optional[str] = None
-    bumbei_ref: Optional[str] = None
-    affiliate: Optional[str] = None
-    ref: Optional[str] = None
-    bb_click_id: Optional[str] = None
-    click_id: Optional[str] = None
     url: Optional[str] = None
     path: Optional[str] = None
     query: Optional[str] = None
@@ -2067,19 +2093,20 @@ class BrowserEventIn(BaseModel):
     user_agent: Optional[str] = None
     ts: Optional[str] = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def accept_legacy_attribution_aliases(cls, value: Any) -> Any:
+        return canonicalize_attribution_input(value)
+
 
 class BrowserConversionIn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     type: str = Field("checkout_completed", description="Browser/pixel conversion event type")
     shop: Optional[str] = None
     mrt_ref: Optional[str] = None
     mrt_click_id: Optional[str] = None
     mrt_campaign: Optional[str] = None
-    bb_ref: Optional[str] = None
-    bumbei_ref: Optional[str] = None
-    affiliate: Optional[str] = None
-    ref: Optional[str] = None
-    bb_click_id: Optional[str] = None
-    click_id: Optional[str] = None
     order_id: Optional[str] = None
     order_name: Optional[str] = None
     checkout_token: Optional[str] = None
@@ -2092,23 +2119,40 @@ class BrowserConversionIn(BaseModel):
     ts: Optional[str] = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
+    @model_validator(mode="before")
+    @classmethod
+    def accept_legacy_attribution_aliases(cls, value: Any) -> Any:
+        return canonicalize_attribution_input(value)
+
 
 class MerchantConversionIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     order_id: str = Field(..., min_length=3)
-    bb_click_id: str = Field(..., min_length=4)
+    mrt_click_id: str = Field(..., min_length=4)
     order_total: Decimal = Field(..., gt=0, max_digits=20, decimal_places=8)
     currency: str = Field("USD", description="USD, SATS, or BTC. USD is converted to sats server-side.")
     customer_hash: Optional[str] = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
+    @model_validator(mode="before")
+    @classmethod
+    def accept_legacy_click_id(cls, value: Any) -> Any:
+        return canonicalize_attribution_input(value)
+
 
 class DemoMerchantCheckoutIn(BaseModel):
-    bb_click_id: str = Field(..., min_length=4)
-    bb_ref: Optional[str] = None
+    model_config = ConfigDict(extra="forbid")
+
+    mrt_click_id: str = Field(..., min_length=4)
+    mrt_ref: Optional[str] = None
     order_total: Decimal = Field(Decimal("250000"), gt=0, max_digits=20, decimal_places=8)
     currency: str = "SATS"
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_legacy_attribution_aliases(cls, value: Any) -> Any:
+        return canonicalize_attribution_input(value)
 
 
 class PayoutMarkPaidIn(BaseModel):
@@ -2800,15 +2844,15 @@ def redirect_click(ref_code: str, request: Request) -> RedirectResponse:
                 "created_at": now(),
             },
         )
-    url = add_query_params(camp["destination_url"], {"bb_click_id": click_id, "bb_ref": ref_code})
+    url = add_query_params(camp["destination_url"], {"mrt_click_id": click_id, "mrt_ref": ref_code})
     resp = RedirectResponse(url, status_code=302)
-    resp.set_cookie("bb_click_id", click_id, max_age=60 * 60 * 24 * int(camp["window_days"]), httponly=True, samesite="lax")
+    resp.set_cookie("mrt_click_id", click_id, max_age=60 * 60 * 24 * int(camp["window_days"]), httponly=True, samesite="lax")
     return resp
 
 
 def _create_conversion(
     body: ConversionIn,
-    bb_click_id: Optional[str] = None,
+    cookie_click_id: Optional[str] = None,
     *,
     merchant_order_key: str | None = None,
     idempotency_payload_hash: str | None = None,
@@ -2823,7 +2867,7 @@ def _create_conversion(
         "rate_stale": False,
     }
     init_db()
-    click_id = body.click_id or bb_click_id
+    click_id = body.mrt_click_id or cookie_click_id
     pause_event: dict[str, Any] | None = None
     with _INVITATION_ACCEPT_LOCK, engine().begin() as c:
         click = asdict(c.execute(text("SELECT * FROM clicks WHERE id=:id"), {"id": click_id}).fetchone())
@@ -2979,8 +3023,17 @@ def _create_conversion(
 
 
 @app.post("/conversions")
-def create_conversion(body: ConversionIn, bb_click_id: Optional[str] = Cookie(None)) -> dict[str, Any]:
-    return _create_conversion(body, bb_click_id)
+def create_conversion(
+    body: ConversionIn,
+    mrt_click_id: Optional[str] = Cookie(None),
+    legacy_click_id: Optional[str] = Cookie(None, alias="bb_click_id", include_in_schema=False),
+) -> dict[str, Any]:
+    supplied_click_ids = {
+        click_id for click_id in (body.mrt_click_id, mrt_click_id, legacy_click_id) if click_id
+    }
+    if len(supplied_click_ids) > 1:
+        raise HTTPException(400, "conflicting attribution values for mrt_click_id")
+    return _create_conversion(body, mrt_click_id or legacy_click_id)
 
 
 def apply_reversal_to_payout(c: Any, conversion: dict[str, Any]) -> None:
@@ -3133,28 +3186,16 @@ def simulate_click(body: SimulateClickIn) -> dict[str, Any]:
                 "created_at": now(),
             },
         )
-    redirect_url = add_query_params(camp["destination_url"], {"bb_click_id": click_id, "bb_ref": body.ref_code})
+    redirect_url = add_query_params(camp["destination_url"], {"mrt_click_id": click_id, "mrt_ref": body.ref_code})
     return {"click_id": click_id, "ref_code": body.ref_code, "campaign_id": enr["campaign_id"], "affiliate_pubkey": enr["affiliate_pubkey"], "redirect_url": redirect_url}
 
 
 def _tracking_ref(payload: Any) -> str:
-    return safe_text(
-        getattr(payload, "mrt_ref", None)
-        or getattr(payload, "bb_ref", None)
-        or getattr(payload, "bumbei_ref", None)
-        or getattr(payload, "affiliate", None)
-        or getattr(payload, "ref", None),
-        200,
-    )
+    return safe_text(getattr(payload, "mrt_ref", None), 200)
 
 
 def _tracking_click_id(payload: Any) -> str:
-    return safe_text(
-        getattr(payload, "mrt_click_id", None)
-        or getattr(payload, "bb_click_id", None)
-        or getattr(payload, "click_id", None),
-        120,
-    )
+    return safe_text(getattr(payload, "mrt_click_id", None), 120)
 
 
 def _request_ip(request: Request) -> str:
@@ -3180,7 +3221,7 @@ def store_tracking_event(kind: str, body: BrowserEventIn | BrowserConversionIn, 
     ref_code = _tracking_ref(body)
     click_id = _tracking_click_id(body)
     if not ref_code and not click_id:
-        raise HTTPException(400, "missing bb_ref or bb_click_id")
+        raise HTTPException(400, "missing mrt_ref or mrt_click_id")
 
     event_id = hid("evt")
     user_agent = safe_text(getattr(body, "user_agent", None) or request.headers.get("user-agent", ""), 500)
@@ -3196,7 +3237,7 @@ def store_tracking_event(kind: str, body: BrowserEventIn | BrowserConversionIn, 
         click = asdict(c.execute(text("SELECT * FROM clicks WHERE id=:id"), {"id": click_id}).fetchone()) if click_id else None
         if click:
             if ref_code and ref_code != click["ref_code"]:
-                raise HTTPException(400, "bb_ref does not match bb_click_id")
+                raise HTTPException(400, "mrt_ref does not match mrt_click_id")
             ref_code = click["ref_code"]
         raw_metadata = getattr(body, "metadata", None) or {}
         safe_metadata = {
@@ -3207,8 +3248,8 @@ def store_tracking_event(kind: str, body: BrowserEventIn | BrowserConversionIn, 
         payload = {
             "type": safe_text(getattr(body, "type", None) or kind, 80),
             "shop": safe_text(getattr(body, "shop", None), 120) or None,
-            "bb_ref": ref_code or None,
-            "bb_click_id": click_id or None,
+            "mrt_ref": ref_code or None,
+            "mrt_click_id": click_id or None,
             "path": safe_text(getattr(body, "path", None), 1000) or None,
             "order_total": order_total,
             "currency": safe_text(getattr(body, "currency", None), 20).upper() or None,
@@ -3253,8 +3294,8 @@ def store_tracking_event(kind: str, body: BrowserEventIn | BrowserConversionIn, 
         "event_id": event_id,
         "kind": kind,
         "type": safe_text(getattr(body, "type", None) or kind, 80),
-        "bb_ref": ref_code or None,
-        "bb_click_id": click_id or None,
+        "mrt_ref": ref_code or None,
+        "mrt_click_id": click_id or None,
     }
 
 
@@ -3282,7 +3323,7 @@ def tracking_status(limit: int = 10) -> dict[str, Any]:
         counts = {r._mapping["kind"]: r._mapping["count"] for r in c.execute(text("SELECT kind, COUNT(*) AS count FROM tracking_events GROUP BY kind")).fetchall()}
         recent = [dict(r._mapping) for r in c.execute(
             text("""
-                SELECT id, kind, event_type, ref_code AS bb_ref, click_id AS bb_click_id, shop, path, created_at
+                SELECT id, kind, event_type, ref_code AS mrt_ref, click_id AS mrt_click_id, shop, path, created_at
                 FROM tracking_events
                 ORDER BY created_at DESC
                 LIMIT :limit
@@ -3411,7 +3452,7 @@ def _process_merchant_conversion_locked(
     init_db()
     order_id_hash = sha(body.order_id)
     payload_material = {
-        "click_id": body.bb_click_id,
+        "click_id": body.mrt_click_id,
         "order_total": decimal_text(body.order_total),
         "currency": body.currency.upper().strip(),
     }
@@ -3491,14 +3532,14 @@ def _process_merchant_conversion_locked(
             SELECT c.merchant_pubkey, c.merchant_pubkey_hex
             FROM clicks cl JOIN campaigns c ON c.id=cl.campaign_id
             WHERE cl.id=:click_id
-        """), {"click_id": body.bb_click_id}).fetchone())
+        """), {"click_id": body.mrt_click_id}).fetchone())
     if not click_campaign:
         raise HTTPException(404, "click not found")
     require_merchant_ownership(click_campaign, authorized_merchant_hex)
     conversion = _create_conversion(
         ConversionIn(
             order_id=body.order_id,
-            click_id=body.bb_click_id,
+            mrt_click_id=body.mrt_click_id,
             order_total=body.order_total,
             currency=body.currency,
         ),
@@ -3531,7 +3572,7 @@ def _process_merchant_conversion_locked(
 def merchant_conversion_webhook(body: MerchantConversionIn, authorization: Optional[str] = Header(default=None)) -> dict[str, Any]:
     """Merchant-facing server-to-server conversion webhook.
 
-    The merchant sends back the bb_click_id captured from the referral redirect. Raw
+    The merchant sends back the mrt_click_id captured from the referral redirect. Raw
     order/customer data is not published to Nostr; the conversion proof stores hashes.
     """
     authorized_merchant_hex = require_merchant_api_key(authorization)
@@ -3662,12 +3703,19 @@ def verify_shopify_webhook(raw_body: bytes, signature: str) -> None:
 
 def shopify_note_attributes(payload: dict[str, Any]) -> dict[str, str]:
     attributes: dict[str, str] = {}
+    attribution_names = {
+        "mrt_ref", "bb_ref", "bumbei_ref", "affiliate", "ref",
+        "mrt_click_id", "bb_click_id", "click_id",
+        "mrt_campaign", "bb_campaign",
+    }
     for item in payload.get("note_attributes") or []:
         if not isinstance(item, dict):
             continue
         name = safe_text(item.get("name"), 120)
         value = safe_text(item.get("value"), 500)
         if name and value:
+            if name in attribution_names and name in attributes and attributes[name] != value:
+                raise ValueError(f"conflicting duplicate attribution value for {name}")
             attributes[name] = value
     return attributes
 
@@ -3905,7 +3953,7 @@ def process_shopify_delivery(order_key: str) -> None:
             result = process_merchant_conversion(
                 MerchantConversionIn(
                     order_id=order_key,
-                    bb_click_id=row["click_id"],
+                    mrt_click_id=row["click_id"],
                     order_total=Decimal(row.get("order_total_decimal") or str(row["order_total"])),
                     currency=row["currency"],
                     metadata={"platform": "shopify", "shop": row["shop_domain"], "topic": row["topic"]},
@@ -3980,11 +4028,18 @@ async def shopify_orders_paid_webhook(request: Request, background_tasks: Backgr
         raise HTTPException(400, "invalid Shopify webhook payload")
 
     record_shopify_webhook_receipt(webhook_id, shop, topic, "received")
-    attributes = shopify_note_attributes(payload)
     # Meerat keys are canonical. Legacy keys remain read-only aliases so carts
     # created by the previous Shopify script can finish without losing cashback.
-    click_id = attributes.get("mrt_click_id") or attributes.get("bb_click_id") or attributes.get("click_id")
-    attribution_code = attributes.get("mrt_campaign") or attributes.get("bb_campaign")
+    try:
+        attributes = shopify_note_attributes(payload)
+        normalized_attribution = canonicalize_attribution_input(attributes)
+    except ValueError:
+        record_shopify_webhook_receipt(
+            webhook_id, shop, topic, "conflict", "conflicting affiliate attribution"
+        )
+        raise HTTPException(422, "conflicting affiliate attribution")
+    click_id = normalized_attribution.get("mrt_click_id")
+    attribution_code = normalized_attribution.get("mrt_campaign")
     if not click_id:
         record_shopify_webhook_receipt(webhook_id, shop, topic, "ignored", "missing affiliate attribution")
         return {
@@ -5482,17 +5537,123 @@ def demo() -> dict[str, Any]:
                 "created_at": now(),
             },
         )
-    conversion = create_conversion(ConversionIn(order_id=hid("ord"), click_id=click_id, order_total=100.0, currency="USD"))
+    conversion = _create_conversion(ConversionIn(order_id=hid("ord"), mrt_click_id=click_id, order_total=100.0, currency="USD"))
     return {"campaign": campaign, "enrollment": enrollment, "click_id": click_id, "conversion": conversion, "affiliate": affiliate_summary(DEFAULT_AFFILIATE_NPUB)}
 
 
 
+MRT_JS = r"""
+(function(){
+  var COOKIE_DAYS = 30;
+  var blocked = false;
+  function readParams(){
+    var p = new URLSearchParams(window.location.search || '');
+    var canonicalClick = p.get('mrt_click_id'), legacyClick = p.get('bb_click_id');
+    var canonicalRef = p.get('mrt_ref'), legacyRef = p.get('bb_ref');
+    if((canonicalClick && legacyClick && canonicalClick !== legacyClick) ||
+       (canonicalRef && legacyRef && canonicalRef !== legacyRef)) return { conflict: true };
+    return {
+      conflict: false,
+      found: !!(canonicalClick || legacyClick || canonicalRef || legacyRef),
+      attribution: {
+        mrt_click_id: canonicalClick || legacyClick,
+        mrt_ref: canonicalRef || legacyRef
+      }
+    };
+  }
+  function setCookie(name, value){
+    if(!value) return;
+    var maxAge = COOKIE_DAYS * 24 * 60 * 60;
+    document.cookie = name + '=' + encodeURIComponent(value) + '; path=/; max-age=' + maxAge + '; SameSite=Lax';
+  }
+  function getCookie(name){
+    var match = document.cookie.match(new RegExp('(?:^|; )' + name.replace(/[.$?*|{}()\[\]\\\/\+^]/g, '\\$&') + '=([^;]*)'));
+    return match ? decodeURIComponent(match[1]) : null;
+  }
+  function clearStoredAttribution(){
+    ['mrt_click_id','mrt_ref','bb_click_id','bb_ref'].forEach(function(name){
+      localStorage.removeItem(name);
+      document.cookie = name + '=; path=/; max-age=0; SameSite=Lax';
+    });
+  }
+  function compatibleStoredValue(canonical, legacy){
+    var values = [
+      localStorage.getItem(canonical), getCookie(canonical),
+      localStorage.getItem(legacy), getCookie(legacy)
+    ].filter(function(value){ return !!value; });
+    var distinct = values.filter(function(value, index){ return values.indexOf(value) === index; });
+    return distinct.length === 1 ? distinct[0] : null;
+  }
+  function save(attribution){
+    if(attribution.mrt_click_id) { localStorage.setItem('mrt_click_id', attribution.mrt_click_id); setCookie('mrt_click_id', attribution.mrt_click_id); }
+    if(attribution.mrt_ref) { localStorage.setItem('mrt_ref', attribution.mrt_ref); setCookie('mrt_ref', attribution.mrt_ref); }
+  }
+  function get(){
+    if(blocked) return { mrt_click_id: null, mrt_ref: null };
+    return {
+      mrt_click_id: compatibleStoredValue('mrt_click_id', 'bb_click_id'),
+      mrt_ref: compatibleStoredValue('mrt_ref', 'bb_ref')
+    };
+  }
+  function injectHiddenInputs(root){
+    var attr = get();
+    root = root || document;
+    Array.prototype.forEach.call(root.querySelectorAll('form'), function(form){
+      ['mrt_click_id','mrt_ref'].forEach(function(name){
+        var val = attr[name];
+        if(!val) return;
+        var input = form.querySelector('input[name="'+name+'"]');
+        if(!input){
+          input = document.createElement('input');
+          input.type = 'hidden';
+          input.name = name;
+          form.appendChild(input);
+        }
+        input.value = val;
+      });
+    });
+  }
+  function init(){
+    var params = readParams();
+    if(params.conflict) {
+      blocked = true;
+    } else if(params.found) {
+      clearStoredAttribution();
+      save(params.attribution);
+    } else {
+      var stored = get();
+      if(stored.mrt_click_id || stored.mrt_ref) save(stored);
+    }
+    injectHiddenInputs(document);
+    window.dispatchEvent(new CustomEvent('meerat:attribution', { detail: get() }));
+  }
+  window.MeeratAttribution = {
+    init: init,
+    get: get,
+    save: save,
+    injectHiddenInputs: injectHiddenInputs,
+    debug: function(){ console.table(get()); return get(); }
+  };
+  if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
+})();
+"""
+
+
+# Frozen compatibility artifact for merchants that still load /bb.js. New
+# integrations use /mrt.js and write only the canonical Meerat namespace.
 BB_JS = r"""
 (function(){
   var COOKIE_DAYS = 30;
   function readParams(){
     var p = new URLSearchParams(window.location.search || '');
-    return { bb_click_id: p.get('bb_click_id'), bb_ref: p.get('bb_ref') };
+    var canonicalClick = p.get('mrt_click_id'), legacyClick = p.get('bb_click_id');
+    var canonicalRef = p.get('mrt_ref'), legacyRef = p.get('bb_ref');
+    if((canonicalClick && legacyClick && canonicalClick !== legacyClick) ||
+       (canonicalRef && legacyRef && canonicalRef !== legacyRef)) return {};
+    return {
+      bb_click_id: canonicalClick || legacyClick,
+      bb_ref: canonicalRef || legacyRef
+    };
   }
   function setCookie(name, value){
     if(!value) return;
@@ -5549,7 +5710,16 @@ BB_JS = r"""
 """
 
 
-@app.get("/bb.js")
+@app.get(
+    "/mrt.js",
+    response_class=Response,
+    responses={200: {"content": {"application/javascript": {}}}},
+)
+def mrt_js() -> Response:
+    return Response(MRT_JS, media_type="application/javascript", headers={"Cache-Control": "public, max-age=300"})
+
+
+@app.get("/bb.js", include_in_schema=False)
 def bb_js() -> Response:
     return Response(BB_JS, media_type="application/javascript", headers={"Cache-Control": "public, max-age=300"})
 
@@ -5562,7 +5732,7 @@ def demo_merchant_page() -> str:
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Demo merchant checkout · Bumbei</title>
+  <title>Demo merchant checkout · Meerat</title>
   <style>
     :root {{ --black:#151615; --orange:#FC6A42; --gray:#E3E3D7; --yellow:#F9C441; --muted:#a8aa9e; --ok:#75d68a; }}
     * {{ box-sizing:border-box; }} body {{ margin:0; font-family:Inter,system-ui,sans-serif; background:radial-gradient(circle at top left, rgba(252,106,66,.24), transparent 30rem), var(--black); color:#fff; }}
@@ -5580,12 +5750,12 @@ def demo_merchant_page() -> str:
 <main>
   <span class="pill">Demo merchant landing / checkout</span>
   <h1>Simulate an Oshigoods-style sats order.</h1>
-  <p>This page loads <code>/bb.js</code>, captures <code>bb_click_id</code>/<code>bb_ref</code> from the URL, injects hidden checkout fields, and posts to a demo merchant backend trigger.</p>
+  <p>This page loads <code>/mrt.js</code>, captures <code>mrt_click_id</code>/<code>mrt_ref</code> from the URL, injects hidden checkout fields, and posts to a demo merchant backend trigger.</p>
   <div class="grid">
     <section class="card">
       <h2>Attribution captured by snippet</h2>
       <pre id="debug">Loading attribution…</pre>
-      <p>Try visiting this page with <code>?bb_click_id=clk_y8DrWEwJ8R&amp;bb_ref=ref_I6al7223jL</code>.</p>
+      <p>Try visiting this page with <code>?mrt_click_id=clk_y8DrWEwJ8R&amp;mrt_ref=ref_I6al7223jL</code>.</p>
     </section>
     <section class="card">
       <h2>Checkout action</h2>
@@ -5598,13 +5768,13 @@ def demo_merchant_page() -> str:
     </section>
   </div>
 </main>
-<script src="/bb.js"></script>
+<script src="/mrt.js"></script>
 <script>
-function showAttr() {{ document.getElementById('debug').textContent = JSON.stringify(window.BumbeiAttribution.get(), null, 2); }}
-window.addEventListener('bumbei:attribution', showAttr); setTimeout(showAttr, 150);
+function showAttr() {{ document.getElementById('debug').textContent = JSON.stringify(window.MeeratAttribution.get(), null, 2); }}
+window.addEventListener('meerat:attribution', showAttr); setTimeout(showAttr, 150);
 document.getElementById('checkout-form').addEventListener('submit', async function(e) {{
   e.preventDefault();
-  window.BumbeiAttribution.injectHiddenInputs(document);
+  window.MeeratAttribution.injectHiddenInputs(document);
   const fd = new FormData(e.currentTarget);
   const payload = Object.fromEntries(fd.entries());
   payload.order_total = Number(payload.order_total);
@@ -5622,10 +5792,10 @@ document.getElementById('checkout-form').addEventListener('submit', async functi
 @app.post("/demo-merchant/checkout")
 def demo_merchant_checkout(body: DemoMerchantCheckoutIn) -> dict[str, Any]:
     """Demo-only merchant backend trigger. Real merchants should use /merchant/conversions server-side."""
-    conversion = create_conversion(
+    conversion = _create_conversion(
         ConversionIn(
             order_id=hid("demo_order"),
-            click_id=body.bb_click_id,
+            mrt_click_id=body.mrt_click_id,
             order_total=body.order_total,
             currency=body.currency,
         )
@@ -5633,8 +5803,8 @@ def demo_merchant_checkout(body: DemoMerchantCheckoutIn) -> dict[str, Any]:
     return {
         "ok": True,
         "demo": True,
-        "bb_click_id": body.bb_click_id,
-        "bb_ref": body.bb_ref,
+        "mrt_click_id": body.mrt_click_id,
+        "mrt_ref": body.mrt_ref,
         "order_total_sats": conversion["order_total_sats"],
         "btc_usd_rate": conversion["btc_usd_rate"],
         "sats_per_usd": conversion["sats_per_usd"],
@@ -5701,7 +5871,7 @@ DASHBOARD_HTML = """
 <body>
 <header>
   <div>
-    <div class="pill">⚡ Bumbei x Nostr affiliate proof POC</div>
+    <div class="pill">⚡ Meerat · Nostr affiliate proof POC</div>
     <h1>Affiliate identity, attribution proofs & Lightning-ready payouts.</h1>
     <p>Demo dashboard para crear campañas, enrolar afiliados, simular clicks/conversiones y ver eventos Nostr publicados en relays públicos.</p>
   </div>
@@ -5715,10 +5885,10 @@ DASHBOARD_HTML = """
   </section>
   <section class="card span-12">
     <h2>Merchant webhook</h2>
-    <p>Para integraciones server-to-server tipo Shopify/WooCommerce/custom checkout: <code>POST /merchant/conversions</code>. El merchant devuelve <code>bb_click_id</code>; si reporta <code>USD</code>, Bumbei calcula sats con su rate server-side. También acepta <code>SATS</code> o <code>BTC</code> para merchants Nostr-native como Oshigoods.</p>
+    <p>Para integraciones server-to-server tipo Shopify/WooCommerce/custom checkout: <code>POST /merchant/conversions</code>. El merchant devuelve <code>mrt_click_id</code>; si reporta <code>USD</code>, Meerat calcula sats con su rate server-side. También acepta <code>SATS</code> o <code>BTC</code> para merchants Nostr-native como Oshigoods.</p>
     <pre>{
   "order_id": "order_123",
-  "bb_click_id": "clk_y8DrWEwJ8R",
+  "mrt_click_id": "clk_y8DrWEwJ8R",
   "order_total": 250000,
   "currency": "SATS",
   "customer_hash": "sha256:...",
@@ -5728,7 +5898,7 @@ DASHBOARD_HTML = """
   <section class="grid">
     <div class="card span-4">
       <h2>1. Create campaign</h2>
-      <div class="row"><input id="merchant" value="npub1540rxhz9x7fpc73nu5q3qydykej7lceh5j4jej6mmpc6n3saw3cqv7s8js" placeholder="merchant pubkey"><input id="campaignName" value="Bumbei BTC Rewards" placeholder="campaign name"></div>
+      <div class="row"><input id="merchant" value="npub1540rxhz9x7fpc73nu5q3qydykej7lceh5j4jej6mmpc6n3saw3cqv7s8js" placeholder="merchant pubkey"><input id="campaignName" value="Meerat Affiliate Rewards" placeholder="campaign name"></div>
       <div class="row"><input id="commission" type="number" value="800" placeholder="bps"><input id="windowDays" type="number" value="30" placeholder="window days"></div>
       <input id="destination" value="https://example.com/checkout" placeholder="destination URL">
       <p><button onclick="createCampaign()">Create campaign + publish Nostr event</button></p>
@@ -6456,7 +6626,7 @@ def _merchant_default_program() -> dict[str, Any]:
         "commission_bps": commission_bps,
         "window_days": window_days,
         "destination_url": configured_url("MERCHANT_DEFAULT_DESTINATION_URL", DEFAULT_DESTINATION),
-        "terms_url": configured_url("MERCHANT_DEFAULT_TERMS_URL", "https://bumbei.com/terms/affiliate"),
+        "terms_url": configured_url("MERCHANT_DEFAULT_TERMS_URL", "https://www.meerat.com/terms/affiliate"),
     }
 
 

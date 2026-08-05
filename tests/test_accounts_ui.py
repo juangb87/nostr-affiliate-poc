@@ -4,6 +4,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 from fastapi.testclient import TestClient
@@ -777,6 +778,12 @@ def test_affiliate_accepts_invitation_with_nip07_and_gets_session(tmp_path, monk
     assert destination.status_code == 200
     payable_referral = client.get(f"/r/{ref_code}", follow_redirects=False)
     assert payable_referral.status_code in {302, 303, 307}
+    referral_query = parse_qs(urlparse(payable_referral.headers["location"]).query)
+    assert referral_query["mrt_ref"] == [ref_code]
+    assert referral_query["mrt_click_id"][0].startswith("clk_")
+    assert "bb_ref" not in referral_query and "bb_click_id" not in referral_query
+    assert "mrt_click_id=" in payable_referral.headers["set-cookie"]
+    assert "bb_click_id=" not in payable_referral.headers["set-cookie"]
     workspace = client.get("/app/affiliate?view=links")
     assert workspace.status_code == 200
     assert "Tu enlace para compartir" in workspace.text

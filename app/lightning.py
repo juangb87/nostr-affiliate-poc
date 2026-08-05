@@ -89,7 +89,7 @@ def _require_public_https_url(value: str, label: str) -> str:
 
 def _http_get_json(url: str) -> dict[str, Any]:
     _require_public_https_url(url, "LNURL")
-    request = Request(url, headers={"Accept": "application/json", "User-Agent": "Bumbei-Payouts/1.0"})
+    request = Request(url, headers={"Accept": "application/json", "User-Agent": "Meerat-Payouts/1.0"})
     try:
         response = build_opener(_NoRedirects()).open(request, timeout=10)
         raw = response.read(65_537)

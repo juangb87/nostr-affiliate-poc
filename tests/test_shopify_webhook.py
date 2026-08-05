@@ -25,10 +25,11 @@ def shopify_headers(raw_body: bytes, *, secret: str = SHOPIFY_SECRET, webhook_id
     }
 
 
-def paid_order_payload(click_id: str | None, *, order_id: int = 6001001) -> dict:
-    note_attributes = [{"name": "bb_ref", "value": "ref_shopify_test"}]
+def paid_order_payload(click_id: str | None, *, order_id: int = 6001001, legacy: bool = False) -> dict:
+    click_key = "bb_click_id" if legacy else "mrt_click_id"
+    note_attributes = []
     if click_id:
-        note_attributes.append({"name": "bb_click_id", "value": click_id})
+        note_attributes.append({"name": click_key, "value": click_id})
     return {
         "id": order_id,
         "name": "#TEST-1001",
@@ -119,6 +120,66 @@ def test_shopify_orders_paid_requires_valid_hmac_and_creates_authoritative_conve
     assert conflict.json()["conflict"] is True
     unchanged = client.get(f"/campaigns/{click['campaign_id']}/summary").json()
     assert len([row for row in unchanged["conversions"] if row["click_id"] == click["click_id"]]) == 1
+
+
+def test_shopify_accepts_legacy_click_attribute_but_rejects_conflicting_namespaces(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path}/shopify-legacy.db")
+    monkeypatch.setenv("SHOPIFY_SECRET", SHOPIFY_SECRET)
+    monkeypatch.setenv("SHOPIFY_STORE_DOMAIN", SHOPIFY_SHOP)
+    monkeypatch.setenv("NOSTR_PUBLISH", "false")
+    client = TestClient(app)
+
+    demo = client.post("/demo").json()
+    click = client.post("/clicks/simulate", json={"ref_code": demo["enrollment"]["ref_code"]}).json()
+    legacy_payload = paid_order_payload(click["click_id"], order_id=6001008, legacy=True)
+    legacy_raw = json.dumps(legacy_payload, separators=(",", ":")).encode()
+    legacy = client.post(
+        "/shopify/webhooks/orders-paid",
+        content=legacy_raw,
+        headers=shopify_headers(legacy_raw, webhook_id="wh_legacy_attribute"),
+    )
+    assert legacy.status_code == 200, legacy.text
+    assert legacy.json()["queued"] is True
+
+    conflicting_payload = paid_order_payload(click["click_id"], order_id=6001009)
+    conflicting_payload["note_attributes"].append({"name": "bb_click_id", "value": "clk_conflicting"})
+    conflicting_raw = json.dumps(conflicting_payload, separators=(",", ":")).encode()
+    conflict = client.post(
+        "/shopify/webhooks/orders-paid",
+        content=conflicting_raw,
+        headers=shopify_headers(conflicting_raw, webhook_id="wh_conflicting_namespace"),
+    )
+    assert conflict.status_code == 422
+    assert conflict.json()["detail"] == "conflicting affiliate attribution"
+    status = client.get("/shopify/webhooks/status").json()
+    assert status["receipts"]["conflict"] == 1
+    assert status["deliveries"] == {"processed": 1}
+
+
+def test_shopify_rejects_duplicate_attribution_attribute_values(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path}/shopify-duplicates.db")
+    monkeypatch.setenv("SHOPIFY_SECRET", SHOPIFY_SECRET)
+    monkeypatch.setenv("SHOPIFY_STORE_DOMAIN", SHOPIFY_SHOP)
+    monkeypatch.setenv("NOSTR_PUBLISH", "false")
+    client = TestClient(app)
+
+    payload = paid_order_payload("clk_first", order_id=6001011)
+    payload["note_attributes"].extend([
+        {"name": "mrt_click_id", "value": "clk_second"},
+        {"name": "bb_click_id", "value": "clk_second"},
+    ])
+    raw = json.dumps(payload, separators=(",", ":")).encode()
+    response = client.post(
+        "/shopify/webhooks/orders-paid",
+        content=raw,
+        headers=shopify_headers(raw, webhook_id="wh_duplicate_attribution"),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "conflicting affiliate attribution"
+    status = client.get("/shopify/webhooks/status").json()
+    assert status["receipts"]["conflict"] == 1
+    assert status["deliveries"] == {}
 
 
 def test_shopify_background_processing_supports_enabled_nostr_publish(tmp_path, monkeypatch):

@@ -43,11 +43,11 @@ python scripts/e2e.py
 - Browser signing adapters: NIP-07 extensions plus temporary NIP-46 `nostrconnect://` deep links/QR for mobile and cross-device login. Both adapters sign the same server challenge; Meerat never receives an `nsec`.
 - `GET /auth/me` — safe current-account summary
 - `POST /auth/logout` — revoke the current session
-- `GET /bb.js` — lightweight tracking snippet that captures `bb_click_id`/`bb_ref`
+- `GET /mrt.js` — canonical tracking snippet that captures `mrt_click_id`/`mrt_ref`
 - `POST /v1/events` — public browser-side landing/page-view tracker for merchant storefronts
 - `POST /v1/conversions` — public browser/pixel conversion signal logger; use `/merchant/conversions` for payout-grade server-side proofs
 - `GET /v1/tracking/status` — safe aggregate tracking debug status
-- `POST /shopify/webhooks/orders-paid` — Shopify-signed authoritative paid-order webhook; validates the raw-body HMAC and reads `bb_click_id` from order `note_attributes`
+- `POST /shopify/webhooks/orders-paid` — Shopify-signed authoritative paid-order webhook; validates the raw-body HMAC and reads `mrt_click_id`/`mrt_campaign` from order `note_attributes`
 - `GET /shopify/webhooks/status` — safe readiness check for the Shopify webhook configuration
 - Legacy `/bumbei/*` routes remain working as hidden compatibility aliases during migration
 - `GET /demo-merchant` — demo landing/checkout page using the snippet
@@ -184,23 +184,25 @@ NWC attempts persist the prepared payment hash before payment. Ambiguous outcome
 Real merchants can add:
 
 ```html
-<script src="https://meerat.com/bb.js"></script>
+<script src="https://meerat.com/mrt.js"></script>
 ```
 
-The snippet reads `bb_click_id` and `bb_ref` from URL params, stores them in first-party cookie + localStorage, injects hidden checkout form inputs, and exposes:
+The snippet reads `mrt_click_id` and `mrt_ref` from URL params, stores them in first-party cookie + localStorage, injects hidden checkout form inputs, and exposes:
 
 ```js
-window.BumbeiAttribution.get()
-window.BumbeiAttribution.debug()
+window.MeeratAttribution.get()
+window.MeeratAttribution.debug()
 ```
 
 The demo merchant page is available at `/demo-merchant`. Visit it with params like:
 
 ```text
-/demo-merchant?bb_click_id=clk_y8DrWEwJ8R&bb_ref=ref_I6al7223jL
+/demo-merchant?mrt_click_id=clk_y8DrWEwJ8R&mrt_ref=ref_I6al7223jL
 ```
 
 Then submit the checkout form to simulate a paid order and trigger the conversion proof.
+
+`/bb.js`, the hidden `/bumbei/*` routes, legacy cookies, and legacy Shopify attributes remain bounded read-compatibility surfaces for already-installed storefronts and in-flight carts. New redirects, snippets, API schemas, responses, and installation instructions use only `mrt_*`. Contradictory canonical and legacy attribution values are rejected.
 
 ## Merchant webhook
 
@@ -210,7 +212,7 @@ curl -X POST "$BASE_URL/merchant/conversions" \
   -H "Content-Type: application/json" \
   -d '{
     "order_id": "order_123",
-    "bb_click_id": "clk_from_redirect",
+    "mrt_click_id": "clk_from_redirect",
     "order_total": 250000,
     "currency": "SATS",
     "customer_hash": "sha256:optional_customer_hash",
@@ -222,7 +224,7 @@ Supported currencies:
 
 - `SATS`: `order_total` is already sats, ideal for Nostr-native merchants.
 - `BTC`: `order_total` is BTC and the app converts to sats.
-- `USD`: the merchant sends fiat amount; Bumbei/this service converts to sats with server-side `SATS_PER_USD`.
+- `USD`: the merchant sends fiat amount; Meerat converts to sats with server-side `SATS_PER_USD`.
 
 Merchants do **not** send `sats_per_usd`; exchange-rate policy stays server-side.
 
@@ -236,7 +238,7 @@ Register the Shopify topic `ORDERS_PAID` with this HTTPS callback:
 https://meerat.com/shopify/webhooks/orders-paid
 ```
 
-The endpoint verifies `X-Shopify-Hmac-Sha256` against the unmodified request body, requires the configured shop domain, and reads `bb_click_id` from `note_attributes`. Paid orders without affiliate attribution are acknowledged and ignored so Shopify does not retry them. Attributed paid orders use the same authoritative conversion, Nostr proof, commission, and pending-payout flow as `/merchant/conversions`.
+The endpoint verifies `X-Shopify-Hmac-Sha256` against the unmodified request body, requires the configured shop domain, and reads canonical `mrt_click_id`/`mrt_campaign` from `note_attributes`. Paid orders without affiliate attribution are acknowledged and ignored so Shopify does not retry them. Attributed paid orders use the same authoritative conversion, Nostr proof, commission, and pending-payout flow as `/merchant/conversions`.
 
 ## Privacy note
 
