@@ -6,7 +6,7 @@
   <meta name="referrer" content="no-referrer">
   <meta name="robots" content="noindex,nofollow">
   <title>{{ campaign.name }} · Cashback Express</title>
-  <link rel="stylesheet" href="/static/cashback-express.css?v=20260805-short-host1">
+  <link rel="stylesheet" href="/static/cashback-express.css?v=20260805-status1">
 </head>
 <body>
 <main class="cashback-shell">
@@ -25,8 +25,9 @@
       <button type="submit"><span lang="es">Activar cashback y comprar</span><span lang="en">Activate cashback and shop</span></button>
       <small id="claim-status" role="status" aria-live="polite"><span lang="es">Sin cuenta. Sin custodia. El pago no es automático en este MVP.</span><span lang="en">No account. No custody. Payment is not automatic in this MVP.</span></small>
     </form>
+    <a class="check-link" href="/x/{{ campaign.short_code }}/check"><span lang="es">¿Ya activaste tu cashback? Revisar estado</span><span lang="en">Already activated cashback? Check status</span> <span aria-hidden="true">→</span></a>
   </section>
 </main>
-<script src="/static/cashback-express.js?v=20260805-short-host1" defer></script>
+<script src="/static/cashback-express.js?v=20260805-status1" defer></script>
 </body>
 </html>

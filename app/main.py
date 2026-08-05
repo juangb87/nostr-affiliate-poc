@@ -76,7 +76,12 @@ from app.payment_rails import (
 )
 from app.payment_state import calculate_fee_sats, payment_idempotency_key
 from app.rates import BtcUsdQuote, RateUnavailableError, btc_usd_rates, fiat_to_sats
-from app.workspaces import affiliate_workspace_data, merchant_workspace_data, short as workspace_short
+from app.workspaces import (
+    affiliate_workspace_data,
+    mask_lightning_address,
+    merchant_workspace_data,
+    short as workspace_short,
+)
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
@@ -93,6 +98,7 @@ SHORT_LINK_CASHBACK_ASSET_PATHS = frozenset({
     "/static/cashback-express.js",
     "/static/fonts/space-grotesk-latin.woff2",
 })
+CASHBACK_STATUS_COOKIE = "meerat_cashback_status"
 SHORT_LINK_RESERVED_PATHS = {
     "app", "health", "static", "r", "v1", "shopify", "campaigns", "affiliates",
     "flows", "payouts", "docs", "redoc", "openapi.json", "bb.js", "favicon.ico", "invite",
@@ -283,10 +289,27 @@ async def redirect_short_link_host(request: Request, call_next: Any) -> Response
     host = (request.url.hostname or "").lower().rstrip(".")
     cashback_match = re.fullmatch(r"/x/[A-Za-z0-9_-]+", request.url.path)
     cashback_claim_match = re.fullmatch(r"/x/[A-Za-z0-9_-]+/claim", request.url.path)
+    cashback_status_match = re.fullmatch(r"/x/[A-Za-z0-9_-]+/check", request.url.path)
+    if (
+        (cashback_match or cashback_claim_match or cashback_status_match)
+        and urlparse(SHORT_LINK_BASE_URL).scheme == "https"
+        and request.url.scheme != "https"
+    ):
+        if request.method in {"GET", "HEAD"}:
+            short_origin = urlparse(SHORT_LINK_BASE_URL)
+            secure_url = request.url.replace(scheme="https", netloc=short_origin.netloc)
+            response = RedirectResponse(str(secure_url), status_code=308)
+            response.headers["Cache-Control"] = "no-store"
+            return response
+        return JSONResponse({"detail": "HTTPS required."}, status_code=400, headers={"Cache-Control": "no-store"})
     if host != SHORT_LINK_HOST:
         canonical = urlparse(BASE_URL)
         canonical_host = (canonical.hostname or "").lower().rstrip(".")
-        if request.method in {"GET", "HEAD"} and cashback_match and host == canonical_host:
+        if (
+            request.method in {"GET", "HEAD"}
+            and (cashback_match or cashback_status_match)
+            and host == canonical_host
+        ):
             short_origin = urlparse(SHORT_LINK_BASE_URL)
             target = request.url.replace(
                 scheme=short_origin.scheme or "https",
@@ -307,6 +330,8 @@ async def redirect_short_link_host(request: Request, call_next: Any) -> Response
     if request.method in {"GET", "HEAD"} and cashback_match:
         return await call_next(request)
     if request.method == "POST" and cashback_claim_match:
+        return await call_next(request)
+    if request.method in {"GET", "HEAD", "POST"} and cashback_status_match:
         return await call_next(request)
     if (
         request.method in {"GET", "HEAD"}
@@ -1130,6 +1155,8 @@ def _init_db_unlocked() -> None:
         id TEXT PRIMARY KEY,
         campaign_id TEXT NOT NULL,
         lightning_address TEXT NOT NULL,
+        status_token_hash TEXT UNIQUE,
+        status_access_expires_at TEXT,
         created_at TEXT NOT NULL,
         expires_at TEXT NOT NULL,
         destination_revealed_at TEXT,
@@ -1384,6 +1411,8 @@ def _init_db_unlocked() -> None:
             c.execute(text("ALTER TABLE cashback_claims ADD COLUMN IF NOT EXISTS destination_revealed_at TEXT"))
             c.execute(text("ALTER TABLE cashback_claims ADD COLUMN IF NOT EXISTS consumed_at TEXT"))
             c.execute(text("ALTER TABLE cashback_claims ADD COLUMN IF NOT EXISTS consumed_order_key TEXT"))
+            c.execute(text("ALTER TABLE cashback_claims ADD COLUMN IF NOT EXISTS status_token_hash TEXT"))
+            c.execute(text("ALTER TABLE cashback_claims ADD COLUMN IF NOT EXISTS status_access_expires_at TEXT"))
             cashback_reward_column_ddl = {
                 "order_key": "TEXT", "claim_id": "TEXT", "campaign_id": "TEXT",
                 "merchant_pubkey_hex": "TEXT", "order_total": "DOUBLE PRECISION",
@@ -1457,7 +1486,10 @@ def _init_db_unlocked() -> None:
             cashback_reward_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(cashback_rewards)")).fetchall()}
             if "committed_sats" not in cashback_campaign_cols:
                 c.execute(text("ALTER TABLE cashback_campaigns ADD COLUMN committed_sats INTEGER NOT NULL DEFAULT 0"))
-            for column in ("destination_revealed_at", "consumed_at", "consumed_order_key"):
+            for column in (
+                "destination_revealed_at", "consumed_at", "consumed_order_key",
+                "status_token_hash", "status_access_expires_at",
+            ):
                 if column not in cashback_claim_cols:
                     c.execute(text(f"ALTER TABLE cashback_claims ADD COLUMN {column} TEXT"))
             cashback_reward_column_ddl = {
@@ -1603,6 +1635,9 @@ def _init_db_unlocked() -> None:
                 f"before schema initialization (example claim_id: {duplicate_cashback_claim})."
             )
         c.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_cashback_rewards_claim_id ON cashback_rewards(claim_id)"))
+        c.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_cashback_claims_status_token_hash ON cashback_claims(status_token_hash) WHERE status_token_hash IS NOT NULL"))
+        c.execute(text("CREATE INDEX IF NOT EXISTS idx_cashback_claims_status_access_expires ON cashback_claims(status_access_expires_at)"))
+        c.execute(text("CREATE INDEX IF NOT EXISTS idx_cashback_claims_expires_at ON cashback_claims(expires_at)"))
         duplicate_cashback_order = c.execute(text("""
             SELECT order_key FROM cashback_rewards
             WHERE order_key IS NOT NULL
@@ -1862,10 +1897,30 @@ def release_campaign_budget(
     )
 
 
+def cleanup_expired_cashback_claims(batch_size: int = 500) -> int:
+    """Bounded startup cleanup for claims that no longer back status access or rewards."""
+    with engine().begin() as connection:
+        deleted = connection.execute(text("""
+            DELETE FROM cashback_claims
+            WHERE id IN (
+                SELECT cl.id
+                FROM cashback_claims cl
+                WHERE COALESCE(cl.status_access_expires_at, cl.expires_at) < :cutoff
+                  AND NOT EXISTS (
+                      SELECT 1 FROM cashback_rewards reward WHERE reward.claim_id=cl.id
+                  )
+                ORDER BY COALESCE(cl.status_access_expires_at, cl.expires_at)
+                LIMIT :batch_size
+            )
+        """), {"cutoff": now(), "batch_size": max(1, min(int(batch_size), 5000))})
+    return max(int(deleted.rowcount or 0), 0)
+
+
 @app.on_event("startup")
 def startup() -> None:
     validate_runtime_security()
     init_db()
+    cleanup_expired_cashback_claims()
     if nostr_publish_enabled():
         threading.Thread(target=nostr_outbox_retry_worker, name="nostr-outbox-retry", daemon=True).start()
 
@@ -1923,6 +1978,12 @@ class CashbackClaimIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     lightning_address: str = Field(..., min_length=3, max_length=320)
+
+
+class CashbackStatusIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    token: str | None = Field(default=None, min_length=40, max_length=200, pattern=r"^[A-Za-z0-9_-]+$")
 
 
 class CashbackPaymentIn(BaseModel):
@@ -6054,13 +6115,16 @@ def cashback_express_landing(request: Request, code: str) -> Response:
     response.headers.update({
         "Cache-Control": "no-store", "Pragma": "no-cache", "Referrer-Policy": "no-referrer",
         "X-Robots-Tag": "noindex, nofollow",
+        "Strict-Transport-Security": "max-age=31536000",
         "Content-Security-Policy": "default-src 'self'; img-src 'self' https: data:; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
     })
     return response
 
 
 @app.post("/x/{code}/claim", include_in_schema=False)
-def cashback_express_claim(code: str, body: CashbackClaimIn, response: str | None = None) -> Response:
+def cashback_express_claim(
+    code: str, body: CashbackClaimIn, response: str | None = None
+) -> Response:
     campaign = _cashback_campaign_by_code(code)
     address = body.lightning_address.strip().lower()
     try:
@@ -6079,15 +6143,11 @@ def cashback_express_claim(code: str, body: CashbackClaimIn, response: str | Non
     except (LightningPaymentError, ValueError) as exc:
         raise HTTPException(422, "Dirección Lightning inválida / Invalid Lightning Address") from exc
     claim_id = hid("clk")
+    status_token = secrets.token_urlsafe(32)
     created = datetime.now(timezone.utc)
     expires = created + timedelta(days=int(campaign["window_days"]))
+    status_access_expires = expires + timedelta(days=90)
     with engine().begin() as connection:
-        # Retain claims only through attribution unless they back a financial record.
-        connection.execute(text("""
-            DELETE FROM cashback_claims
-            WHERE expires_at < :now
-              AND NOT EXISTS (SELECT 1 FROM cashback_rewards r WHERE r.claim_id=cashback_claims.id)
-        """), {"now": created.isoformat()})
         # Re-check state in the same transaction so a paused campaign fails closed.
         active = connection.execute(text("""
             SELECT 1 FROM cashback_campaigns
@@ -6097,18 +6157,123 @@ def cashback_express_claim(code: str, body: CashbackClaimIn, response: str | Non
             raise HTTPException(404, "Cashback no disponible / Cashback unavailable")
         # MVP limitation: the destination is plaintext at rest; it is never public or rendered raw.
         connection.execute(text("""
-            INSERT INTO cashback_claims (id, campaign_id, lightning_address, created_at, expires_at)
-            VALUES (:id, :campaign, :address, :created, :expires)
+            INSERT INTO cashback_claims
+              (id, campaign_id, lightning_address, status_token_hash, status_access_expires_at,
+               created_at, expires_at)
+            VALUES (:id, :campaign, :address, :status_token_hash, :status_access_expires_at,
+                    :created, :expires)
         """), {
             "id": claim_id, "campaign": campaign["id"], "address": address,
+            "status_token_hash": sha(status_token),
+            "status_access_expires_at": status_access_expires.isoformat(),
             "created": created.isoformat(), "expires": expires.isoformat(),
         })
     location = add_query_params(campaign["destination_url"], {"bb_click_id": claim_id, "bb_campaign": code})
     location = urlunparse(urlparse(location)._replace(fragment=""))
     privacy_headers = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"}
     if response == "json":
-        return JSONResponse({"redirect_url": location}, headers=privacy_headers)
-    return RedirectResponse(location, status_code=303, headers=privacy_headers)
+        result = JSONResponse({
+            "redirect_url": location,
+            "status_path": f"/x/{code}/check",
+            "status_token": status_token,
+        }, headers=privacy_headers)
+    else:
+        result = RedirectResponse(location, status_code=303, headers=privacy_headers)
+    result.set_cookie(
+        CASHBACK_STATUS_COOKIE,
+        status_token,
+        max_age=60 * 60 * 24 * int(campaign["window_days"] + 90),
+        path=f"/x/{code}/check",
+        secure=urlparse(SHORT_LINK_BASE_URL).scheme == "https",
+        httponly=True,
+        samesite="lax",
+    )
+    return result
+
+
+def _cashback_public_headers() -> dict[str, str]:
+    return {
+        "Cache-Control": "no-store",
+        "Pragma": "no-cache",
+        "Referrer-Policy": "no-referrer",
+        "X-Robots-Tag": "noindex, nofollow",
+        "Strict-Transport-Security": "max-age=31536000",
+    }
+
+
+@app.get("/x/{code}/check", response_class=HTMLResponse, include_in_schema=False)
+def cashback_express_status_page(request: Request, code: str) -> Response:
+    campaign = _cashback_campaign_by_code(code, active_only=False)
+    response = templates.TemplateResponse(
+        request=request,
+        name="cashback_status.html",
+        context={"campaign": campaign},
+    )
+    response.headers.update(_cashback_public_headers())
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; img-src 'self' https: data:; style-src 'self'; "
+        "script-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+    )
+    return response
+
+
+@app.post("/x/{code}/check", include_in_schema=False)
+def cashback_express_status(request: Request, code: str, body: CashbackStatusIn) -> Response:
+    campaign = _cashback_campaign_by_code(code, active_only=False)
+    token = body.token or request.cookies.get(CASHBACK_STATUS_COOKIE)
+    if not token or not re.fullmatch(r"[A-Za-z0-9_-]{40,200}", token):
+        raise HTTPException(404, "Cashback status unavailable.")
+    with engine().connect() as connection:
+        status_row = asdict(connection.execute(text("""
+            SELECT cl.lightning_address, cl.created_at, cl.expires_at, cl.consumed_at,
+                   r.reward_sats, r.status AS reward_status, r.created_at AS reward_created_at,
+                   r.paid_at, r.payment_hash
+            FROM cashback_claims cl
+            JOIN cashback_campaigns c ON c.id=cl.campaign_id
+            LEFT JOIN cashback_rewards r ON r.claim_id=cl.id
+            WHERE c.id=:campaign_id AND c.short_code=:code
+              AND cl.status_token_hash=:token_hash
+              AND cl.status_access_expires_at IS NOT NULL
+              AND cl.status_access_expires_at > :checked_at
+            LIMIT 1
+        """), {
+            "campaign_id": campaign["id"], "code": code, "token_hash": sha(token),
+            "checked_at": now(),
+        }).fetchone())
+    if not status_row:
+        raise HTTPException(404, "Cashback status unavailable.")
+    reward_status = status_row.get("reward_status")
+    if reward_status == "paid":
+        public_status = "paid"
+    elif reward_status:
+        public_status = "pending"
+    elif status_row.get("consumed_at"):
+        public_status = "confirmed"
+    else:
+        try:
+            expires_at = datetime.fromisoformat(str(status_row["expires_at"]).replace("Z", "+00:00"))
+            expired = expires_at <= datetime.now(timezone.utc)
+        except ValueError:
+            expired = False
+        public_status = "expired" if expired else "tracking"
+    payment_hash = status_row.get("payment_hash") or ""
+    payload = {
+        "campaign_name": campaign.get("display_name") or campaign["name"],
+        "lightning_address_masked": mask_lightning_address(status_row["lightning_address"]),
+        "status": public_status,
+        "created_at": status_row["created_at"],
+        "expires_at": status_row["expires_at"],
+        "purchase_confirmed_at": status_row.get("consumed_at"),
+        "reward_created_at": status_row.get("reward_created_at"),
+        "reward_sats": status_row.get("reward_sats"),
+        "paid_at": status_row.get("paid_at"),
+    }
+    if public_status == "paid":
+        payload["payment_evidence"] = "merchant_attested"
+        payload["payment_hash_short"] = (
+            f"{payment_hash[:8]}…{payment_hash[-8:]}" if len(payment_hash) == 64 else None
+        )
+    return JSONResponse(payload, headers=_cashback_public_headers())
 
 
 @app.post("/app/merchant/cashback-claims/{claim_id}/destination", tags=["Accounts"])

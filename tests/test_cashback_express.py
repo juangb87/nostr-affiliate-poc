@@ -138,8 +138,9 @@ def test_public_landing_and_claim_are_private_and_fail_safe(tmp_path, monkeypatc
     assert page.status_code == 200
     assert "Cashback café" in page.text and "7.25%" in page.text
     assert "Cashback" in page.text and "reembolso" in page.text
-    assert '/static/cashback-express.css?v=20260805-short-host1' in page.text
-    assert '/static/cashback-express.js?v=20260805-short-host1' in page.text
+    assert '/static/cashback-express.css?v=20260805-status1' in page.text
+    assert '/static/cashback-express.js?v=20260805-status1' in page.text
+    assert f'href="/x/{code}/check"' in page.text
     assert page.headers["cache-control"] == "no-store"
     assert page.headers["referrer-policy"] == "no-referrer"
     assert "referrer no-referrer" not in page.headers["content-security-policy"]
@@ -192,15 +193,187 @@ def test_public_landing_and_claim_are_private_and_fail_safe(tmp_path, monkeypatc
         json={"lightning_address": "second@wallet.example"},
     )
     assert json_claim.status_code == 200
+    status_token = json_claim.json()["status_token"]
+    assert len(status_token) >= 40
+    assert json_claim.json()["status_path"] == f"/x/{code}/check"
+    assert "meerat_cashback_status=" in json_claim.headers["set-cookie"]
+    assert "HttpOnly" in json_claim.headers["set-cookie"]
+    assert f"Path=/x/{code}/check" in json_claim.headers["set-cookie"]
+    assert "SameSite=lax" in json_claim.headers["set-cookie"]
     redirect_url = json_claim.json()["redirect_url"]
     assert urlparse(redirect_url).hostname == "merchant.example"
     assert "second@wallet.example" not in redirect_url
     assert parse_qs(urlparse(redirect_url).query)["bb_campaign"] == [code]
+    assert status_token not in redirect_url
+    with main.engine().connect() as connection:
+        persisted = connection.execute(
+            text("SELECT status_token_hash FROM cashback_claims WHERE lightning_address='second@wallet.example'")
+        ).scalar_one()
+        assert persisted == main.sha(status_token)
+        assert status_token not in persisted
     assert client.post(f"/x/{code}/claim", json={"lightning_address": "not-an-address"}).status_code == 422
     with main.engine().begin() as connection:
         connection.execute(text("UPDATE cashback_campaigns SET status='paused' WHERE short_code=:code"), {"code": code})
     assert short_client.get(f"/x/{code}").status_code == 404
     assert client.post(f"/x/{code}/claim", json={"lightning_address": "buyer@wallet.example"}).status_code == 404
+
+
+def test_private_cashback_status_lifecycle_uses_capability_token_not_address(tmp_path, monkeypatch):
+    merchant = Keys.generate()
+    client = client_for(tmp_path, monkeypatch, merchant)
+    login(client, merchant)
+    campaign = create_cashback(client, merchant, cashback_percent="10").json()
+    code = campaign["code"]
+    short_client = TestClient(main.app, base_url="https://mrt.st")
+
+    page = short_client.get(f"/x/{code}/check?lang=en")
+    assert page.status_code == 200
+    assert "Check your cashback" in page.text
+    assert "Dirección Lightning" in page.text
+    assert "buyer@wallet.example" not in page.text
+    assert page.headers["cache-control"] == "no-store"
+    assert page.headers["referrer-policy"] == "no-referrer"
+    assert page.headers["x-robots-tag"] == "noindex, nofollow"
+
+    missing = short_client.post(f"/x/{code}/check", json={})
+    invalid = short_client.post(f"/x/{code}/check", json={"token": "x" * 43})
+    address_probe = short_client.post(
+        f"/x/{code}/check", json={"lightning_address": "buyer@wallet.example"}
+    )
+    assert missing.status_code == invalid.status_code == 404
+    assert address_probe.status_code == 422
+    assert missing.json() == invalid.json() == {"detail": "Cashback status unavailable."}
+
+    claim = short_client.post(
+        f"/x/{code}/claim?response=json",
+        json={"lightning_address": "buyer@wallet.example"},
+    )
+    assert claim.status_code == 200
+    token = claim.json()["status_token"]
+    tracking = short_client.post(f"/x/{code}/check", json={"token": token})
+    assert tracking.status_code == 200
+    assert tracking.headers["cache-control"] == "no-store"
+    assert tracking.headers["referrer-policy"] == "no-referrer"
+    assert tracking.json()["status"] == "tracking"
+    assert tracking.json()["lightning_address_masked"] == "b***r@w***t.example"
+    assert tracking.json()["campaign_name"] == "Cashback café"
+    assert tracking.json()["reward_sats"] is None
+    assert "lightning_address" not in tracking.json()
+    assert "order_key" not in tracking.json()
+    assert "payment_evidence" not in tracking.json()
+
+    # The HttpOnly campaign-scoped cookie is enough on the same browser.
+    cookie_tracking = short_client.post(f"/x/{code}/check", json={})
+    assert cookie_tracking.status_code == 200
+    assert cookie_tracking.json()["status"] == "tracking"
+
+    other = create_cashback(client, merchant, name="Other cashback").json()
+    assert short_client.post(f"/x/{other['code']}/check", json={"token": token}).status_code == 404
+
+    claim_id = parse_qs(urlparse(claim.json()["redirect_url"]).query)["bb_click_id"][0]
+    reward = main.process_cashback_reward(
+        order_key="status-order", claim_id=claim_id, campaign_code=code,
+        order_total=Decimal("1000"), currency="SATS",
+        authorized_merchant_hex=merchant.public_key().to_hex(),
+    )
+    pending = short_client.post(f"/x/{code}/check", json={"token": token}).json()
+    assert pending["status"] == "pending"
+    assert pending["reward_sats"] == 100
+    assert pending["purchase_confirmed_at"]
+    assert pending["paid_at"] is None
+
+    payment = {"payment_hash": "cd" * 32, "evidence": "merchant wallet receipt"}
+    paid = client.post(
+        f"/app/merchant/cashback-rewards/{reward['id']}/paid",
+        json=payment, headers={"Origin": "https://testserver"},
+    )
+    assert paid.status_code == 200
+    settled = short_client.post(f"/x/{code}/check", json={"token": token}).json()
+    assert settled["status"] == "paid"
+    assert settled["reward_sats"] == 100
+    assert settled["paid_at"]
+    assert settled["payment_evidence"] == "merchant_attested"
+    assert settled["payment_hash_short"] == "cdcdcdcd…cdcdcdcd"
+    assert "merchant wallet receipt" not in json.dumps(settled)
+
+    with main.engine().begin() as connection:
+        connection.execute(
+            text("UPDATE cashback_claims SET status_access_expires_at=:expired WHERE id=:id"),
+            {"expired": (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(), "id": claim_id},
+        )
+    assert main.cleanup_expired_cashback_claims() == 0
+    with main.engine().begin() as connection:
+        assert connection.execute(
+            text("SELECT id FROM cashback_claims WHERE id=:id"), {"id": claim_id}
+        ).fetchone()
+
+
+def test_cashback_status_expiry_and_short_host_routing(tmp_path, monkeypatch):
+    merchant = Keys.generate()
+    client = client_for(tmp_path, monkeypatch, merchant)
+    login(client, merchant)
+    campaign = create_cashback(client, merchant).json()
+    code = campaign["code"]
+    short_client = TestClient(main.app, base_url="https://mrt.st")
+    claim = short_client.post(
+        f"/x/{code}/claim?response=json", json={"lightning_address": "expired@wallet.example"}
+    )
+    token = claim.json()["status_token"]
+    claim_id = parse_qs(urlparse(claim.json()["redirect_url"]).query)["bb_click_id"][0]
+    with main.engine().begin() as connection:
+        connection.execute(
+            text("UPDATE cashback_claims SET expires_at=:expired WHERE id=:id"),
+            {"expired": (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(), "id": claim_id},
+        )
+    expired = short_client.post(f"/x/{code}/check", json={"token": token})
+    assert expired.status_code == 200
+    assert expired.json()["status"] == "expired"
+
+    canonical = client.get(f"/x/{code}/check?lang=en", follow_redirects=False)
+    assert canonical.status_code == 302
+    assert canonical.headers["location"] == f"https://mrt.st/x/{code}/check?lang=en"
+    assert canonical.headers["cache-control"] == "no-store"
+    direct = short_client.get(f"/x/{code}/check", follow_redirects=False)
+    lookup = short_client.post(f"/x/{code}/check", json={"token": token}, follow_redirects=False)
+    assert direct.status_code == lookup.status_code == 200
+    assert "location" not in direct.headers and "location" not in lookup.headers
+
+
+def test_cashback_status_capability_expires_and_http_transport_is_rejected(tmp_path, monkeypatch):
+    merchant = Keys.generate()
+    client = client_for(tmp_path, monkeypatch, merchant)
+    login(client, merchant)
+    code = create_cashback(client, merchant).json()["code"]
+    short_client = TestClient(main.app, base_url="https://mrt.st")
+    claim = short_client.post(
+        f"/x/{code}/claim?response=json",
+        json={"lightning_address": "buyer@wallet.example"},
+    )
+    token = claim.json()["status_token"]
+    with main.engine().begin() as connection:
+        connection.execute(
+            text("UPDATE cashback_claims SET status_access_expires_at=:expired"),
+            {"expired": (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()},
+        )
+    denied = short_client.post(f"/x/{code}/check", json={"token": token})
+    assert denied.status_code == 404
+    assert denied.json() == {"detail": "Cashback status unavailable."}
+    assert main.cleanup_expired_cashback_claims() == 1
+    with main.engine().begin() as connection:
+        assert connection.execute(text("SELECT id FROM cashback_claims")).fetchone() is None
+
+    http_client = TestClient(main.app, base_url="http://mrt.st")
+    redirect = http_client.get(f"/x/{code}/check", follow_redirects=False)
+    rejected_claim = http_client.post(
+        f"/x/{code}/claim?response=json",
+        json={"lightning_address": "other@wallet.example"},
+    )
+    rejected_status = http_client.post(f"/x/{code}/check", json={"token": token})
+    alternate_http = TestClient(main.app, base_url="http://alternate.example")
+    alternate_status = alternate_http.post(f"/x/{code}/check", json={"token": token})
+    assert redirect.status_code == 308
+    assert redirect.headers["location"].startswith("https://mrt.st/")
+    assert rejected_claim.status_code == rejected_status.status_code == alternate_status.status_code == 400
 
 
 def test_short_host_middleware_does_not_redirect_to_itself(tmp_path, monkeypatch):
