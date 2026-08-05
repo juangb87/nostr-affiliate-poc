@@ -26,6 +26,19 @@ def money_display(value: Any, currency: str) -> str:
     return f"${formatted}" if code == "USD" else f"{formatted} {code}".strip()
 
 
+def mask_lightning_address(value: Any) -> str:
+    raw = str(value or "")
+    if "@" not in raw:
+        return "••••"
+    local, domain = raw.rsplit("@", 1)
+    first_domain, dot, rest = domain.partition(".")
+    def masked(part: str) -> str:
+        if len(part) <= 2:
+            return part[:1] + "***"
+        return part[0] + "***" + part[-1]
+    return f"{masked(local)}@{masked(first_domain)}{dot}{rest}"
+
+
 def merchant_workspace_data(connection: Any, session: dict[str, Any], *, base_url: str, shopify_ready: bool, shopify_detail: str) -> dict[str, Any]:
     account_id = session["account_id"]
     identities = {session["nostr_pubkey_hex"]}
@@ -51,6 +64,41 @@ def merchant_workspace_data(connection: Any, session: dict[str, Any], *, base_ur
         """
     ).bindparams(bindparam("identities", expanding=True))
     campaigns = _rows(connection, campaign_stmt, {"identities": identity_list})
+    cashback_stmt = text("""
+        SELECT c.*, mp.logo_url, mp.display_name, mp.tagline,
+          (SELECT COUNT(*) FROM cashback_claims cl WHERE cl.campaign_id=c.id) AS claims,
+          (SELECT COUNT(*) FROM cashback_rewards r WHERE r.campaign_id=c.id) AS rewards
+        FROM cashback_campaigns c
+        LEFT JOIN merchant_profiles mp ON mp.merchant_pubkey_hex=c.merchant_pubkey_hex
+        WHERE c.archived_at IS NULL AND c.merchant_pubkey_hex IN :identities
+        ORDER BY c.created_at DESC
+    """).bindparams(bindparam("identities", expanding=True))
+    cashback_campaigns = _rows(connection, cashback_stmt, {"identities": identity_list})
+    cashback_ids = [row["id"] for row in cashback_campaigns]
+    cashback_claims: list[dict[str, Any]] = []
+    cashback_rewards: list[dict[str, Any]] = []
+    pending_cashback_sats = 0
+    if cashback_ids:
+        ids_param = bindparam("cashback_ids", expanding=True)
+        cashback_claims = _rows(connection, text("""
+            SELECT cl.id, cl.campaign_id, cl.created_at, cl.expires_at, c.name AS campaign_name
+            FROM cashback_claims cl JOIN cashback_campaigns c ON c.id=cl.campaign_id
+            WHERE cl.campaign_id IN :cashback_ids ORDER BY cl.created_at DESC LIMIT 50
+        """).bindparams(ids_param), {"cashback_ids": cashback_ids})
+        cashback_rewards = _rows(connection, text("""
+            SELECT r.id, r.claim_id, r.campaign_id, r.order_total_decimal, r.currency,
+                   r.order_total_sats, r.reward_sats, r.status, r.created_at, r.paid_at,
+                   r.payment_hash,
+                   cl.lightning_address, c.name AS campaign_name
+            FROM cashback_rewards r
+            JOIN cashback_claims cl ON cl.id=r.claim_id
+            JOIN cashback_campaigns c ON c.id=r.campaign_id
+            WHERE r.campaign_id IN :cashback_ids ORDER BY r.created_at DESC LIMIT 50
+        """).bindparams(bindparam("cashback_ids", expanding=True)), {"cashback_ids": cashback_ids})
+        pending_cashback_sats = int(connection.execute(text("""
+            SELECT COALESCE(SUM(reward_sats),0) FROM cashback_rewards
+            WHERE campaign_id IN :cashback_ids AND status='pending'
+        """).bindparams(bindparam("cashback_ids", expanding=True)), {"cashback_ids": cashback_ids}).scalar_one())
     campaign_ids = [row["id"] for row in campaigns]
 
     conversions: list[dict[str, Any]] = []
@@ -148,6 +196,11 @@ def merchant_workspace_data(connection: Any, session: dict[str, Any], *, base_ur
 
     for campaign in campaigns:
         campaign["commission_percent"] = f"{int(campaign['commission_bps']) / 100:g}"
+    for campaign in cashback_campaigns:
+        campaign["cashback_percent"] = f"{int(campaign['cashback_bps']) / 100:g}"
+        campaign["short_url"] = f"{base_url.rstrip('/')}/x/{campaign['short_code']}"
+    for reward in cashback_rewards:
+        reward["lightning_address_masked"] = mask_lightning_address(reward.pop("lightning_address", ""))
     for click in clicks:
         click["affiliate_short"] = short(click.get("affiliate_pubkey"))
         click["id_short"] = short(click.get("id"), 10, 6)
@@ -183,13 +236,19 @@ def merchant_workspace_data(connection: Any, session: dict[str, Any], *, base_ur
 
     return {
         "campaigns": campaigns,
+        "cashback_campaigns": cashback_campaigns,
+        "cashback_claims": cashback_claims,
+        "cashback_rewards": cashback_rewards,
         "clicks": clicks,
         "enrollments": enrollments,
         "conversions": conversions,
         "payouts": payouts,
         "totals": {
-            "campaigns": len(campaigns),
-            "active_campaigns": sum(1 for row in campaigns if row.get("status") == "active"),
+            "campaigns": len(campaigns) + len(cashback_campaigns),
+            "affiliate_campaigns": len(campaigns),
+            "cashback_campaigns": len(cashback_campaigns),
+            "active_campaigns": sum(1 for row in campaigns + cashback_campaigns if row.get("status") == "active"),
+            "pending_cashback_sats": pending_cashback_sats,
             "affiliates": int(totals.get("affiliates") or 0),
             "clicks": int(totals.get("clicks") or 0),
             "conversions": int(totals.get("conversions") or 0),

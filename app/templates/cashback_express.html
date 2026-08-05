@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="{{ language }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta name="robots" content="noindex,nofollow">
+  <title>{{ campaign.name }} · Cashback Express</title>
+  <link rel="stylesheet" href="/static/cashback-express.css?v=20260805-1">
+</head>
+<body>
+<main class="cashback-shell">
+  <header class="brand">
+    {% if campaign.logo_url %}<img src="{{ campaign.logo_url }}" alt="" referrerpolicy="no-referrer">{% else %}<span class="brand-mark">{{ (campaign.display_name or campaign.name)[:1] }}</span>{% endif %}
+    <div><strong>{{ campaign.display_name or campaign.name }}</strong>{% if campaign.tagline %}<small>{{ campaign.tagline }}</small>{% endif %}</div>
+    <label class="language"><span class="sr-only">Idioma / Language</span><select id="cashback-language"><option value="es" {% if language == 'es' %}selected{% endif %}>ES</option><option value="en" {% if language == 'en' %}selected{% endif %}>EN</option></select></label>
+  </header>
+  <section class="cashback-card">
+    <p class="eyebrow"><span lang="es">Cashback Express</span><span lang="en">Cashback Express</span></p>
+    <h1><span lang="es">Recibí <em>{{ campaign.cashback_percent }}%</em> de reembolso en sats.</span><span lang="en">Get <em>{{ campaign.cashback_percent }}%</em> cashback in sats.</span></h1>
+    <p><span lang="es">Ingresá tu Dirección Lightning. Validamos su formato y la guardamos durante la ventana de atribución; nunca la agregamos al enlace de compra.</span><span lang="en">Enter your Lightning Address. We validate its format and retain it for the attribution window; it is never added to your shopping link.</span></p>
+    <form id="cashback-claim" action="/x/{{ campaign.short_code }}/claim" method="post" novalidate>
+      <label for="lightning-address"><span lang="es">Dirección Lightning</span><span lang="en">Lightning Address</span></label>
+      <input id="lightning-address" type="email" autocomplete="email" inputmode="email" placeholder="vos@wallet.example" required maxlength="320">
+      <button type="submit"><span lang="es">Activar cashback y comprar</span><span lang="en">Activate cashback and shop</span></button>
+      <small id="claim-status" role="status" aria-live="polite"><span lang="es">Sin cuenta. Sin custodia. El pago no es automático en este MVP.</span><span lang="en">No account. No custody. Payment is not automatic in this MVP.</span></small>
+    </form>
+  </section>
+</main>
+<script src="/static/cashback-express.js?v=20260805-1" defer></script>
+</body>
+</html>

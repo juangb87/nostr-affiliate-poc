@@ -77,7 +77,7 @@ from app.payment_rails import (
 from app.payment_state import calculate_fee_sats, payment_idempotency_key
 from app.rates import BtcUsdQuote, RateUnavailableError, btc_usd_rates, fiat_to_sats
 from app.workspaces import affiliate_workspace_data, merchant_workspace_data, short as workspace_short
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
@@ -1075,9 +1075,63 @@ def _init_db_unlocked() -> None:
         currency TEXT NOT NULL,
         status TEXT NOT NULL,
         conversion_id TEXT,
+        reward_id TEXT,
+        attribution_code TEXT,
         error TEXT,
         created_at TEXT NOT NULL,
+        processing_started_at TEXT,
         processed_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS cashback_campaigns (
+        id TEXT PRIMARY KEY,
+        merchant_pubkey TEXT NOT NULL,
+        merchant_pubkey_hex TEXT NOT NULL,
+        name TEXT NOT NULL,
+        cashback_bps INTEGER NOT NULL,
+        window_days INTEGER NOT NULL,
+        destination_url TEXT NOT NULL,
+        short_code TEXT UNIQUE NOT NULL,
+        budget_sats INTEGER,
+        committed_sats INTEGER NOT NULL DEFAULT 0,
+        max_reward_sats INTEGER,
+        status TEXT NOT NULL DEFAULT 'active',
+        archived_at TEXT,
+        created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS cashback_claims (
+        id TEXT PRIMARY KEY,
+        campaign_id TEXT NOT NULL,
+        lightning_address TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        consumed_at TEXT,
+        consumed_order_key TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_cashback_claims_campaign ON cashback_claims(campaign_id, created_at);
+    CREATE TABLE IF NOT EXISTS cashback_rewards (
+        id TEXT PRIMARY KEY,
+        order_key TEXT UNIQUE NOT NULL,
+        claim_id TEXT UNIQUE NOT NULL,
+        campaign_id TEXT NOT NULL,
+        merchant_pubkey_hex TEXT NOT NULL,
+        order_total REAL NOT NULL,
+        order_total_decimal TEXT NOT NULL,
+        currency TEXT NOT NULL,
+        order_total_sats INTEGER NOT NULL,
+        btc_usd_rate TEXT,
+        sats_per_usd TEXT,
+        rate_source TEXT,
+        rate_observed_at TEXT,
+        rate_fetched_at TEXT,
+        rate_stale INTEGER,
+        cashback_bps INTEGER NOT NULL,
+        reward_sats INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        created_at TEXT NOT NULL,
+        destination_revealed_at TEXT,
+        paid_at TEXT,
+        payment_hash TEXT,
+        payment_evidence TEXT
     );
     CREATE TABLE IF NOT EXISTS shopify_webhook_receipts (
         webhook_id TEXT PRIMARY KEY,
@@ -1297,6 +1351,21 @@ def _init_db_unlocked() -> None:
         for stmt in [s.strip() for s in ddl.split(";") if s.strip()]:
             c.execute(text(stmt))
         if database_url().startswith("postgresql"):
+            c.execute(text("ALTER TABLE cashback_campaigns ADD COLUMN IF NOT EXISTS committed_sats INTEGER NOT NULL DEFAULT 0"))
+            c.execute(text("ALTER TABLE cashback_claims ADD COLUMN IF NOT EXISTS consumed_at TEXT"))
+            c.execute(text("ALTER TABLE cashback_claims ADD COLUMN IF NOT EXISTS consumed_order_key TEXT"))
+            cashback_reward_column_ddl = {
+                "order_key": "TEXT", "claim_id": "TEXT", "campaign_id": "TEXT",
+                "merchant_pubkey_hex": "TEXT", "order_total": "DOUBLE PRECISION",
+                "order_total_decimal": "TEXT", "currency": "TEXT", "order_total_sats": "INTEGER",
+                "btc_usd_rate": "TEXT", "sats_per_usd": "TEXT", "rate_source": "TEXT",
+                "rate_observed_at": "TEXT", "rate_fetched_at": "TEXT", "rate_stale": "INTEGER",
+                "cashback_bps": "INTEGER", "reward_sats": "INTEGER", "status": "TEXT DEFAULT 'pending'",
+                "created_at": "TEXT", "destination_revealed_at": "TEXT", "paid_at": "TEXT",
+                "payment_hash": "TEXT", "payment_evidence": "TEXT",
+            }
+            for column, column_type in cashback_reward_column_ddl.items():
+                c.execute(text(f"ALTER TABLE cashback_rewards ADD COLUMN IF NOT EXISTS {column} {column_type}"))
             c.execute(text("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS merchant_pubkey_hex TEXT"))
             c.execute(text("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS terms_url TEXT"))
             c.execute(text("ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS invite_eyebrow TEXT"))
@@ -1313,6 +1382,9 @@ def _init_db_unlocked() -> None:
             c.execute(text("ALTER TABLE conversions ADD COLUMN IF NOT EXISTS idempotency_payload_hash TEXT"))
             c.execute(text("ALTER TABLE conversions ADD COLUMN IF NOT EXISTS order_total_decimal TEXT"))
             c.execute(text("ALTER TABLE shopify_webhook_deliveries ADD COLUMN IF NOT EXISTS order_total_decimal TEXT"))
+            c.execute(text("ALTER TABLE shopify_webhook_deliveries ADD COLUMN IF NOT EXISTS reward_id TEXT"))
+            c.execute(text("ALTER TABLE shopify_webhook_deliveries ADD COLUMN IF NOT EXISTS attribution_code TEXT"))
+            c.execute(text("ALTER TABLE shopify_webhook_deliveries ADD COLUMN IF NOT EXISTS processing_started_at TEXT"))
             c.execute(text("ALTER TABLE conversions ADD COLUMN IF NOT EXISTS order_total_sats INTEGER"))
             c.execute(text("ALTER TABLE conversions ADD COLUMN IF NOT EXISTS btc_usd_rate TEXT"))
             c.execute(text("ALTER TABLE conversions ADD COLUMN IF NOT EXISTS sats_per_usd TEXT"))
@@ -1350,6 +1422,27 @@ def _init_db_unlocked() -> None:
             challenge_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(auth_challenges)")).fetchall()}
             merchant_profile_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(merchant_profiles)")).fetchall()}
             nostr_event_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(nostr_events)")).fetchall()}
+            cashback_campaign_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(cashback_campaigns)")).fetchall()}
+            cashback_claim_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(cashback_claims)")).fetchall()}
+            cashback_reward_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(cashback_rewards)")).fetchall()}
+            if "committed_sats" not in cashback_campaign_cols:
+                c.execute(text("ALTER TABLE cashback_campaigns ADD COLUMN committed_sats INTEGER NOT NULL DEFAULT 0"))
+            for column in ("consumed_at", "consumed_order_key"):
+                if column not in cashback_claim_cols:
+                    c.execute(text(f"ALTER TABLE cashback_claims ADD COLUMN {column} TEXT"))
+            cashback_reward_column_ddl = {
+                "order_key": "TEXT", "claim_id": "TEXT", "campaign_id": "TEXT",
+                "merchant_pubkey_hex": "TEXT", "order_total": "REAL", "order_total_decimal": "TEXT",
+                "currency": "TEXT", "order_total_sats": "INTEGER", "btc_usd_rate": "TEXT",
+                "sats_per_usd": "TEXT", "rate_source": "TEXT", "rate_observed_at": "TEXT",
+                "rate_fetched_at": "TEXT", "rate_stale": "INTEGER", "cashback_bps": "INTEGER",
+                "reward_sats": "INTEGER", "status": "TEXT DEFAULT 'pending'", "created_at": "TEXT",
+                "destination_revealed_at": "TEXT", "paid_at": "TEXT", "payment_hash": "TEXT",
+                "payment_evidence": "TEXT",
+            }
+            for column, column_type in cashback_reward_column_ddl.items():
+                if column not in cashback_reward_cols:
+                    c.execute(text(f"ALTER TABLE cashback_rewards ADD COLUMN {column} {column_type}"))
             for column in ("invite_eyebrow", "invite_headline", "invite_description"):
                 if column not in campaign_cols:
                     c.execute(text(f"ALTER TABLE campaigns ADD COLUMN {column} TEXT"))
@@ -1385,6 +1478,12 @@ def _init_db_unlocked() -> None:
                     c.execute(text(f"ALTER TABLE conversions ADD COLUMN {column} {column_type}"))
             if "order_total_decimal" not in shopify_delivery_cols:
                 c.execute(text("ALTER TABLE shopify_webhook_deliveries ADD COLUMN order_total_decimal TEXT"))
+            if "reward_id" not in shopify_delivery_cols:
+                c.execute(text("ALTER TABLE shopify_webhook_deliveries ADD COLUMN reward_id TEXT"))
+            if "attribution_code" not in shopify_delivery_cols:
+                c.execute(text("ALTER TABLE shopify_webhook_deliveries ADD COLUMN attribution_code TEXT"))
+            if "processing_started_at" not in shopify_delivery_cols:
+                c.execute(text("ALTER TABLE shopify_webhook_deliveries ADD COLUMN processing_started_at TEXT"))
             payout_column_ddl = {
                 "bolt11_invoice": "TEXT",
                 "payment_provider": "TEXT",
@@ -1462,6 +1561,41 @@ def _init_db_unlocked() -> None:
         else:
             logger.warning("skipping enrollment uniqueness index because historical duplicates require reconciliation")
         c.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_conversions_merchant_order_key ON conversions(merchant_order_key) WHERE merchant_order_key IS NOT NULL"))
+        duplicate_cashback_claim = c.execute(text("""
+            SELECT claim_id FROM cashback_rewards
+            WHERE claim_id IS NOT NULL
+            GROUP BY claim_id HAVING COUNT(*) > 1
+            ORDER BY claim_id LIMIT 1
+        """)).scalar_one_or_none()
+        if duplicate_cashback_claim:
+            raise RuntimeError(
+                "Duplicate cashback_rewards.claim_id values detected; manual reconciliation is required "
+                f"before schema initialization (example claim_id: {duplicate_cashback_claim})."
+            )
+        c.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_cashback_rewards_claim_id ON cashback_rewards(claim_id)"))
+        duplicate_cashback_order = c.execute(text("""
+            SELECT order_key FROM cashback_rewards
+            WHERE order_key IS NOT NULL
+            GROUP BY order_key HAVING COUNT(*) > 1
+            ORDER BY order_key LIMIT 1
+        """)).scalar_one_or_none()
+        if duplicate_cashback_order:
+            raise RuntimeError(
+                "Duplicate cashback_rewards.order_key values detected; manual reconciliation is required "
+                f"before schema initialization (example order_key: {duplicate_cashback_order})."
+            )
+        c.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_cashback_rewards_order_key ON cashback_rewards(order_key) WHERE order_key IS NOT NULL"))
+        c.execute(text("UPDATE cashback_rewards SET order_total_decimal=CAST(order_total AS TEXT) WHERE order_total_decimal IS NULL AND order_total IS NOT NULL"))
+        c.execute(text("""
+            UPDATE cashback_campaigns
+            SET committed_sats=(SELECT COALESCE(SUM(r.reward_sats),0) FROM cashback_rewards r WHERE r.campaign_id=cashback_campaigns.id)
+        """))
+        c.execute(text("""
+            UPDATE cashback_claims
+            SET consumed_at=COALESCE(consumed_at, (SELECT MIN(r.created_at) FROM cashback_rewards r WHERE r.claim_id=cashback_claims.id)),
+                consumed_order_key=COALESCE(consumed_order_key, (SELECT MIN(r.order_key) FROM cashback_rewards r WHERE r.claim_id=cashback_claims.id))
+            WHERE EXISTS (SELECT 1 FROM cashback_rewards r WHERE r.claim_id=cashback_claims.id)
+        """))
         c.execute(text("""
             UPDATE payouts SET state=CASE
                 WHEN status='paid' AND nostr_event_id IS NOT NULL THEN 'PUBLISHED'
@@ -1729,6 +1863,43 @@ class MerchantBootstrapIn(BaseModel):
     terms_url: str | None = Field(default=None, max_length=3000)
     logo_url: str | None = Field(default=None, max_length=2048)
     enrollment_mode: Literal["private", "approval", "open"] | None = None
+
+
+class CashbackCampaignIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    merchant_pubkey: str = Field(..., min_length=32, max_length=128)
+    name: str = Field(..., min_length=1, max_length=160)
+    cashback_percent: Decimal = Field(..., ge=Decimal("0.01"), le=100, max_digits=5, decimal_places=2)
+    destination_url: str = Field(..., max_length=3000)
+    attribution_window_days: int = Field(30, ge=1, le=365)
+    budget_sats: int = Field(..., ge=1, le=2_100_000_000)
+    max_reward_sats: int = Field(..., ge=1, le=2_100_000_000)
+
+    @model_validator(mode="after")
+    def finite_liability(self) -> "CashbackCampaignIn":
+        if self.max_reward_sats > self.budget_sats:
+            raise ValueError("max_reward_sats must be less than or equal to budget_sats")
+        return self
+
+
+class CashbackCampaignStatusIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["active", "paused"]
+
+
+class CashbackClaimIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    lightning_address: str = Field(..., min_length=3, max_length=320)
+
+
+class CashbackPaymentIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    payment_hash: str = Field(..., min_length=64, max_length=64, pattern=r"^[0-9a-fA-F]{64}$")
+    evidence: str = Field(..., min_length=1, max_length=500)
 
 
 class MerchantProfileIn(BaseModel):
@@ -3103,7 +3274,7 @@ def dashboard_data() -> dict[str, Any]:
 @contextmanager
 def merchant_conversion_lock(order_key: str):
     """Serialize one merchant order locally and across PostgreSQL workers."""
-    lock_digest = order_key.rsplit(":", 1)[-1]
+    lock_digest = hashlib.sha256(order_key.encode()).hexdigest()
     lock = _MERCHANT_CONVERSION_LOCKS[int(lock_digest[:8], 16) % len(_MERCHANT_CONVERSION_LOCKS)]
     with lock:
         if not database_url().startswith("postgresql"):
@@ -3294,18 +3465,25 @@ def shopify_installation_snippets(base_url: str, shop_domain: str) -> dict[str, 
 
   var ref = param("bb_ref") || param("bumbei_ref") || param("ref") || param("affiliate");
   var clickId = param("bb_click_id") || param("click_id");
+  var campaignCode = param("bb_campaign");
   if (ref) { setCookie("bb_ref", ref); setCookie("bumbei_ref", ref); }
   if (clickId) setCookie("bb_click_id", clickId);
+  if (campaignCode) setCookie("bb_campaign", campaignCode);
 
   ref = ref || getCookie("bb_ref") || getCookie("bumbei_ref");
   clickId = clickId || getCookie("bb_click_id");
-  if (!ref && !clickId) return;
+  campaignCode = campaignCode || getCookie("bb_campaign");
+  if (!ref && !clickId && !campaignCode) return;
 
   fetch("/cart/update.js", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ attributes: { bb_ref: ref || "", bb_click_id: clickId || "" } })
+    body: JSON.stringify({ attributes: { bb_ref: ref || "", bb_click_id: clickId || "", bb_campaign: campaignCode || "" } })
   }).catch(function () {});
+
+  // Cashback Express relies on cart attributes plus the signed orders/paid webhook.
+  // Do not send buyer page-view telemetry for this flow.
+  if (campaignCode) return;
 
   fetch(__EVENTS_URL__, {
     method: "POST",
@@ -3316,6 +3494,7 @@ def shopify_installation_snippets(base_url: str, shop_domain: str) -> dict[str, 
       shop: __SHOP_LITERAL__,
       bb_ref: ref || null,
       bb_click_id: clickId || null,
+      bb_campaign: campaignCode || null,
       path: window.location.pathname,
       ts: new Date().toISOString()
     })
@@ -3334,7 +3513,10 @@ def shopify_installation_snippets(base_url: str, shop_domain: str) -> dict[str, 
 
   const ref = await cookie(["bb_ref", "bumbei_ref"]);
   const clickId = await cookie(["bb_click_id", "click_id"]);
-  if (!ref && !clickId) return;
+  const campaignCode = await cookie(["bb_campaign"]);
+  if (!ref && !clickId && !campaignCode) return;
+  // Cashback Express is accounted from the signed orders/paid webhook only.
+  if (campaignCode) return;
 
   await fetch(__CONVERSIONS_URL__, {
     method: "POST",
@@ -3344,6 +3526,7 @@ def shopify_installation_snippets(base_url: str, shop_domain: str) -> dict[str, 
       shop: __SHOP_LITERAL__,
       bb_ref: ref,
       bb_click_id: clickId,
+      bb_campaign: campaignCode,
       order_id: checkout.order && checkout.order.id ? String(checkout.order.id) : null,
       total_price: checkout.totalPrice && checkout.totalPrice.amount ? checkout.totalPrice.amount : null,
       currency: checkout.currencyCode || null,
@@ -3410,7 +3593,8 @@ def record_shopify_webhook_receipt(
 
 
 def enqueue_shopify_paid_order(
-    *, webhook_id: str, order_key: str, shop: str, topic: str, click_id: str, order_total: Decimal, currency: str
+    *, webhook_id: str, order_key: str, shop: str, topic: str, click_id: str,
+    order_total: Decimal, currency: str, attribution_code: str | None = None
 ) -> tuple[dict[str, Any], bool, bool]:
     """Persist a minimal webhook inbox row and atomically claim a new Shopify order."""
     init_db()
@@ -3421,9 +3605,9 @@ def enqueue_shopify_paid_order(
                 """
                 INSERT INTO shopify_webhook_deliveries
                 (webhook_id, order_key, shop_domain, topic, click_id, order_total, order_total_decimal, currency,
-                 status, conversion_id, error, created_at, processed_at)
+                 status, conversion_id, reward_id, attribution_code, error, created_at, processing_started_at, processed_at)
                 VALUES (:webhook_id, :order_key, :shop_domain, :topic, :click_id, :order_total, :order_total_decimal,
-                        :currency, 'pending', NULL, NULL, :created_at, NULL)
+                        :currency, 'pending', NULL, NULL, :attribution_code, NULL, :created_at, NULL, NULL)
                 ON CONFLICT(order_key) DO NOTHING
                 """
             ),
@@ -3436,6 +3620,7 @@ def enqueue_shopify_paid_order(
                 "order_total": float(order_total),
                 "order_total_decimal": decimal_text(order_total),
                 "currency": currency,
+                "attribution_code": attribution_code,
                 "created_at": created_at,
             },
         ).rowcount == 1
@@ -3447,12 +3632,18 @@ def enqueue_shopify_paid_order(
                 or Decimal(row.get("order_total_decimal") or str(row["order_total"])) != order_total
                 or row["currency"] != currency
                 or row["shop_domain"] != shop
+                or (row.get("attribution_code") or None) != (attribution_code or None)
             )
         )
         should_process = inserted
-        if row and row["status"] == "failed" and not conflict:
+        stale_before = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        stale_processing = bool(
+            row and row["status"] == "processing"
+            and (not row.get("processing_started_at") or row["processing_started_at"] < stale_before)
+        )
+        if row and (row["status"] == "failed" or stale_processing) and not conflict:
             c.execute(
-                text("UPDATE shopify_webhook_deliveries SET status='pending', error=NULL WHERE order_key=:key"),
+                text("UPDATE shopify_webhook_deliveries SET status='pending', error=NULL, processing_started_at=NULL WHERE order_key=:key"),
                 {"key": order_key},
             )
             row["status"] = "pending"
@@ -3460,41 +3651,168 @@ def enqueue_shopify_paid_order(
     return row, should_process, conflict
 
 
+def process_cashback_reward(
+    *, order_key: str, claim_id: str, campaign_code: str | None,
+    order_total: Decimal, currency: str, authorized_merchant_hex: str,
+) -> dict[str, Any]:
+    """Create one pending buyer obligation, consuming one claim and budget atomically."""
+    with engine().connect() as lookup:
+        campaign_id = lookup.execute(
+            text("SELECT campaign_id FROM cashback_claims WHERE id=:claim_id"), {"claim_id": claim_id}
+        ).scalar_one_or_none()
+    if not campaign_id:
+        raise HTTPException(404, "cashback claim not found")
+    # One campaign lock covers claim consumption, budget reservation and reward insert.
+    with merchant_conversion_lock(f"cashback-campaign:{campaign_id}"):
+        return _process_cashback_reward_locked(
+            order_key=order_key, claim_id=claim_id, campaign_code=campaign_code,
+            order_total=order_total, currency=currency,
+            authorized_merchant_hex=authorized_merchant_hex,
+        )
+
+
+def _process_cashback_reward_locked(
+    *, order_key: str, claim_id: str, campaign_code: str | None,
+    order_total: Decimal, currency: str, authorized_merchant_hex: str,
+) -> dict[str, Any]:
+    normalized_currency = currency.upper().strip()
+    quote = rate_quote_for_currency(normalized_currency)
+    total_sats = order_total_sats(order_total, normalized_currency, quote)
+    created_at = now()
+    with engine().begin() as connection:
+        existing = asdict(connection.execute(
+            text("SELECT * FROM cashback_rewards WHERE order_key=:key"), {"key": order_key}
+        ).fetchone())
+        if existing:
+            return existing
+        row = asdict(connection.execute(text("""
+            SELECT cl.id AS claim_id, cl.expires_at, cl.consumed_at, cl.consumed_order_key,
+                   c.id AS campaign_id, c.merchant_pubkey_hex, c.cashback_bps,
+                   c.short_code, c.status, c.archived_at, c.max_reward_sats, c.budget_sats,
+                   c.committed_sats
+            FROM cashback_claims cl JOIN cashback_campaigns c ON c.id=cl.campaign_id
+            WHERE cl.id=:claim_id
+        """), {"claim_id": claim_id}).fetchone())
+        if not row:
+            raise HTTPException(404, "cashback claim not found")
+        if row.get("consumed_at"):
+            raise HTTPException(409, "cashback claim already funded another order")
+        if row["merchant_pubkey_hex"] != authorized_merchant_hex:
+            raise HTTPException(403, "cashback campaign belongs to another merchant")
+        if row["status"] != "active" or row.get("archived_at"):
+            raise HTTPException(409, "cashback campaign is inactive")
+        if campaign_code != row["short_code"]:
+            raise HTTPException(409, "cashback campaign attribution mismatch")
+        if parse_iso(row["expires_at"]) <= datetime.now(timezone.utc):
+            raise HTTPException(409, "cashback claim expired")
+        reward_sats = int(
+            (Decimal(total_sats) * Decimal(int(row["cashback_bps"])) / Decimal(10_000))
+            .quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+        )
+        if row.get("max_reward_sats") is not None:
+            reward_sats = min(reward_sats, int(row["max_reward_sats"]))
+        if reward_sats <= 0:
+            raise HTTPException(422, "cashback reward rounds to zero sats")
+        reserved = connection.execute(text("""
+            UPDATE cashback_campaigns
+            SET committed_sats=committed_sats+:reward_sats
+            WHERE id=:campaign_id
+              AND (budget_sats IS NULL OR committed_sats+:reward_sats <= budget_sats)
+        """), {"reward_sats": reward_sats, "campaign_id": row["campaign_id"]}).rowcount
+        if reserved != 1:
+            raise HTTPException(409, "cashback campaign budget exhausted")
+        consumed = connection.execute(text("""
+            UPDATE cashback_claims SET consumed_at=:consumed_at, consumed_order_key=:order_key
+            WHERE id=:claim_id AND consumed_at IS NULL
+        """), {"consumed_at": created_at, "order_key": order_key, "claim_id": claim_id}).rowcount
+        if consumed != 1:
+            raise HTTPException(409, "cashback claim already funded another order")
+        reward_id = hid("rew")
+        snapshot = quote.snapshot() if quote else {
+            "btc_usd_rate": None, "sats_per_usd": None, "rate_source": None,
+            "rate_observed_at": None, "rate_fetched_at": None, "rate_stale": False,
+        }
+        snapshot["rate_stale"] = int(bool(snapshot.get("rate_stale")))
+        connection.execute(text("""
+            INSERT INTO cashback_rewards
+              (id, order_key, claim_id, campaign_id, merchant_pubkey_hex, order_total,
+               order_total_decimal, currency, order_total_sats, btc_usd_rate, sats_per_usd,
+               rate_source, rate_observed_at, rate_fetched_at, rate_stale, cashback_bps,
+               reward_sats, status, created_at)
+            VALUES (:id, :order_key, :claim_id, :campaign_id, :merchant_hex, :order_total,
+                    :order_decimal, :currency, :total_sats, :btc_usd_rate, :sats_per_usd,
+                    :rate_source, :rate_observed_at, :rate_fetched_at, :rate_stale, :bps,
+                    :reward_sats, 'pending', :created_at)
+        """), {
+            "id": reward_id, "order_key": order_key, "claim_id": claim_id,
+            "campaign_id": row["campaign_id"], "merchant_hex": row["merchant_pubkey_hex"],
+            "order_total": float(order_total), "order_decimal": decimal_text(order_total),
+            "currency": normalized_currency, "total_sats": total_sats, "bps": row["cashback_bps"],
+            "reward_sats": reward_sats, "created_at": created_at, **snapshot,
+        })
+        return asdict(connection.execute(
+            text("SELECT * FROM cashback_rewards WHERE id=:id"), {"id": reward_id}
+        ).fetchone())
+
+
 def process_shopify_delivery(order_key: str) -> None:
-    """Process one claimed Shopify order after the HTTP response has been sent."""
+    """Atomically claim a pending or stale Shopify order and process it idempotently."""
+    processing_started_at = now()
+    stale_before = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
     with engine().begin() as c:
         claimed = c.execute(
             text(
                 """
                 UPDATE shopify_webhook_deliveries
-                SET status='processing', error=NULL
-                WHERE order_key=:key AND status='pending'
+                SET status='processing', error=NULL, processing_started_at=:started
+                WHERE order_key=:key AND (
+                    status='pending' OR (status='processing' AND
+                    (processing_started_at IS NULL OR processing_started_at < :stale_before))
+                )
                 """
             ),
-            {"key": order_key},
+            {"key": order_key, "started": processing_started_at, "stale_before": stale_before},
         ).rowcount == 1
         row = asdict(c.execute(text("SELECT * FROM shopify_webhook_deliveries WHERE order_key=:key"), {"key": order_key}).fetchone())
     if not claimed or not row:
         return
 
     try:
-        result = process_merchant_conversion(
-            MerchantConversionIn(
-                order_id=order_key,
-                bb_click_id=row["click_id"],
+        with engine().connect() as connection:
+            cashback_claim = bool(connection.execute(
+                text("SELECT 1 FROM cashback_claims WHERE id=:id"), {"id": row["click_id"]}
+            ).fetchone())
+        if cashback_claim:
+            result = process_cashback_reward(
+                order_key=order_key,
+                claim_id=row["click_id"],
+                campaign_code=row.get("attribution_code"),
                 order_total=Decimal(row.get("order_total_decimal") or str(row["order_total"])),
                 currency=row["currency"],
-                metadata={"platform": "shopify", "shop": row["shop_domain"], "topic": row["topic"]},
-            ),
-            configured_merchant_pubkey_hex(),
-        )
+                authorized_merchant_hex=configured_merchant_pubkey_hex(),
+            )
+            result_id = result["id"]
+            result_column = "reward_id"
+        else:
+            result = process_merchant_conversion(
+                MerchantConversionIn(
+                    order_id=order_key,
+                    bb_click_id=row["click_id"],
+                    order_total=Decimal(row.get("order_total_decimal") or str(row["order_total"])),
+                    currency=row["currency"],
+                    metadata={"platform": "shopify", "shop": row["shop_domain"], "topic": row["topic"]},
+                ),
+                configured_merchant_pubkey_hex(),
+            )
+            result_id = result["conversion_id"]
+            result_column = "conversion_id"
     except Exception as exc:
         with engine().begin() as c:
             c.execute(
                 text(
                     """
                     UPDATE shopify_webhook_deliveries
-                    SET status='failed', error=:error, processed_at=:processed_at
+                    SET status='failed', error=:error, processing_started_at=NULL, processed_at=:processed_at
                     WHERE order_key=:key
                     """
                 ),
@@ -3505,14 +3823,13 @@ def process_shopify_delivery(order_key: str) -> None:
 
     with engine().begin() as c:
         c.execute(
-            text(
-                """
+            text(f"""
                 UPDATE shopify_webhook_deliveries
-                SET status='processed', conversion_id=:conversion_id, error=NULL, processed_at=:processed_at
+                SET status='processed', {result_column}=:result_id, error=NULL,
+                    processing_started_at=NULL, processed_at=:processed_at
                 WHERE order_key=:key
-                """
-            ),
-            {"key": order_key, "conversion_id": result["conversion_id"], "processed_at": now()},
+                """),
+            {"key": order_key, "result_id": result_id, "processed_at": now()},
         )
     record_shopify_webhook_receipt(row["webhook_id"], row["shop_domain"], row["topic"], "processed")
 
@@ -3557,6 +3874,7 @@ async def shopify_orders_paid_webhook(request: Request, background_tasks: Backgr
     record_shopify_webhook_receipt(webhook_id, shop, topic, "received")
     attributes = shopify_note_attributes(payload)
     click_id = attributes.get("bb_click_id") or attributes.get("click_id")
+    attribution_code = attributes.get("bb_campaign")
     if not click_id:
         record_shopify_webhook_receipt(webhook_id, shop, topic, "ignored", "missing affiliate attribution")
         return {
@@ -3586,6 +3904,7 @@ async def shopify_orders_paid_webhook(request: Request, background_tasks: Backgr
         click_id=click_id,
         order_total=order_total,
         currency=currency,
+        attribution_code=attribution_code,
     )
     if conflict:
         record_shopify_webhook_receipt(webhook_id, shop, topic, "conflict", "duplicate order payload mismatch")
@@ -3596,6 +3915,7 @@ async def shopify_orders_paid_webhook(request: Request, background_tasks: Backgr
             "conflict": True,
             "status": delivery["status"],
             "conversion_id": delivery.get("conversion_id"),
+            "reward_id": delivery.get("reward_id"),
             "shop": shop,
             "topic": topic,
         }
@@ -3615,6 +3935,7 @@ async def shopify_orders_paid_webhook(request: Request, background_tasks: Backgr
         "queued": delivery["status"] != "processed",
         "status": delivery["status"],
         "conversion_id": delivery.get("conversion_id"),
+        "reward_id": delivery.get("reward_id"),
         "shop": shop,
         "topic": topic,
         "webhook_id": webhook_id,
@@ -5585,6 +5906,231 @@ def _normalized_merchant_url(value: str, field_name: str, *, logo: bool = False)
         if unquote(parsed.path).lower().endswith(".svg"):
             raise HTTPException(422, "logo_url no admite imágenes SVG.")
     return urlunparse(parsed._replace(fragment=""))
+
+
+def _cashback_campaign_by_code(code: str, *, active_only: bool = True) -> dict[str, Any]:
+    init_db()
+    where = "AND c.status='active' AND c.archived_at IS NULL" if active_only else ""
+    with engine().connect() as connection:
+        row = connection.execute(
+            text(f"""
+                SELECT c.*, mp.display_name, mp.tagline, mp.logo_url
+                FROM cashback_campaigns c
+                LEFT JOIN merchant_profiles mp ON mp.merchant_pubkey_hex=c.merchant_pubkey_hex
+                WHERE c.short_code=:code {where}
+            """),
+            {"code": code},
+        ).fetchone()
+    campaign = asdict(row)
+    if not campaign:
+        raise HTTPException(404, "Cashback no disponible / Cashback unavailable")
+    return campaign
+
+
+def _merchant_session_owns(connection: Any, session: dict[str, Any], merchant_hex: str) -> bool:
+    return session["nostr_pubkey_hex"] == merchant_hex or bool(
+        connection.execute(
+            text("SELECT 1 FROM merchant_account_links WHERE account_id=:account AND merchant_pubkey_hex=:merchant LIMIT 1"),
+            {"account": session["account_id"], "merchant": merchant_hex},
+        ).fetchone()
+    )
+
+
+def _cashback_short_code(connection: Any) -> str:
+    for _ in range(12):
+        code = secrets.token_urlsafe(9).replace("-", "").replace("_", "")[:12]
+        if len(code) >= 10 and not connection.execute(
+            text("SELECT 1 FROM cashback_campaigns WHERE short_code=:code"), {"code": code}
+        ).fetchone():
+            return code
+    raise HTTPException(503, "No se pudo generar un código seguro.")
+
+
+@app.post("/app/merchant/cashback-express", tags=["Accounts"])
+def merchant_create_cashback_express(body: CashbackCampaignIn, request: Request) -> dict[str, Any]:
+    session = require_account_session(request, "merchant")
+    _require_same_origin(request)
+    identity = normalize_pubkey(body.merchant_pubkey, "merchant_pubkey")
+    configured_merchant = configured_merchant_pubkey_hex()
+    if identity["hex"] != configured_merchant:
+        raise HTTPException(403, "Cashback Express is restricted to the configured Shopify merchant.")
+    name = safe_text(body.name, 160)
+    if not name:
+        raise HTTPException(422, "name es obligatorio")
+    destination = _normalized_merchant_url(body.destination_url, "destination_url")
+    cashback_bps = int(body.cashback_percent * Decimal(100))
+    init_db()
+    campaign_id = hid("cbk")
+    with engine().begin() as connection:
+        if not _merchant_session_owns(connection, session, identity["hex"]):
+            raise HTTPException(403, "La cuenta no controla este comerciante.")
+        code = _cashback_short_code(connection)
+        connection.execute(text("""
+            INSERT INTO cashback_campaigns
+              (id, merchant_pubkey, merchant_pubkey_hex, name, cashback_bps, window_days,
+               destination_url, short_code, budget_sats, max_reward_sats, status, created_at)
+            VALUES (:id, :npub, :hex, :name, :bps, :window, :destination, :code,
+                    :budget, :maximum, 'active', :created)
+        """), {
+            "id": campaign_id, "npub": identity["npub"], "hex": identity["hex"], "name": name,
+            "bps": cashback_bps, "window": body.attribution_window_days, "destination": destination,
+            "code": code, "budget": body.budget_sats, "maximum": body.max_reward_sats, "created": now(),
+        })
+    return {
+        "ok": True, "campaign_id": campaign_id, "code": code,
+        "short_url": f"{BASE_URL}/x/{code}", "cashback_bps": cashback_bps,
+    }
+
+
+@app.post("/app/merchant/cashback-express/{campaign_id}/status", tags=["Accounts"])
+def merchant_set_cashback_express_status(
+    campaign_id: str, body: CashbackCampaignStatusIn, request: Request
+) -> dict[str, Any]:
+    session = require_account_session(request, "merchant")
+    _require_same_origin(request)
+    init_db()
+    with engine().begin() as connection:
+        campaign = asdict(connection.execute(text("""
+            SELECT id, merchant_pubkey_hex FROM cashback_campaigns WHERE id=:id
+        """), {"id": campaign_id}).fetchone())
+        if not campaign or not _merchant_session_owns(connection, session, campaign["merchant_pubkey_hex"]):
+            raise HTTPException(404, "Cashback campaign not found.")
+        updated = connection.execute(text("""
+            UPDATE cashback_campaigns SET status=:status
+            WHERE id=:id AND archived_at IS NULL
+        """), {"status": body.status, "id": campaign_id}).rowcount
+        if updated != 1:
+            raise HTTPException(409, "Archived cashback campaigns cannot be resumed.")
+    return {"ok": True, "campaign_id": campaign_id, "status": body.status}
+
+
+@app.get("/x/{code}", response_class=HTMLResponse, include_in_schema=False)
+def cashback_express_landing(request: Request, code: str) -> Response:
+    campaign = _cashback_campaign_by_code(code)
+    campaign["cashback_percent"] = f"{Decimal(campaign['cashback_bps']) / Decimal(100):g}"
+    response = templates.TemplateResponse(
+        request=request, name="cashback_express.html", context={"campaign": campaign}
+    )
+    response.headers.update({
+        "Cache-Control": "no-store", "Pragma": "no-cache", "Referrer-Policy": "no-referrer",
+        "X-Robots-Tag": "noindex, nofollow",
+        "Content-Security-Policy": "default-src 'self'; img-src 'self' https: data:; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+    })
+    return response
+
+
+@app.post("/x/{code}/claim", include_in_schema=False)
+def cashback_express_claim(code: str, body: CashbackClaimIn, response: str | None = None) -> Response:
+    campaign = _cashback_campaign_by_code(code)
+    address = body.lightning_address.strip().lower()
+    try:
+        descriptor = urlparse(lightning_address_url(address))
+        host = (descriptor.hostname or "").lower().rstrip(".")
+        if host == "localhost" or host.endswith((".localhost", ".local")):
+            raise ValueError("non-public Lightning Address host")
+        try:
+            host_ip = ipaddress.ip_address(host)
+        except ValueError:
+            if any(not label or len(label) > 63 for label in host.split(".")):
+                raise ValueError("invalid Lightning Address host")
+        else:
+            if not host_ip.is_global:
+                raise ValueError("non-public Lightning Address host")
+    except (LightningPaymentError, ValueError) as exc:
+        raise HTTPException(422, "Dirección Lightning inválida / Invalid Lightning Address") from exc
+    claim_id = hid("clk")
+    created = datetime.now(timezone.utc)
+    expires = created + timedelta(days=int(campaign["window_days"]))
+    with engine().begin() as connection:
+        # Retain claims only through attribution unless they back a financial record.
+        connection.execute(text("""
+            DELETE FROM cashback_claims
+            WHERE expires_at < :now
+              AND NOT EXISTS (SELECT 1 FROM cashback_rewards r WHERE r.claim_id=cashback_claims.id)
+        """), {"now": created.isoformat()})
+        # Re-check state in the same transaction so a paused campaign fails closed.
+        active = connection.execute(text("""
+            SELECT 1 FROM cashback_campaigns
+            WHERE id=:id AND status='active' AND archived_at IS NULL
+        """), {"id": campaign["id"]}).fetchone()
+        if not active:
+            raise HTTPException(404, "Cashback no disponible / Cashback unavailable")
+        # MVP limitation: the destination is plaintext at rest; it is never public or rendered raw.
+        connection.execute(text("""
+            INSERT INTO cashback_claims (id, campaign_id, lightning_address, created_at, expires_at)
+            VALUES (:id, :campaign, :address, :created, :expires)
+        """), {
+            "id": claim_id, "campaign": campaign["id"], "address": address,
+            "created": created.isoformat(), "expires": expires.isoformat(),
+        })
+    location = add_query_params(campaign["destination_url"], {"bb_click_id": claim_id, "bb_campaign": code})
+    location = urlunparse(urlparse(location)._replace(fragment=""))
+    privacy_headers = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"}
+    if response == "json":
+        return JSONResponse({"redirect_url": location}, headers=privacy_headers)
+    return RedirectResponse(location, status_code=303, headers=privacy_headers)
+
+
+def _owned_cashback_reward(connection: Any, session: dict[str, Any], reward_id: str) -> dict[str, Any]:
+    row = asdict(connection.execute(text("""
+        SELECT r.*, cl.lightning_address
+        FROM cashback_rewards r JOIN cashback_claims cl ON cl.id=r.claim_id
+        WHERE r.id=:reward_id
+    """), {"reward_id": reward_id}).fetchone())
+    if not row or not _merchant_session_owns(connection, session, row["merchant_pubkey_hex"]):
+        raise HTTPException(404, "Cashback reward not found.")
+    return row
+
+
+@app.get("/app/merchant/cashback-rewards/{reward_id}/destination", tags=["Accounts"])
+def merchant_reveal_cashback_destination(reward_id: str, request: Request) -> Response:
+    session = require_account_session(request, "merchant")
+    init_db()
+    with engine().begin() as connection:
+        reward = _owned_cashback_reward(connection, session, reward_id)
+        # Authenticated tenant-scoped disclosure only. The merchant's wallet handles payment.
+        revealed_at = now()
+        connection.execute(text("""
+            UPDATE cashback_rewards SET destination_revealed_at=COALESCE(destination_revealed_at,:revealed_at)
+            WHERE id=:reward_id
+        """), {"revealed_at": revealed_at, "reward_id": reward_id})
+    return JSONResponse({
+        "reward_id": reward_id, "lightning_address": reward["lightning_address"],
+        "reward_sats": reward["reward_sats"], "status": reward["status"],
+    }, headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
+
+
+@app.post("/app/merchant/cashback-rewards/{reward_id}/paid", tags=["Accounts"])
+def merchant_mark_cashback_paid(reward_id: str, body: CashbackPaymentIn, request: Request) -> dict[str, Any]:
+    session = require_account_session(request, "merchant")
+    _require_same_origin(request)
+    payment_hash = body.payment_hash.lower()
+    evidence = safe_text(body.evidence, 500)
+    if not evidence:
+        raise HTTPException(422, "Payment evidence is required.")
+    init_db()
+    paid_at = now()
+    with engine().begin() as connection:
+        reward = _owned_cashback_reward(connection, session, reward_id)
+        if reward["status"] == "paid":
+            if reward.get("payment_hash") == payment_hash and reward.get("payment_evidence") == evidence:
+                return {"ok": True, "reward_id": reward_id, "status": "paid", "paid_at": reward.get("paid_at"), "idempotent": True}
+            raise HTTPException(409, "Cashback reward was paid with different evidence.")
+        if reward["status"] != "pending":
+            raise HTTPException(409, "Cashback reward is not pending.")
+        updated = connection.execute(text("""
+            UPDATE cashback_rewards
+            SET status='paid', paid_at=:paid_at, payment_hash=:payment_hash, payment_evidence=:evidence
+            WHERE id=:reward_id AND status='pending'
+        """), {
+            "paid_at": paid_at, "payment_hash": payment_hash, "evidence": evidence, "reward_id": reward_id,
+        }).rowcount
+        if updated != 1:
+            current = _owned_cashback_reward(connection, session, reward_id)
+            if current["status"] == "paid" and current.get("payment_hash") == payment_hash and current.get("payment_evidence") == evidence:
+                return {"ok": True, "reward_id": reward_id, "status": "paid", "paid_at": current.get("paid_at"), "idempotent": True}
+            raise HTTPException(409, "Cashback reward settlement conflict.")
+    return {"ok": True, "reward_id": reward_id, "status": "paid", "paid_at": paid_at, "idempotent": False}
 
 
 def _merchant_requested_program(body: MerchantBootstrapIn) -> dict[str, Any]:

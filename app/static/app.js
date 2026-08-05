@@ -309,6 +309,37 @@ async function loginWithNostr(role, method) {
 }
 
 document.addEventListener("click", async (event) => {
+  const cashbackCampaignStatus = event.target.closest("[data-cashback-campaign-status]");
+  if (cashbackCampaignStatus) {
+    cashbackCampaignStatus.disabled = true;
+    try {
+      await jsonFetch(`/app/merchant/cashback-express/${encodeURIComponent(cashbackCampaignStatus.dataset.campaignId)}/status`, {
+        method: "POST", body: JSON.stringify({status: cashbackCampaignStatus.dataset.nextStatus})
+      });
+      window.location.reload();
+    } catch (error) {
+      cashbackCampaignStatus.textContent = readableError(error);
+      cashbackCampaignStatus.disabled = false;
+    }
+    return;
+  }
+  const cashbackReveal = event.target.closest("[data-cashback-reveal]");
+  if (cashbackReveal) {
+    const record = cashbackReveal.closest("[data-cashback-reward]");
+    cashbackReveal.disabled = true;
+    try {
+      const result = await jsonFetch(`/app/merchant/cashback-rewards/${encodeURIComponent(record.dataset.cashbackReward)}/destination`);
+      record.querySelector("[data-cashback-destination]").textContent = result.lightning_address;
+      record.querySelector("[data-cashback-destination]").hidden = false;
+      record.querySelector("[data-cashback-masked]").hidden = true;
+      record.querySelector("[data-cashback-paid]").hidden = false;
+      cashbackReveal.hidden = true;
+    } catch (error) {
+      cashbackReveal.disabled = false;
+      cashbackReveal.textContent = readableError(error);
+    }
+    return;
+  }
   const roleChoice = event.target.closest("[data-login-role]");
   if (roleChoice) {
     document.querySelectorAll("[data-login-role]").forEach((element) => {
@@ -497,6 +528,31 @@ document.addEventListener("click", (event) => {
 document.querySelectorAll("[data-merchant-onboarding-wizard]").forEach((form) => setMerchantOnboardingStep(form, 1));
 
 document.addEventListener("submit", async (event) => {
+  const cashbackPaid = event.target.closest("[data-cashback-paid]");
+  if (cashbackPaid) {
+    event.preventDefault();
+    const record = cashbackPaid.closest("[data-cashback-reward]");
+    const status = cashbackPaid.querySelector("[data-cashback-pay-status]");
+    const button = cashbackPaid.querySelector("button[type='submit']");
+    const fields = new FormData(cashbackPaid);
+    button.disabled = true;
+    try {
+      await jsonFetch(`/app/merchant/cashback-rewards/${encodeURIComponent(record.dataset.cashbackReward)}/paid`, {
+        method: "POST",
+        body: JSON.stringify({
+          payment_hash: String(fields.get("payment_hash") || "").trim(),
+          evidence: String(fields.get("evidence") || "").trim()
+        })
+      });
+      status.textContent = document.documentElement.lang === "en" ? "Payment recorded." : "Pago registrado.";
+      window.location.reload();
+    } catch (error) {
+      status.textContent = readableError(error);
+      status.classList.add("error");
+      button.disabled = false;
+    }
+    return;
+  }
   const commissionForm = event.target.closest("[data-campaign-commission]");
   if (commissionForm) {
     event.preventDefault();
@@ -699,6 +755,35 @@ document.addEventListener("submit", async (event) => {
         method: "POST", body: JSON.stringify({payment_hash: evidence})
       });
       status.textContent = "Pago registrado."; window.location.reload();
+    } catch (error) {
+      status.textContent = readableError(error); status.classList.add("error"); button.disabled = false;
+    }
+    return;
+  }
+
+  const cashbackForm = event.target.closest("[data-cashback-express]");
+  if (cashbackForm) {
+    event.preventDefault();
+    const status = cashbackForm.querySelector("[data-cashback-status]");
+    const button = cashbackForm.querySelector("button[type='submit']");
+    const fields = new FormData(cashbackForm);
+    button.disabled = true;
+    status.classList.remove("error");
+    try {
+      const result = await jsonFetch("/app/merchant/cashback-express", {
+        method: "POST",
+        body: JSON.stringify({
+          merchant_pubkey: String(fields.get("merchant_pubkey") || ""),
+          name: String(fields.get("name") || ""),
+          cashback_percent: String(fields.get("cashback_percent") || ""),
+          destination_url: String(fields.get("destination_url") || ""),
+          attribution_window_days: Number(fields.get("attribution_window_days") || 30),
+          budget_sats: Number(fields.get("budget_sats")),
+          max_reward_sats: Number(fields.get("max_reward_sats"))
+        })
+      });
+      status.textContent = `Cashback Express listo: ${result.short_url}`;
+      window.location.reload();
     } catch (error) {
       status.textContent = readableError(error); status.classList.add("error"); button.disabled = false;
     }
