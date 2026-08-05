@@ -1,4 +1,4 @@
-@font-face{font-family:Space;src:url('/static/fonts/space-grotesk-latin.woff2?v=20260805-status1') format('woff2');font-display:swap}
+@font-face{font-family:Space;src:url('/static/fonts/space-grotesk-latin.woff2?v=20260805-status2') format('woff2');font-display:swap}
 *{box-sizing:border-box}
 html{color-scheme:dark}
 body{margin:0;min-height:100vh;background:#151615;color:#f7f5ea;font-family:Space,system-ui,sans-serif}

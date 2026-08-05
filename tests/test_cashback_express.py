@@ -138,8 +138,8 @@ def test_public_landing_and_claim_are_private_and_fail_safe(tmp_path, monkeypatc
     assert page.status_code == 200
     assert "Cashback café" in page.text and "7.25%" in page.text
     assert "Cashback" in page.text and "reembolso" in page.text
-    assert '/static/cashback-express.css?v=20260805-status1' in page.text
-    assert '/static/cashback-express.js?v=20260805-status1' in page.text
+    assert '/static/cashback-express.css?v=20260805-status2' in page.text
+    assert '/static/cashback-express.js?v=20260805-status2' in page.text
     assert f'href="/x/{code}/check"' in page.text
     assert page.headers["cache-control"] == "no-store"
     assert page.headers["referrer-policy"] == "no-referrer"
