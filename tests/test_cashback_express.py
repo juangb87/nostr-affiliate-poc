@@ -371,9 +371,14 @@ def test_cashback_status_capability_expires_and_http_transport_is_rejected(tmp_p
     rejected_status = http_client.post(f"/x/{code}/check", json={"token": token})
     alternate_http = TestClient(main.app, base_url="http://alternate.example")
     alternate_status = alternate_http.post(f"/x/{code}/check", json={"token": token})
+    proxied_https = http_client.get(
+        f"/x/{code}/check", headers={"X-Forwarded-Proto": "https"}, follow_redirects=False
+    )
     assert redirect.status_code == 308
     assert redirect.headers["location"].startswith("https://mrt.st/")
     assert rejected_claim.status_code == rejected_status.status_code == alternate_status.status_code == 400
+    assert proxied_https.status_code == 200
+    assert "data-cashback-status" in proxied_https.text
 
 
 def test_short_host_middleware_does_not_redirect_to_itself(tmp_path, monkeypatch):

@@ -290,10 +290,12 @@ async def redirect_short_link_host(request: Request, call_next: Any) -> Response
     cashback_match = re.fullmatch(r"/x/[A-Za-z0-9_-]+", request.url.path)
     cashback_claim_match = re.fullmatch(r"/x/[A-Za-z0-9_-]+/claim", request.url.path)
     cashback_status_match = re.fullmatch(r"/x/[A-Za-z0-9_-]+/check", request.url.path)
+    forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip().lower()
+    effective_scheme = forwarded_proto if forwarded_proto in {"http", "https"} else request.url.scheme
     if (
         (cashback_match or cashback_claim_match or cashback_status_match)
         and urlparse(SHORT_LINK_BASE_URL).scheme == "https"
-        and request.url.scheme != "https"
+        and effective_scheme != "https"
     ):
         if request.method in {"GET", "HEAD"}:
             short_origin = urlparse(SHORT_LINK_BASE_URL)
