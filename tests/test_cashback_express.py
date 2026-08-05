@@ -129,7 +129,12 @@ def test_public_landing_and_claim_are_private_and_fail_safe(tmp_path, monkeypatc
     campaign = create_cashback(client, merchant).json()
     assert campaign["short_url"].startswith("https://mrt.st/x/")
     code = campaign["code"]
-    page = client.get(f"/x/{code}?lang=en")
+    canonical = client.get(f"/x/{code}?lang=en", follow_redirects=False)
+    assert canonical.status_code == 302
+    assert canonical.headers["location"] == f"https://mrt.st/x/{code}?lang=en"
+    assert canonical.headers["cache-control"] == "no-store"
+    short_client = TestClient(main.app, base_url="https://mrt.st")
+    page = short_client.get(f"/x/{code}?lang=en")
     assert page.status_code == 200
     assert "Cashback café" in page.text and "7.25%" in page.text
     assert "Cashback" in page.text and "reembolso" in page.text
@@ -170,7 +175,7 @@ def test_public_landing_and_claim_are_private_and_fail_safe(tmp_path, monkeypatc
     assert client.post(f"/x/{code}/claim", json={"lightning_address": "not-an-address"}).status_code == 422
     with main.engine().begin() as connection:
         connection.execute(text("UPDATE cashback_campaigns SET status='paused' WHERE short_code=:code"), {"code": code})
-    assert client.get(f"/x/{code}").status_code == 404
+    assert short_client.get(f"/x/{code}").status_code == 404
     assert client.post(f"/x/{code}/claim", json={"lightning_address": "buyer@wallet.example"}).status_code == 404
 
 

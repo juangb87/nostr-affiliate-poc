@@ -276,7 +276,19 @@ def legacy_demo_mutations_enabled() -> bool:
 @app.middleware("http")
 async def redirect_short_link_host(request: Request, call_next: Any) -> Response:
     host = (request.url.hostname or "").lower().rstrip(".")
+    cashback_match = re.fullmatch(r"/x/[A-Za-z0-9_-]+", request.url.path)
     if host != SHORT_LINK_HOST:
+        canonical = urlparse(BASE_URL)
+        canonical_host = (canonical.hostname or "").lower().rstrip(".")
+        if request.method in {"GET", "HEAD"} and cashback_match and host == canonical_host:
+            short_origin = urlparse(SHORT_LINK_BASE_URL)
+            target = request.url.replace(
+                scheme=short_origin.scheme or "https",
+                netloc=short_origin.netloc,
+            )
+            response = RedirectResponse(str(target), status_code=302)
+            response.headers["Cache-Control"] = "no-store"
+            return response
         return await call_next(request)
 
     canonical = urlparse(BASE_URL)
@@ -284,14 +296,8 @@ async def redirect_short_link_host(request: Request, call_next: Any) -> Response
     netloc = canonical.netloc
     canonical_host = (canonical.hostname or "").lower().rstrip(".")
     match = SHORT_REF_PATH_RE.fullmatch(request.url.path)
-    cashback_match = re.fullmatch(r"/x/[A-Za-z0-9_-]+", request.url.path)
     if request.method in {"GET", "HEAD"} and cashback_match:
-        if canonical_host == SHORT_LINK_HOST:
-            return await call_next(request)
-        target = request.url.replace(scheme=scheme, netloc=netloc)
-        response = RedirectResponse(str(target), status_code=302)
-        response.headers["Cache-Control"] = "no-store"
-        return response
+        return await call_next(request)
     if (
         request.method in {"GET", "HEAD"}
         and match
