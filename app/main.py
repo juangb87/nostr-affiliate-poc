@@ -2051,6 +2051,9 @@ class SimulateClickIn(BaseModel):
 class BrowserEventIn(BaseModel):
     type: str = Field("page_view", description="Browser event type, e.g. page_view")
     shop: Optional[str] = None
+    mrt_ref: Optional[str] = None
+    mrt_click_id: Optional[str] = None
+    mrt_campaign: Optional[str] = None
     bb_ref: Optional[str] = None
     bumbei_ref: Optional[str] = None
     affiliate: Optional[str] = None
@@ -2068,6 +2071,9 @@ class BrowserEventIn(BaseModel):
 class BrowserConversionIn(BaseModel):
     type: str = Field("checkout_completed", description="Browser/pixel conversion event type")
     shop: Optional[str] = None
+    mrt_ref: Optional[str] = None
+    mrt_click_id: Optional[str] = None
+    mrt_campaign: Optional[str] = None
     bb_ref: Optional[str] = None
     bumbei_ref: Optional[str] = None
     affiliate: Optional[str] = None
@@ -3133,7 +3139,8 @@ def simulate_click(body: SimulateClickIn) -> dict[str, Any]:
 
 def _tracking_ref(payload: Any) -> str:
     return safe_text(
-        getattr(payload, "bb_ref", None)
+        getattr(payload, "mrt_ref", None)
+        or getattr(payload, "bb_ref", None)
         or getattr(payload, "bumbei_ref", None)
         or getattr(payload, "affiliate", None)
         or getattr(payload, "ref", None),
@@ -3142,7 +3149,12 @@ def _tracking_ref(payload: Any) -> str:
 
 
 def _tracking_click_id(payload: Any) -> str:
-    return safe_text(getattr(payload, "bb_click_id", None) or getattr(payload, "click_id", None), 120)
+    return safe_text(
+        getattr(payload, "mrt_click_id", None)
+        or getattr(payload, "bb_click_id", None)
+        or getattr(payload, "click_id", None),
+        120,
+    )
 
 
 def _request_ip(request: Request) -> str:
@@ -3559,22 +3571,22 @@ def shopify_installation_snippets(base_url: str, shop_domain: str) -> dict[str, 
     return match ? decodeURIComponent(match[1]) : "";
   }
 
-  var ref = param("bb_ref") || param("bumbei_ref") || param("ref") || param("affiliate");
-  var clickId = param("bb_click_id") || param("click_id");
-  var campaignCode = param("bb_campaign");
-  if (ref) { setCookie("bb_ref", ref); setCookie("bumbei_ref", ref); }
-  if (clickId) setCookie("bb_click_id", clickId);
-  if (campaignCode) setCookie("bb_campaign", campaignCode);
+  var ref = param("mrt_ref") || param("ref") || param("affiliate");
+  var clickId = param("mrt_click_id") || param("click_id");
+  var campaignCode = param("mrt_campaign");
+  if (ref) setCookie("mrt_ref", ref);
+  if (clickId) setCookie("mrt_click_id", clickId);
+  if (campaignCode) setCookie("mrt_campaign", campaignCode);
 
-  ref = ref || getCookie("bb_ref") || getCookie("bumbei_ref");
-  clickId = clickId || getCookie("bb_click_id");
-  campaignCode = campaignCode || getCookie("bb_campaign");
+  ref = ref || getCookie("mrt_ref");
+  clickId = clickId || getCookie("mrt_click_id");
+  campaignCode = campaignCode || getCookie("mrt_campaign");
   if (!ref && !clickId && !campaignCode) return;
 
   fetch("/cart/update.js", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ attributes: { bb_ref: ref || "", bb_click_id: clickId || "", bb_campaign: campaignCode || "" } })
+    body: JSON.stringify({ attributes: { mrt_ref: ref || "", mrt_click_id: clickId || "", mrt_campaign: campaignCode || "" } })
   }).catch(function () {});
 
   // Cashback Express relies on cart attributes plus the signed orders/paid webhook.
@@ -3588,9 +3600,9 @@ def shopify_installation_snippets(base_url: str, shop_domain: str) -> dict[str, 
     body: JSON.stringify({
       type: "page_view",
       shop: __SHOP_LITERAL__,
-      bb_ref: ref || null,
-      bb_click_id: clickId || null,
-      bb_campaign: campaignCode || null,
+      mrt_ref: ref || null,
+      mrt_click_id: clickId || null,
+      mrt_campaign: campaignCode || null,
       path: window.location.pathname,
       ts: new Date().toISOString()
     })
@@ -3607,9 +3619,9 @@ def shopify_installation_snippets(base_url: str, shop_domain: str) -> dict[str, 
     return null;
   }
 
-  const ref = await cookie(["bb_ref", "bumbei_ref"]);
-  const clickId = await cookie(["bb_click_id", "click_id"]);
-  const campaignCode = await cookie(["bb_campaign"]);
+  const ref = await cookie(["mrt_ref"]);
+  const clickId = await cookie(["mrt_click_id", "click_id"]);
+  const campaignCode = await cookie(["mrt_campaign"]);
   if (!ref && !clickId && !campaignCode) return;
   // Cashback Express is accounted from the signed orders/paid webhook only.
   if (campaignCode) return;
@@ -3620,9 +3632,9 @@ def shopify_installation_snippets(base_url: str, shop_domain: str) -> dict[str, 
     body: JSON.stringify({
       type: "checkout_completed",
       shop: __SHOP_LITERAL__,
-      bb_ref: ref,
-      bb_click_id: clickId,
-      bb_campaign: campaignCode,
+      mrt_ref: ref,
+      mrt_click_id: clickId,
+      mrt_campaign: campaignCode,
       order_id: checkout.order && checkout.order.id ? String(checkout.order.id) : null,
       total_price: checkout.totalPrice && checkout.totalPrice.amount ? checkout.totalPrice.amount : null,
       currency: checkout.currencyCode || null,
@@ -3797,7 +3809,7 @@ def _process_cashback_reward_locked(
             raise HTTPException(403, "cashback campaign belongs to another merchant")
         if row["status"] != "active" or row.get("archived_at"):
             raise HTTPException(409, "cashback campaign is inactive")
-        if campaign_code != row["short_code"]:
+        if campaign_code and campaign_code != row["short_code"]:
             raise HTTPException(409, "cashback campaign attribution mismatch")
         if parse_iso(row["expires_at"]) <= datetime.now(timezone.utc):
             raise HTTPException(409, "cashback claim expired")
@@ -3969,8 +3981,10 @@ async def shopify_orders_paid_webhook(request: Request, background_tasks: Backgr
 
     record_shopify_webhook_receipt(webhook_id, shop, topic, "received")
     attributes = shopify_note_attributes(payload)
-    click_id = attributes.get("bb_click_id") or attributes.get("click_id")
-    attribution_code = attributes.get("bb_campaign")
+    # Meerat keys are canonical. Legacy keys remain read-only aliases so carts
+    # created by the previous Shopify script can finish without losing cashback.
+    click_id = attributes.get("mrt_click_id") or attributes.get("bb_click_id") or attributes.get("click_id")
+    attribution_code = attributes.get("mrt_campaign") or attributes.get("bb_campaign")
     if not click_id:
         record_shopify_webhook_receipt(webhook_id, shop, topic, "ignored", "missing affiliate attribution")
         return {
@@ -6185,7 +6199,7 @@ def cashback_express_claim(
             "status_access_expires_at": status_access_expires.isoformat(),
             "created": created.isoformat(), "expires": expires.isoformat(),
         })
-    location = add_query_params(campaign["destination_url"], {"bb_click_id": claim_id, "bb_campaign": code})
+    location = add_query_params(campaign["destination_url"], {"mrt_click_id": claim_id, "mrt_campaign": code})
     location = urlunparse(urlparse(location)._replace(fragment=""))
     privacy_headers = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"}
     if response == "json":

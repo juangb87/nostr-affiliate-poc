@@ -163,7 +163,7 @@ def test_public_landing_and_claim_are_private_and_fail_safe(tmp_path, monkeypatc
     assert "location" not in font.headers
     assert unrelated_asset.status_code == 308
     assert unrelated_asset.headers["location"] == "https://testserver/static/app.js"
-    assert "bb_click_id" not in page.text
+    assert "mrt_click_id" not in page.text
 
     skipped = short_client.get(f"/x/{code}/continue", follow_redirects=False)
     assert skipped.status_code == 302
@@ -193,11 +193,11 @@ def test_public_landing_and_claim_are_private_and_fail_safe(tmp_path, monkeypatc
     assert observed == []  # Public claims perform no LNURL network request.
     assert address.lower() not in claim.headers["location"]
     query = parse_qs(urlparse(claim.headers["location"]).query)
-    assert set(query) == {"utm", "bb_click_id", "bb_campaign"}
+    assert set(query) == {"utm", "mrt_click_id", "mrt_campaign"}
     assert query["utm"] == ["keep"]
     assert urlparse(claim.headers["location"]).fragment == ""
-    assert query["bb_click_id"][0].startswith("clk_")
-    assert query["bb_campaign"] == [code]
+    assert query["mrt_click_id"][0].startswith("clk_")
+    assert query["mrt_campaign"] == [code]
     with main.engine().connect() as connection:
         row = connection.execute(
             text("SELECT * FROM cashback_claims WHERE lightning_address=:address"),
@@ -220,7 +220,7 @@ def test_public_landing_and_claim_are_private_and_fail_safe(tmp_path, monkeypatc
     redirect_url = json_claim.json()["redirect_url"]
     assert urlparse(redirect_url).hostname == "merchant.example"
     assert "second@wallet.example" not in redirect_url
-    assert parse_qs(urlparse(redirect_url).query)["bb_campaign"] == [code]
+    assert parse_qs(urlparse(redirect_url).query)["mrt_campaign"] == [code]
     assert status_token not in redirect_url
     with main.engine().connect() as connection:
         persisted = connection.execute(
@@ -287,7 +287,7 @@ def test_private_cashback_status_lifecycle_uses_capability_token_not_address(tmp
     other = create_cashback(client, merchant, name="Other cashback").json()
     assert short_client.post(f"/x/{other['code']}/check", json={"token": token}).status_code == 404
 
-    claim_id = parse_qs(urlparse(claim.json()["redirect_url"]).query)["bb_click_id"][0]
+    claim_id = parse_qs(urlparse(claim.json()["redirect_url"]).query)["mrt_click_id"][0]
     reward = main.process_cashback_reward(
         order_key="status-order", claim_id=claim_id, campaign_code=code,
         order_total=Decimal("1000"), currency="SATS",
@@ -336,7 +336,7 @@ def test_cashback_status_expiry_and_short_host_routing(tmp_path, monkeypatch):
         f"/x/{code}/claim?response=json", json={"lightning_address": "expired@wallet.example"}
     )
     token = claim.json()["status_token"]
-    claim_id = parse_qs(urlparse(claim.json()["redirect_url"]).query)["bb_click_id"][0]
+    claim_id = parse_qs(urlparse(claim.json()["redirect_url"]).query)["mrt_click_id"][0]
     with main.engine().begin() as connection:
         connection.execute(
             text("UPDATE cashback_claims SET expires_at=:expired WHERE id=:id"),
@@ -459,9 +459,9 @@ def test_shopify_cashback_reward_is_idempotent_conflict_safe_and_tenant_scoped(t
     campaign = create_cashback(client, merchant, cashback_percent="10").json()
     monkeypatch.setattr(main, "validate_lightning_address", lambda address: {"callback": "ok"})
     claimed = client.post(f"/x/{campaign['code']}/claim", json={"lightning_address": "buyer@wallet.example"}, follow_redirects=False)
-    click_id = parse_qs(urlparse(claimed.headers["location"]).query)["bb_click_id"][0]
+    click_id = parse_qs(urlparse(claimed.headers["location"]).query)["mrt_click_id"][0]
     payload = {"id": 101, "financial_status": "paid", "total_price": "1.00", "currency": "USD", "note_attributes": [
-        {"name": "bb_click_id", "value": click_id}, {"name": "bb_campaign", "value": campaign["code"]}
+        {"name": "mrt_click_id", "value": click_id}, {"name": "mrt_campaign", "value": campaign["code"]}
     ]}
     raw = json.dumps(payload, separators=(",", ":")).encode()
     first = client.post("/shopify/webhooks/orders-paid", content=raw, headers=signed_headers(raw))
@@ -491,6 +491,60 @@ def test_shopify_cashback_reward_is_idempotent_conflict_safe_and_tenant_scoped(t
     assert "buyer@wallet.example" not in page.text
 
 
+def test_shopify_cashback_accepts_legacy_click_only_but_rejects_explicit_wrong_campaign(tmp_path, monkeypatch):
+    merchant = Keys.generate()
+    client = client_for(tmp_path, monkeypatch, merchant)
+    login(client, merchant)
+    campaign = create_cashback(client, merchant, cashback_percent="10").json()
+
+    legacy_claim = _claim_id(client, campaign["code"], "legacy@wallet.example")
+    legacy_payload = {
+        "id": 103,
+        "total_price": "1.00",
+        "currency": "USD",
+        "note_attributes": [{"name": "bb_click_id", "value": legacy_claim}],
+    }
+    legacy_raw = json.dumps(legacy_payload, separators=(",", ":")).encode()
+    accepted = client.post(
+        "/shopify/webhooks/orders-paid",
+        content=legacy_raw,
+        headers=signed_headers(legacy_raw, "legacy-cashback-wh"),
+    )
+    assert accepted.status_code == 200
+    with main.engine().connect() as connection:
+        legacy_delivery = connection.execute(
+            text("SELECT status, reward_id FROM shopify_webhook_deliveries WHERE webhook_id='legacy-cashback-wh'")
+        ).mappings().one()
+        assert legacy_delivery["status"] == "processed"
+        assert legacy_delivery["reward_id"]
+
+    wrong_claim = _claim_id(client, campaign["code"], "wrong@wallet.example")
+    wrong_payload = {
+        "id": 104,
+        "total_price": "1.00",
+        "currency": "USD",
+        "note_attributes": [
+            {"name": "mrt_click_id", "value": wrong_claim},
+            {"name": "mrt_campaign", "value": "wrong-campaign"},
+        ],
+    }
+    wrong_raw = json.dumps(wrong_payload, separators=(",", ":")).encode()
+    rejected = client.post(
+        "/shopify/webhooks/orders-paid",
+        content=wrong_raw,
+        headers=signed_headers(wrong_raw, "wrong-cashback-wh"),
+    )
+    assert rejected.status_code == 200
+    with main.engine().connect() as connection:
+        failed_delivery = connection.execute(
+            text("SELECT status, error FROM shopify_webhook_deliveries WHERE webhook_id='wrong-cashback-wh'")
+        ).mappings().one()
+        assert failed_delivery["status"] == "failed"
+        assert "attribution mismatch" in failed_delivery["error"]
+        assert connection.execute(
+            text("SELECT COUNT(*) FROM cashback_rewards WHERE claim_id=:claim"), {"claim": wrong_claim}
+        ).scalar_one() == 0
+
 def test_expired_claim_never_creates_reward_and_snippets_carry_no_address(tmp_path, monkeypatch):
     merchant = Keys.generate()
     client = client_for(tmp_path, monkeypatch, merchant)
@@ -498,22 +552,27 @@ def test_expired_claim_never_creates_reward_and_snippets_carry_no_address(tmp_pa
     campaign = create_cashback(client, merchant).json()
     monkeypatch.setattr(main, "validate_lightning_address", lambda address: {"callback": "ok"})
     claimed = client.post(f"/x/{campaign['code']}/claim", json={"lightning_address": "buyer@wallet.example"}, follow_redirects=False)
-    click_id = parse_qs(urlparse(claimed.headers["location"]).query)["bb_click_id"][0]
+    click_id = parse_qs(urlparse(claimed.headers["location"]).query)["mrt_click_id"][0]
     with main.engine().begin() as connection:
         connection.execute(text("UPDATE cashback_claims SET expires_at=:expired WHERE id=:id"), {
             "expired": (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(), "id": click_id
         })
-    payload = {"id": 102, "total_price": "1.00", "currency": "USD", "note_attributes": [{"name": "bb_click_id", "value": click_id}, {"name": "bb_campaign", "value": campaign["code"]}]}
+    payload = {"id": 102, "total_price": "1.00", "currency": "USD", "note_attributes": [{"name": "mrt_click_id", "value": click_id}, {"name": "mrt_campaign", "value": campaign["code"]}]}
     raw = json.dumps(payload, separators=(",", ":")).encode()
     response = client.post("/shopify/webhooks/orders-paid", content=raw, headers=signed_headers(raw))
     assert response.status_code == 200
     with main.engine().connect() as connection:
         assert connection.execute(text("SELECT COUNT(*) FROM cashback_rewards")).scalar_one() == 0
     snippets = main.shopify_installation_snippets("https://testserver", "cashback.myshopify.com")
-    assert "bb_campaign" in snippets["theme_script"] and "bb_campaign" in snippets["custom_pixel"]
+    install_code = snippets["theme_script"] + snippets["custom_pixel"]
+    assert "mrt_ref" in install_code
+    assert "mrt_click_id" in install_code
+    assert "mrt_campaign" in snippets["theme_script"] and "mrt_campaign" in snippets["custom_pixel"]
     assert "if (campaignCode) return;" in snippets["theme_script"]
     assert "if (campaignCode) return;" in snippets["custom_pixel"]
-    assert "lightning_address" not in snippets["theme_script"] + snippets["custom_pixel"]
+    assert "bb_" not in install_code.lower()
+    assert "bumbei" not in install_code.lower()
+    assert "lightning_address" not in install_code
     with main.engine().connect() as connection:
         indexes = connection.execute(text("PRAGMA index_list(cashback_rewards)")).mappings().all()
         assert any(row["name"] == "uq_cashback_rewards_order_key" and row["unique"] for row in indexes)
@@ -522,7 +581,7 @@ def test_expired_claim_never_creates_reward_and_snippets_carry_no_address(tmp_pa
 def _claim_id(client: TestClient, code: str, address: str = "buyer@wallet.example") -> str:
     response = client.post(f"/x/{code}/claim", json={"lightning_address": address}, follow_redirects=False)
     assert response.status_code == 303, response.text
-    return parse_qs(urlparse(response.headers["location"]).query)["bb_click_id"][0]
+    return parse_qs(urlparse(response.headers["location"]).query)["mrt_click_id"][0]
 
 
 def test_single_store_configuration_is_required_and_enforced(tmp_path, monkeypatch):
@@ -657,7 +716,7 @@ def test_stale_processing_delivery_is_requeued_without_duplicate_reward(tmp_path
     campaign = create_cashback(client, merchant, cashback_percent="10").json()
     claim = _claim_id(client, campaign["code"])
     payload = {"id": 901, "total_price": "1.00", "currency": "USD", "note_attributes": [
-        {"name": "bb_click_id", "value": claim}, {"name": "bb_campaign", "value": campaign["code"]}
+        {"name": "mrt_click_id", "value": claim}, {"name": "mrt_campaign", "value": campaign["code"]}
     ]}
     raw = json.dumps(payload, separators=(",", ":")).encode()
     assert client.post("/shopify/webhooks/orders-paid", content=raw, headers=signed_headers(raw, "stale-1")).status_code == 200
