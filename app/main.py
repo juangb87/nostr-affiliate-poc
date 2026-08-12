@@ -15,6 +15,7 @@ import secrets
 import threading
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
@@ -118,6 +119,134 @@ _INVOICE_PREPARE_LOCK = threading.Lock()
 _INVOICE_PREPARE_LAST: dict[str, float] = {}
 _INVOICE_PREPARE_ACTIVE: set[str] = set()
 CAMPAIGN_ENROLLMENT_MODES = {"private", "approval", "open"}
+
+
+@dataclass(frozen=True)
+class ShopifyStoreConfig:
+    """Tenant routing for one permanent Shopify store domain."""
+
+    shop_domain: str
+    merchant_pubkey: str
+    merchant_pubkey_hex: str
+    webhook_secret: str
+    label: str
+
+
+SHOPIFY_STORE_DOMAIN_RE = re.compile(r"^[a-z0-9][a-z0-9-]*\.myshopify\.com$")
+SHOPIFY_SECRET_ENV_RE = re.compile(r"^SHOPIFY_WEBHOOK_SECRET_[A-Z0-9_]+$")
+
+
+def _normalize_shopify_store_domain(value: str, *, strict: bool = False) -> str:
+    raw = str(value or "").strip().lower().rstrip("/")
+    if not strict and "://" in raw:
+        raw = raw.split("://", 1)[1]
+    if not SHOPIFY_STORE_DOMAIN_RE.fullmatch(raw):
+        raise ValueError("Shopify store domain must be a permanent *.myshopify.com domain")
+    return raw
+
+
+def _shopify_store_config(
+    shop_domain: str, merchant_pubkey: str, webhook_secret: str, label: str
+) -> ShopifyStoreConfig:
+    try:
+        domain = _normalize_shopify_store_domain(shop_domain, strict=True)
+        public_key = PublicKey.parse(str(merchant_pubkey).strip())
+    except Exception as exc:
+        raise RuntimeError("invalid Shopify multi-store configuration") from exc
+    normalized_label = " ".join(str(label or domain).split())[:120] or domain
+    return ShopifyStoreConfig(
+        shop_domain=domain,
+        merchant_pubkey=public_key.to_bech32(),
+        merchant_pubkey_hex=public_key.to_hex(),
+        webhook_secret=webhook_secret,
+        label=normalized_label,
+    )
+
+
+def shopify_store_configs() -> dict[str, ShopifyStoreConfig]:
+    """Load domain-keyed stores and merge the legacy single-store configuration."""
+    stores: dict[str, ShopifyStoreConfig] = {}
+    raw_multi = os.getenv("SHOPIFY_STORES_JSON", "").strip()
+    if raw_multi:
+        def reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            result: dict[str, Any] = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate JSON key")
+                result[key] = value
+            return result
+
+        try:
+            parsed = json.loads(raw_multi, object_pairs_hook=reject_duplicate_json_keys)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("SHOPIFY_STORES_JSON must be valid JSON") from exc
+        if not isinstance(parsed, dict):
+            raise RuntimeError("SHOPIFY_STORES_JSON must be a domain-keyed object")
+        for domain, entry in parsed.items():
+            if not isinstance(entry, dict):
+                raise RuntimeError("each Shopify store configuration must be an object")
+            secret_env = " ".join(str(entry.get("webhook_secret_env") or "").split())[:160]
+            if secret_env and not SHOPIFY_SECRET_ENV_RE.fullmatch(secret_env):
+                raise RuntimeError("invalid Shopify webhook secret environment reference")
+            config = _shopify_store_config(
+                str(domain),
+                str(entry.get("merchant_pubkey") or ""),
+                os.getenv(secret_env, "") if secret_env else "",
+                str(entry.get("label") or domain),
+            )
+            if config.shop_domain in stores:
+                raise RuntimeError("duplicate normalized Shopify store domain")
+            stores[config.shop_domain] = config
+
+    legacy_domain = os.getenv("SHOPIFY_STORE_DOMAIN", "").strip()
+    legacy_merchant = os.getenv("SHOPIFY_MERCHANT_PUBKEY", "").strip()
+    if legacy_domain and legacy_merchant:
+        try:
+            normalized_legacy_domain = _normalize_shopify_store_domain(legacy_domain)
+            legacy = _shopify_store_config(
+                normalized_legacy_domain,
+                legacy_merchant,
+                os.getenv("SHOPIFY_WEBHOOK_SECRET") or os.getenv("SHOPIFY_SECRET", ""),
+                os.getenv("SHOPIFY_STORE_LABEL", normalized_legacy_domain),
+            )
+        except (ValueError, RuntimeError) as exc:
+            raise RuntimeError("invalid legacy Shopify store configuration") from exc
+        existing = stores.get(legacy.shop_domain)
+        if existing and (
+            existing.merchant_pubkey_hex != legacy.merchant_pubkey_hex
+            or (
+                existing.webhook_secret
+                and legacy.webhook_secret
+                and existing.webhook_secret != legacy.webhook_secret
+            )
+        ):
+            raise RuntimeError("conflicting legacy and multi-store Shopify configuration")
+        if existing and not existing.webhook_secret and legacy.webhook_secret:
+            stores[legacy.shop_domain] = ShopifyStoreConfig(
+                shop_domain=existing.shop_domain,
+                merchant_pubkey=existing.merchant_pubkey,
+                merchant_pubkey_hex=existing.merchant_pubkey_hex,
+                webhook_secret=legacy.webhook_secret,
+                label=existing.label,
+            )
+        elif not existing:
+            stores[legacy.shop_domain] = legacy
+    return stores
+
+
+def configured_shopify_merchant_pubkeys_hex() -> set[str]:
+    merchants = {store.merchant_pubkey_hex for store in shopify_store_configs().values()}
+    if not merchants:
+        raise HTTPException(503, "Shopify merchant identities are not configured")
+    return merchants
+
+
+def shopify_store_for_domain(shop_domain: str) -> ShopifyStoreConfig | None:
+    try:
+        domain = _normalize_shopify_store_domain(shop_domain, strict=True)
+    except ValueError:
+        return None
+    return shopify_store_configs().get(domain)
 
 app = FastAPI(
     title="Nostr Affiliate POC",
@@ -244,10 +373,7 @@ def tracking_cors_origins() -> list[str]:
         "https://shapersfit.com,https://www.shapersfit.com,https://shapersfit.myshopify.com",
     )
     origins = [origin.strip() for origin in raw.split(",") if origin.strip()]
-    shop = os.getenv("SHOPIFY_STORE_DOMAIN", "").strip().lower().rstrip("/")
-    if "://" in shop:
-        shop = shop.split("://", 1)[1]
-    if re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,252}", shop):
+    for shop in shopify_store_configs():
         shop_origin = f"https://{shop}"
         if shop_origin not in origins:
             origins.append(shop_origin)
@@ -1126,6 +1252,7 @@ def _init_db_unlocked() -> None:
         webhook_id TEXT PRIMARY KEY,
         order_key TEXT UNIQUE NOT NULL,
         shop_domain TEXT NOT NULL,
+        merchant_pubkey_hex TEXT,
         topic TEXT NOT NULL,
         click_id TEXT NOT NULL,
         order_total REAL NOT NULL,
@@ -1449,6 +1576,7 @@ def _init_db_unlocked() -> None:
             c.execute(text("ALTER TABLE shopify_webhook_deliveries ADD COLUMN IF NOT EXISTS reward_id TEXT"))
             c.execute(text("ALTER TABLE shopify_webhook_deliveries ADD COLUMN IF NOT EXISTS attribution_code TEXT"))
             c.execute(text("ALTER TABLE shopify_webhook_deliveries ADD COLUMN IF NOT EXISTS processing_started_at TEXT"))
+            c.execute(text("ALTER TABLE shopify_webhook_deliveries ADD COLUMN IF NOT EXISTS merchant_pubkey_hex TEXT"))
             c.execute(text("ALTER TABLE conversions ADD COLUMN IF NOT EXISTS order_total_sats INTEGER"))
             c.execute(text("ALTER TABLE conversions ADD COLUMN IF NOT EXISTS btc_usd_rate TEXT"))
             c.execute(text("ALTER TABLE conversions ADD COLUMN IF NOT EXISTS sats_per_usd TEXT"))
@@ -1551,6 +1679,8 @@ def _init_db_unlocked() -> None:
                 c.execute(text("ALTER TABLE shopify_webhook_deliveries ADD COLUMN attribution_code TEXT"))
             if "processing_started_at" not in shopify_delivery_cols:
                 c.execute(text("ALTER TABLE shopify_webhook_deliveries ADD COLUMN processing_started_at TEXT"))
+            if "merchant_pubkey_hex" not in shopify_delivery_cols:
+                c.execute(text("ALTER TABLE shopify_webhook_deliveries ADD COLUMN merchant_pubkey_hex TEXT"))
             payout_column_ddl = {
                 "bolt11_invoice": "TEXT",
                 "payment_provider": "TEXT",
@@ -1581,6 +1711,17 @@ def _init_db_unlocked() -> None:
                 c.execute(text("ALTER TABLE enrollments ADD COLUMN status TEXT NOT NULL DEFAULT 'approved'"))
             if "client_hash" not in challenge_cols:
                 c.execute(text("ALTER TABLE auth_challenges ADD COLUMN client_hash TEXT"))
+        for store in shopify_store_configs().values():
+            c.execute(
+                text(
+                    """
+                    UPDATE shopify_webhook_deliveries
+                    SET merchant_pubkey_hex=:merchant
+                    WHERE merchant_pubkey_hex IS NULL AND shop_domain=:shop
+                    """
+                ),
+                {"merchant": store.merchant_pubkey_hex, "shop": store.shop_domain},
+            )
         c.execute(text("UPDATE nostr_events SET updated_at=created_at WHERE updated_at IS NULL"))
         legacy_campaigns = c.execute(
             text(
@@ -3692,8 +3833,10 @@ def shopify_installation_snippets(base_url: str, shop_domain: str) -> dict[str, 
     }
 
 
-def verify_shopify_webhook(raw_body: bytes, signature: str) -> None:
-    secret = shopify_webhook_secret()
+def verify_shopify_webhook(
+    raw_body: bytes, signature: str, store: ShopifyStoreConfig
+) -> None:
+    secret = store.webhook_secret
     if not secret:
         raise HTTPException(503, "Shopify webhook secret is not configured")
     expected = base64.b64encode(hmac.new(secret.encode(), raw_body, hashlib.sha256).digest()).decode()
@@ -3750,7 +3893,8 @@ def record_shopify_webhook_receipt(
 
 def enqueue_shopify_paid_order(
     *, webhook_id: str, order_key: str, shop: str, topic: str, click_id: str,
-    order_total: Decimal, currency: str, attribution_code: str | None = None
+    order_total: Decimal, currency: str, merchant_pubkey_hex: str,
+    attribution_code: str | None = None
 ) -> tuple[dict[str, Any], bool, bool]:
     """Persist a minimal webhook inbox row and atomically claim a new Shopify order."""
     init_db()
@@ -3760,9 +3904,9 @@ def enqueue_shopify_paid_order(
             text(
                 """
                 INSERT INTO shopify_webhook_deliveries
-                (webhook_id, order_key, shop_domain, topic, click_id, order_total, order_total_decimal, currency,
+                (webhook_id, order_key, shop_domain, merchant_pubkey_hex, topic, click_id, order_total, order_total_decimal, currency,
                  status, conversion_id, reward_id, attribution_code, error, created_at, processing_started_at, processed_at)
-                VALUES (:webhook_id, :order_key, :shop_domain, :topic, :click_id, :order_total, :order_total_decimal,
+                VALUES (:webhook_id, :order_key, :shop_domain, :merchant_pubkey_hex, :topic, :click_id, :order_total, :order_total_decimal,
                         :currency, 'pending', NULL, NULL, :attribution_code, NULL, :created_at, NULL, NULL)
                 ON CONFLICT(order_key) DO NOTHING
                 """
@@ -3771,6 +3915,7 @@ def enqueue_shopify_paid_order(
                 "webhook_id": webhook_id,
                 "order_key": order_key,
                 "shop_domain": shop,
+                "merchant_pubkey_hex": merchant_pubkey_hex,
                 "topic": topic,
                 "click_id": click_id,
                 "order_total": float(order_total),
@@ -3788,6 +3933,7 @@ def enqueue_shopify_paid_order(
                 or Decimal(row.get("order_total_decimal") or str(row["order_total"])) != order_total
                 or row["currency"] != currency
                 or row["shop_domain"] != shop
+                or row.get("merchant_pubkey_hex") != merchant_pubkey_hex
                 or (row.get("attribution_code") or None) != (attribution_code or None)
             )
         )
@@ -3934,6 +4080,14 @@ def process_shopify_delivery(order_key: str) -> None:
         return
 
     try:
+        current_store = shopify_store_for_domain(row["shop_domain"])
+        authorized_merchant_hex = row.get("merchant_pubkey_hex")
+        if (
+            not current_store
+            or not authorized_merchant_hex
+            or current_store.merchant_pubkey_hex != authorized_merchant_hex
+        ):
+            raise RuntimeError("Shopify store tenant mapping changed or is unavailable")
         with engine().connect() as connection:
             cashback_claim = bool(connection.execute(
                 text("SELECT 1 FROM cashback_claims WHERE id=:id"), {"id": row["click_id"]}
@@ -3945,7 +4099,7 @@ def process_shopify_delivery(order_key: str) -> None:
                 campaign_code=row.get("attribution_code"),
                 order_total=Decimal(row.get("order_total_decimal") or str(row["order_total"])),
                 currency=row["currency"],
-                authorized_merchant_hex=configured_merchant_pubkey_hex(),
+                authorized_merchant_hex=authorized_merchant_hex,
             )
             result_id = result["id"]
             result_column = "reward_id"
@@ -3958,7 +4112,7 @@ def process_shopify_delivery(order_key: str) -> None:
                     currency=row["currency"],
                     metadata={"platform": "shopify", "shop": row["shop_domain"], "topic": row["topic"]},
                 ),
-                configured_merchant_pubkey_hex(),
+                authorized_merchant_hex,
             )
             result_id = result["conversion_id"]
             result_column = "conversion_id"
@@ -3993,6 +4147,13 @@ def process_shopify_delivery(order_key: str) -> None:
 @app.post("/shopify/webhooks/orders-paid", tags=["Shopify"])
 async def shopify_orders_paid_webhook(request: Request, background_tasks: BackgroundTasks) -> dict[str, Any]:
     """Authenticate and enqueue Shopify's orders/paid webhook for authoritative processing."""
+    topic = request.headers.get("x-shopify-topic", "").strip().lower()
+    shop = request.headers.get("x-shopify-shop-domain", "").strip().lower()
+    webhook_id = request.headers.get("x-shopify-webhook-id", "").strip()
+    store = shopify_store_for_domain(shop)
+    if not store:
+        raise HTTPException(401, "invalid Shopify webhook authentication")
+
     max_body_bytes = 5 * 1024 * 1024
     content_length = request.headers.get("content-length")
     if content_length:
@@ -4004,21 +4165,13 @@ async def shopify_orders_paid_webhook(request: Request, background_tasks: Backgr
     raw_body = await request.body()
     if len(raw_body) > max_body_bytes:
         raise HTTPException(413, "Shopify webhook body is too large")
-    verify_shopify_webhook(raw_body, request.headers.get("x-shopify-hmac-sha256", ""))
-
-    topic = request.headers.get("x-shopify-topic", "").strip().lower()
-    shop = request.headers.get("x-shopify-shop-domain", "").strip().lower()
-    webhook_id = request.headers.get("x-shopify-webhook-id", "").strip()
+    verify_shopify_webhook(
+        raw_body, request.headers.get("x-shopify-hmac-sha256", ""), store
+    )
     if topic != "orders/paid":
         raise HTTPException(400, "unexpected Shopify webhook topic")
     if not webhook_id:
         raise HTTPException(400, "missing Shopify webhook id")
-
-    configured_shop = normalized_shopify_store_domain()
-    if not configured_shop:
-        raise HTTPException(503, "Shopify store domain is not configured")
-    if shop != configured_shop:
-        raise HTTPException(403, "unexpected Shopify store domain")
 
     try:
         payload = json.loads(raw_body)
@@ -4069,6 +4222,7 @@ async def shopify_orders_paid_webhook(request: Request, background_tasks: Backgr
         click_id=click_id,
         order_total=order_total,
         currency=currency,
+        merchant_pubkey_hex=store.merchant_pubkey_hex,
         attribution_code=attribution_code,
     )
     if conflict:
@@ -4107,43 +4261,58 @@ async def shopify_orders_paid_webhook(request: Request, background_tasks: Backgr
     }
 
 
-@app.get("/shopify/webhooks/status", tags=["Shopify"])
-def shopify_webhook_status() -> dict[str, Any]:
-    """Expose safe webhook readiness and aggregate inbox state without credentials or order data."""
+def _shopify_webhook_status_for_store(
+    store: ShopifyStoreConfig | None = None,
+) -> dict[str, Any]:
+    """Return aggregate or one-store readiness without exposing secret values."""
     init_db()
+    params = {"shop": store.shop_domain} if store else {}
+    where = " WHERE shop_domain=:shop" if store else ""
     with engine().connect() as c:
         counts = {
             row._mapping["status"]: row._mapping["count"]
             for row in c.execute(
-                text("SELECT status, COUNT(*) AS count FROM shopify_webhook_deliveries GROUP BY status")
+                text(f"SELECT status, COUNT(*) AS count FROM shopify_webhook_deliveries{where} GROUP BY status"),
+                params,
             ).fetchall()
         }
         receipt_counts = {
             row._mapping["status"]: row._mapping["count"]
             for row in c.execute(
-                text("SELECT status, COUNT(*) AS count FROM shopify_webhook_receipts GROUP BY status")
+                text(f"SELECT status, COUNT(*) AS count FROM shopify_webhook_receipts{where} GROUP BY status"),
+                params,
             ).fetchall()
         }
         latest_row = c.execute(
             text(
-                """
+                f"""
                 SELECT webhook_id, topic, status, reason, created_at, updated_at
-                FROM shopify_webhook_receipts
+                FROM shopify_webhook_receipts{where}
                 ORDER BY updated_at DESC LIMIT 1
                 """
-            )
+            ),
+            params,
         ).fetchone()
         latest_receipt = asdict(latest_row) if latest_row else None
+    stores = shopify_store_configs()
     return {
         "ok": True,
-        "secret_configured": bool(shopify_webhook_secret()),
-        "store_configured": bool(normalized_shopify_store_domain()),
+        "secret_configured": bool(store.webhook_secret) if store else any(
+            configured.webhook_secret for configured in stores.values()
+        ),
+        "store_configured": bool(store) if store else bool(stores),
         "topic": "orders/paid",
         "callback_url": f"{BASE_URL}/shopify/webhooks/orders-paid",
         "deliveries": counts,
         "receipts": receipt_counts,
         "latest_receipt": latest_receipt,
     }
+
+
+@app.get("/shopify/webhooks/status", tags=["Shopify"])
+def shopify_webhook_status() -> dict[str, Any]:
+    """Expose safe aggregate webhook readiness without credentials or order data."""
+    return _shopify_webhook_status_for_store()
 
 
 @app.get("/affiliates/{affiliate_pubkey}")
@@ -6004,17 +6173,22 @@ def merchant_account_page(request: Request, view: str = "overview") -> Response:
     valid_views = {"overview", "campaigns", "cashback", "affiliates", "activity", "payouts", "integration", "settings"}
     if view not in valid_views:
         raise HTTPException(404, "No se encontró la vista solicitada del espacio del comerciante.")
-    configured_shopify_merchant = os.getenv("SHOPIFY_MERCHANT_PUBKEY", DEFAULT_MERCHANT_NPUB)
-    try:
-        shopify_merchant_hex = normalize_pubkey(configured_shopify_merchant, "SHOPIFY_MERCHANT_PUBKEY")["hex"]
-    except HTTPException:
-        shopify_merchant_hex = ""
     with engine().connect() as c:
-        owns_shopify_store = session["nostr_pubkey_hex"] == shopify_merchant_hex or bool(
-            c.execute(
-                text("SELECT 1 FROM merchant_account_links WHERE account_id=:account_id AND merchant_pubkey_hex=:hex LIMIT 1"),
-                {"account_id": session["account_id"], "hex": shopify_merchant_hex},
-            ).fetchone()
+        owned_merchant_hexes = {session["nostr_pubkey_hex"]}
+        owned_merchant_hexes.update(
+            row._mapping["merchant_pubkey_hex"]
+            for row in c.execute(
+                text("SELECT merchant_pubkey_hex FROM merchant_account_links WHERE account_id=:account_id"),
+                {"account_id": session["account_id"]},
+            ).fetchall()
+        )
+        authorized_shopify_stores = sorted(
+            (
+                store
+                for store in shopify_store_configs().values()
+                if store.merchant_pubkey_hex in owned_merchant_hexes
+            ),
+            key=lambda store: store.shop_domain,
         )
         bootstrap_rows = c.execute(
             text(
@@ -6034,7 +6208,12 @@ def merchant_account_page(request: Request, view: str = "overview") -> Response:
         }
         for row in bootstrap_rows
     ]
-    webhook = shopify_webhook_status() if owns_shopify_store else {"secret_configured": False, "store_configured": False, "receipts": {}}
+    selected_shopify_store = authorized_shopify_stores[0] if authorized_shopify_stores else None
+    webhook = (
+        _shopify_webhook_status_for_store(selected_shopify_store)
+        if selected_shopify_store
+        else {"secret_configured": False, "store_configured": False, "receipts": {}}
+    )
     configured = bool(webhook.get("secret_configured") and webhook.get("store_configured"))
     processed = int(webhook.get("receipts", {}).get("processed", 0))
     shopify_ready = configured and processed > 0
@@ -6085,8 +6264,8 @@ def merchant_account_page(request: Request, view: str = "overview") -> Response:
             **data,
             "bootstrap_tenants": bootstrap_tenants,
             "shopify_installation": shopify_installation_snippets(
-                BASE_URL, normalized_shopify_store_domain()
-            ) if owns_shopify_store else None,
+                BASE_URL, selected_shopify_store.shop_domain
+            ) if selected_shopify_store else None,
             "short_link_base_url": SHORT_LINK_BASE_URL,
             "program_defaults": _merchant_default_program(),
             "account": _account_shell(session, "merchant"),
@@ -6241,9 +6420,9 @@ def merchant_create_cashback_express(body: CashbackCampaignIn, request: Request)
     session = require_account_session(request, "merchant")
     _require_same_origin(request)
     identity = normalize_pubkey(body.merchant_pubkey, "merchant_pubkey")
-    configured_merchant = configured_merchant_pubkey_hex()
-    if identity["hex"] != configured_merchant:
-        raise HTTPException(403, "Cashback Express is restricted to the configured Shopify merchant.")
+    configured_merchants = configured_shopify_merchant_pubkeys_hex()
+    if identity["hex"] not in configured_merchants:
+        raise HTTPException(403, "Cashback Express is restricted to a configured Shopify merchant.")
     name = safe_text(body.name, 160)
     if not name:
         raise HTTPException(422, "name es obligatorio")

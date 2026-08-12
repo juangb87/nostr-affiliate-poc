@@ -4,6 +4,7 @@ import hmac
 import json
 
 from fastapi.testclient import TestClient
+from sqlalchemy import text
 
 import app.main as main_module
 from app.main import app
@@ -13,13 +14,16 @@ SHOPIFY_SECRET = "shopify-test-secret"
 SHOPIFY_SHOP = "shapersfit.myshopify.com"
 
 
-def shopify_headers(raw_body: bytes, *, secret: str = SHOPIFY_SECRET, webhook_id: str = "wh_test_1") -> dict[str, str]:
+def shopify_headers(
+    raw_body: bytes, *, secret: str = SHOPIFY_SECRET,
+    webhook_id: str = "wh_test_1", shop: str = SHOPIFY_SHOP,
+) -> dict[str, str]:
     signature = base64.b64encode(hmac.new(secret.encode(), raw_body, hashlib.sha256).digest()).decode()
     return {
         "Content-Type": "application/json",
         "X-Shopify-Hmac-Sha256": signature,
         "X-Shopify-Topic": "orders/paid",
-        "X-Shopify-Shop-Domain": SHOPIFY_SHOP,
+        "X-Shopify-Shop-Domain": shop,
         "X-Shopify-Webhook-Id": webhook_id,
         "X-Shopify-Api-Version": "2026-04",
     }
@@ -251,9 +255,94 @@ def test_shopify_orders_paid_rejects_wrong_shop_and_topic(tmp_path, monkeypatch)
     wrong_shop = shopify_headers(raw)
     wrong_shop["X-Shopify-Shop-Domain"] = "attacker.myshopify.com"
     response = client.post("/shopify/webhooks/orders-paid", content=raw, headers=wrong_shop)
-    assert response.status_code == 403
+    assert response.status_code == 401
 
     wrong_topic = shopify_headers(raw)
     wrong_topic["X-Shopify-Topic"] = "orders/create"
     response = client.post("/shopify/webhooks/orders-paid", content=raw, headers=wrong_topic)
     assert response.status_code == 400
+
+
+
+def test_shopify_multi_store_routes_each_domain_to_its_own_secret(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path}/shopify-multi.db")
+    monkeypatch.delenv("SHOPIFY_STORE_DOMAIN", raising=False)
+    monkeypatch.delenv("SHOPIFY_SECRET", raising=False)
+    first_merchant = main_module.Keys.generate()
+    second_merchant = main_module.Keys.generate()
+    monkeypatch.setenv("SHOPIFY_WEBHOOK_SECRET_FIRST", "first-secret")
+    monkeypatch.setenv("SHOPIFY_WEBHOOK_SECRET_SECOND", "second-secret")
+    monkeypatch.setenv("SHOPIFY_STORES_JSON", json.dumps({
+        "first.myshopify.com": {
+            "merchant_pubkey": first_merchant.public_key().to_bech32(),
+            "webhook_secret_env": "SHOPIFY_WEBHOOK_SECRET_FIRST",
+            "label": "First",
+        },
+        "second.myshopify.com": {
+            "merchant_pubkey": second_merchant.public_key().to_bech32(),
+            "webhook_secret_env": "SHOPIFY_WEBHOOK_SECRET_SECOND",
+            "label": "Second",
+        },
+    }))
+    client = TestClient(app)
+    raw = json.dumps(paid_order_payload(None), separators=(",", ":")).encode()
+
+    first = client.post(
+        "/shopify/webhooks/orders-paid", content=raw,
+        headers=shopify_headers(
+            raw, secret="first-secret", shop="first.myshopify.com", webhook_id="wh_first"
+        ),
+    )
+    second = client.post(
+        "/shopify/webhooks/orders-paid", content=raw,
+        headers=shopify_headers(
+            raw, secret="second-secret", shop="second.myshopify.com", webhook_id="wh_second"
+        ),
+    )
+    wrong_secret = client.post(
+        "/shopify/webhooks/orders-paid", content=raw,
+        headers=shopify_headers(
+            raw, secret="first-secret", shop="second.myshopify.com", webhook_id="wh_wrong"
+        ),
+    )
+    unknown = client.post(
+        "/shopify/webhooks/orders-paid", content=raw,
+        headers=shopify_headers(
+            raw, secret="first-secret", shop="unknown.myshopify.com", webhook_id="wh_unknown"
+        ),
+    )
+
+    assert first.status_code == 200 and first.json()["ignored"] is True
+    assert second.status_code == 200 and second.json()["ignored"] is True
+    assert wrong_secret.status_code == 401
+    assert unknown.status_code == 401
+    stores = main_module.shopify_store_configs()
+    assert stores["first.myshopify.com"].merchant_pubkey_hex == first_merchant.public_key().to_hex()
+    assert stores["second.myshopify.com"].merchant_pubkey_hex == second_merchant.public_key().to_hex()
+
+
+
+def test_shopify_migration_backfills_legacy_delivery_tenant(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path}/shopify-backfill.db")
+    monkeypatch.setenv("SHOPIFY_SECRET", SHOPIFY_SECRET)
+    monkeypatch.setenv("SHOPIFY_STORE_DOMAIN", SHOPIFY_SHOP)
+    main_module._ENGINE = None
+    main_module._ENGINE_URL = None
+    main_module.init_db()
+    with main_module.engine().begin() as connection:
+        connection.execute(text("""
+            INSERT INTO shopify_webhook_deliveries
+              (webhook_id, order_key, shop_domain, topic, click_id, order_total,
+               currency, status, created_at, merchant_pubkey_hex)
+            VALUES ('legacy-webhook', 'legacy-order', :shop, 'orders/paid',
+                    'legacy-click', 1.0, 'USD', 'failed', :created, NULL)
+        """), {"shop": SHOPIFY_SHOP, "created": main_module.now()})
+
+    main_module.init_db()
+
+    with main_module.engine().connect() as connection:
+        merchant_hex = connection.execute(text("""
+            SELECT merchant_pubkey_hex FROM shopify_webhook_deliveries
+            WHERE order_key='legacy-order'
+        """)).scalar_one()
+    assert merchant_hex == main_module.configured_merchant_pubkey_hex()

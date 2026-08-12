@@ -136,10 +136,11 @@ Recommended environment variables:
 - `NOSTR_PUBLISH`: set to `true` to publish to relays
 - `NOSTR_RELAYS`: comma-separated relay URLs. Default: `wss://nos.lol,wss://relay.damus.io,wss://relay.primal.net`
 - `MERCHANT_API_KEYS`: comma-separated bearer tokens accepted by `/merchant/conversions`.
-- `SHOPIFY_SECRET`: Shopify app client secret used to verify webhook HMAC signatures.
-- `SHOPIFY_WEBHOOK_SECRET`: optional dedicated override for webhook verification; when omitted, `SHOPIFY_SECRET` is used.
-- `SHOPIFY_STORE_DOMAIN`: permanent `*.myshopify.com` domain accepted in signed webhook headers.
-- `SHOPIFY_MERCHANT_PUBKEY`: merchant identity assigned to authoritative Shopify conversions.
+- `SHOPIFY_SECRET`: legacy single-store Shopify app client secret used to verify webhook HMAC signatures.
+- `SHOPIFY_WEBHOOK_SECRET`: optional legacy single-store override for webhook verification; when omitted, `SHOPIFY_SECRET` is used.
+- `SHOPIFY_STORE_DOMAIN`: legacy single-store permanent `*.myshopify.com` domain accepted in signed webhook headers.
+- `SHOPIFY_MERCHANT_PUBKEY`: legacy single-store merchant identity assigned to authoritative Shopify conversions.
+- `SHOPIFY_STORES_JSON`: optional domain-keyed multi-store map. Each entry requires `merchant_pubkey`, may include a non-secret `label`, and may reference a dedicated secret through `webhook_secret_env` (for example `SHOPIFY_WEBHOOK_SECRET_SHAPERSFIT`). Missing per-store secrets keep campaign creation and installation snippets available but signed webhook processing remains disabled for that store. Legacy variables are merged so existing stores continue working during migration. Example: `{"shop.myshopify.com":{"merchant_pubkey":"npub...","webhook_secret_env":"SHOPIFY_WEBHOOK_SECRET_SHOP","label":"Shop"}}`. Never embed secret values in this JSON.
 - `OPS_NOSTR_PUBKEYS`: comma-separated Nostr pubkeys authorized for `/ops`.
 - `NIP46_RELAYS`: comma-separated secure `wss://` relays used only for temporary browser-to-signer NIP-46 login connections. Invalid, duplicate, credential-bearing, and non-TLS URLs are ignored; at most three are exposed to the browser.
 - `MERCHANT_ACCOUNT_BINDINGS`: comma-separated `owner_pubkey:merchant_pubkey` administrative ownership pairs. For pilot bootstrap these identities must be distinct: the owner signs in through NIP-07 and the merchant pubkey identifies the tenant. Removing the pair revokes that delegated workspace access. Meerat never requests the owner's `nsec`.

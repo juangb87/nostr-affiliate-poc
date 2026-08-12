@@ -594,6 +594,40 @@ def test_single_store_configuration_is_required_and_enforced(tmp_path, monkeypat
     assert create_cashback(client, merchant).status_code == 403
 
 
+
+def test_multi_store_configuration_allows_each_mapped_merchant(tmp_path, monkeypatch):
+    first, second, outsider = Keys.generate(), Keys.generate(), Keys.generate()
+    client = client_for(tmp_path, monkeypatch, first)
+    for merchant, name in ((second, "Second program"), (outsider, "Outsider program")):
+        seeded = client.post("/campaigns", json={
+            "merchant_pubkey": merchant.public_key().to_bech32(),
+            "name": name,
+            "commission_bps": 500,
+            "attribution_window_days": 30,
+            "destination_url": "https://merchant.example/shop",
+            "enrollment_mode": "private",
+        })
+        assert seeded.status_code == 200
+    monkeypatch.setenv("SHOPIFY_STORES_JSON", json.dumps({
+        "second.myshopify.com": {
+            "merchant_pubkey": second.public_key().to_bech32(),
+            "label": "Second store",
+        }
+    }))
+
+    login(client, first)
+    assert create_cashback(client, first).status_code == 200
+    client.cookies.clear()
+    login(client, second)
+    assert create_cashback(client, second).status_code == 200
+    client.cookies.clear()
+    login(client, outsider)
+    denied = create_cashback(client, outsider)
+    assert denied.status_code == 403
+    assert denied.json()["detail"] == "Cashback Express is restricted to a configured Shopify merchant."
+
+
+
 def test_claim_is_single_use_same_order_idempotent_and_budget_is_atomic(tmp_path, monkeypatch):
     merchant = Keys.generate()
     client = client_for(tmp_path, monkeypatch, merchant)
