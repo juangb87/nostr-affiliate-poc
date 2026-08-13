@@ -605,7 +605,7 @@ def test_merchant_creates_hashed_single_use_invitation_for_owned_campaign(tmp_pa
 
     merchant_page = client.get("/app/merchant?view=affiliates")
     assert merchant_page.status_code == 200
-    assert '/static/app.js?v=20260805-cashback-clicks1' in merchant_page.text
+    assert '/static/app.js?v=20260813-cashback-invoice1' in merchant_page.text
     assert 'data-invite-origin="https://mrt.st"' in merchant_page.text
 
     invitation = create_invitation(client, campaign["campaign_id"])

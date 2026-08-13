@@ -385,6 +385,8 @@ ES_TO_EN.update({
     "Resolviendo la dirección Lightning y generando la factura…": "Resolving the Lightning address and generating the invoice…",
     "El servidor devolvió una factura Lightning inválida": "The server returned an invalid Lightning invoice.",
     "Regenerar factura Lightning y QR": "Regenerate Lightning invoice and QR code",
+    "La factura Lightning no está vigente. Generá una nueva antes de registrar el pago.": "The Lightning invoice is no longer valid. Generate a new one before recording the payment.",
+    "Hash cargado. Marcá el cashback como pagado únicamente después de que tu wallet confirme el pago.": "Hash loaded. Mark the cashback as paid only after your wallet confirms the payment.",
     "Ingresá el hash de pago Lightning: exactamente 64 caracteres hexadecimales, sin guiones. El ID UUID de Strike no es un hash de pago.": "Enter the Lightning payment hash: exactly 64 hexadecimal characters, without hyphens. A Strike UUID is not a payment hash.",
     "Marcá la confirmación únicamente si tu billetera mostró que el pago fue exitoso.": "Check the confirmation only if your wallet showed that the payment succeeded.",
     "Registrando atestación y publicando prueba…": "Recording attestation and publishing proof…",

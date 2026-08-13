@@ -6713,6 +6713,61 @@ def merchant_reveal_cashback_destination(reward_id: str, request: Request) -> Re
     }, headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
 
 
+@app.post("/app/merchant/cashback-rewards/{reward_id}/prepare-invoice", tags=["Accounts"])
+async def merchant_prepare_cashback_invoice(reward_id: str, request: Request, response: Response) -> dict[str, Any]:
+    session = require_account_session(request, "merchant")
+    _require_same_origin(request)
+    init_db()
+    with engine().connect() as connection:
+        reward = _owned_cashback_reward(connection, session, reward_id)
+        if reward["status"] != "pending":
+            raise HTTPException(409, "Cashback reward is not pending.")
+        lightning_address = str(reward["lightning_address"])
+        amount_sats = int(reward["reward_sats"])
+    rate_key = f"cashback:{session['account_id']}:{reward_id}"
+    started = time.monotonic()
+    with _INVOICE_PREPARE_LOCK:
+        for key, timestamp in list(_INVOICE_PREPARE_LAST.items()):
+            if started - timestamp > 60:
+                _INVOICE_PREPARE_LAST.pop(key, None)
+        if rate_key in _INVOICE_PREPARE_ACTIVE or started - _INVOICE_PREPARE_LAST.get(rate_key, 0) < 5:
+            raise HTTPException(429, "La preparación de la factura Lightning ya está en curso o se solicitó hace muy poco.")
+        _INVOICE_PREPARE_ACTIVE.add(rate_key)
+        _INVOICE_PREPARE_LAST[rate_key] = started
+    try:
+        try:
+            invoice, payment_hash = await prepare_lnurl_payment(lightning_address, amount_sats)
+        except LightningPaymentError as exc:
+            raise HTTPException(502, str(exc)) from exc
+        with engine().begin() as connection:
+            latest = _owned_cashback_reward(connection, session, reward_id)
+            if latest["status"] != "pending":
+                raise HTTPException(409, "Cashback reward changed while preparing the Lightning invoice.")
+            if str(latest["lightning_address"]) != lightning_address or int(latest["reward_sats"]) != amount_sats:
+                raise HTTPException(409, "Cashback destination or amount changed while preparing the Lightning invoice.")
+            connection.execute(text("""
+                UPDATE cashback_rewards SET destination_revealed_at=COALESCE(destination_revealed_at,:revealed_at)
+                WHERE id=:reward_id
+            """), {"revealed_at": now(), "reward_id": reward_id})
+        expires_at = bolt11_expires_at(invoice)
+        try:
+            qr_data_uri = await asyncio.to_thread(_bolt11_qr_data_uri, invoice)
+        except (DataOverflowError, ValueError) as exc:
+            raise HTTPException(502, "La factura BOLT11 es demasiado grande para mostrarla de forma segura.") from exc
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        return {
+            "ok": True, "reward_id": reward_id, "amount_sats": amount_sats,
+            "lightning_address": lightning_address, "invoice": invoice,
+            "payment_hash": payment_hash, "expires_at": expires_at,
+            "qr_data_uri": qr_data_uri,
+        }
+    finally:
+        with _INVOICE_PREPARE_LOCK:
+            _INVOICE_PREPARE_ACTIVE.discard(rate_key)
+
+
 @app.post("/app/merchant/cashback-rewards/{reward_id}/paid", tags=["Accounts"])
 def merchant_mark_cashback_paid(reward_id: str, body: CashbackPaymentIn, request: Request) -> dict[str, Any]:
     session = require_account_session(request, "merchant")

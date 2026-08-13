@@ -194,6 +194,17 @@ function clearPreparedInvoice(form) {
   panel.hidden = true;
 }
 
+function clearCashbackPreparedInvoice(form) {
+  const panel = form.querySelector("[data-cashback-invoice-panel]");
+  panel.querySelector("[data-invoice-qr]").removeAttribute("src");
+  panel.querySelector("[data-invoice-text]").textContent = "";
+  delete panel.querySelector("[data-invoice-copy]").dataset.copy;
+  delete form.dataset.preparedPaymentHash;
+  delete form.dataset.preparedExpiresAt;
+  form.querySelector("[name='payment_hash']").value = "";
+  panel.hidden = true;
+}
+
 async function resolveAffiliateInvitation() {
   const page = document.querySelector("[data-invite-page]");
   if (!page) return;
@@ -424,6 +435,61 @@ document.addEventListener("click", async (event) => {
       setInviteStatus(status, es, en);
       status.classList.add("error");
       invite.disabled = false;
+    }
+    return;
+  }
+  const cashbackUseInvoiceHash = event.target.closest("[data-cashback-use-invoice-hash]");
+  if (cashbackUseInvoiceHash) {
+    const form = cashbackUseInvoiceHash.closest("[data-cashback-paid]");
+    const status = form.querySelector("[data-cashback-invoice-status]");
+    const paymentHash = form.dataset.preparedPaymentHash || "";
+    const expiresAt = Date.parse(form.dataset.preparedExpiresAt || "");
+    if (!/^[0-9a-f]{64}$/.test(paymentHash) || !Number.isFinite(expiresAt) || Date.now() >= expiresAt) {
+      status.textContent = tr("La factura Lightning no está vigente. Generá una nueva antes de registrar el pago.");
+      status.classList.add("error");
+      return;
+    }
+    form.querySelector("[name='payment_hash']").value = paymentHash;
+    status.classList.remove("error");
+    status.textContent = tr("Hash cargado. Marcá el cashback como pagado únicamente después de que tu wallet confirme el pago.");
+    form.querySelector("[name='evidence']").focus();
+    return;
+  }
+  const cashbackPrepareInvoice = event.target.closest("[data-cashback-prepare-invoice]");
+  if (cashbackPrepareInvoice) {
+    const form = cashbackPrepareInvoice.closest("[data-cashback-paid]");
+    const record = form.closest("[data-cashback-reward]");
+    const panel = form.querySelector("[data-cashback-invoice-panel]");
+    const status = form.querySelector("[data-cashback-invoice-status]");
+    cashbackPrepareInvoice.disabled = true;
+    status.classList.remove("error");
+    status.textContent = tr("Resolviendo la dirección Lightning y generando la factura…");
+    clearCashbackPreparedInvoice(form);
+    try {
+      const result = await jsonFetch(`/app/merchant/cashback-rewards/${encodeURIComponent(record.dataset.cashbackReward)}/prepare-invoice`, {
+        method: "POST", body: "{}"
+      });
+      const expiresAt = Date.parse(result.expires_at);
+      if (!/^lnbc[0-9a-z]+$/i.test(result.invoice) || !/^data:image\/svg\+xml;base64,/.test(result.qr_data_uri) || !/^[0-9a-f]{64}$/.test(result.payment_hash) || !Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+        throw new Error(tr("El servidor devolvió una factura Lightning inválida"));
+      }
+      panel.querySelector("[data-invoice-qr]").src = result.qr_data_uri;
+      panel.querySelector("[data-invoice-amount]").textContent = formatAppNumber(result.amount_sats);
+      panel.querySelector("[data-invoice-destination]").textContent = result.lightning_address;
+      panel.querySelector("[data-invoice-text]").textContent = result.invoice;
+      panel.querySelector("[data-invoice-copy]").dataset.copy = result.invoice;
+      form.dataset.preparedPaymentHash = result.payment_hash;
+      form.dataset.preparedExpiresAt = result.expires_at;
+      panel.querySelector("[data-invoice-expiry]").textContent = tr(`Expira: ${formatAppDateTime(expiresAt)}`);
+      panel.hidden = false;
+      cashbackPrepareInvoice.textContent = tr("Regenerar factura Lightning y QR");
+      status.textContent = tr(`Factura Lightning lista por ${formatAppNumber(result.amount_sats)} sats. Generarla no realiza el pago.`);
+    } catch (error) {
+      clearCashbackPreparedInvoice(form);
+      status.textContent = readableError(error);
+      status.classList.add("error");
+    } finally {
+      cashbackPrepareInvoice.disabled = false;
     }
     return;
   }

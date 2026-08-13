@@ -489,6 +489,72 @@ def test_shopify_cashback_reward_is_idempotent_conflict_safe_and_tenant_scoped(t
     assert "recompensas a compradores" in page.text.lower()
     assert "b***r@w***t.example" in page.text
     assert "buyer@wallet.example" not in page.text
+    assert 'data-cashback-prepare-invoice' in page.text
+    assert 'data-cashback-invoice-panel hidden' in page.text
+    assert "Generar factura Lightning y QR" in page.text
+
+
+def test_cashback_invoice_preparation_is_tenant_scoped_and_non_mutating(tmp_path, monkeypatch):
+    merchant, outsider = Keys.generate(), Keys.generate()
+    client = client_for(tmp_path, monkeypatch, merchant)
+    login(client, merchant)
+    campaign = create_cashback(client, merchant, cashback_percent="10").json()
+    monkeypatch.setattr(main, "validate_lightning_address", lambda address: {"callback": "ok"})
+    claim_id = _claim_id(client, campaign["code"], "buyer@wallet.example")
+    payload = {"id": 105, "total_price": "1.00", "currency": "USD", "note_attributes": [
+        {"name": "mrt_click_id", "value": claim_id}, {"name": "mrt_campaign", "value": campaign["code"]}
+    ]}
+    raw = json.dumps(payload, separators=(",", ":")).encode()
+    assert client.post("/shopify/webhooks/orders-paid", content=raw, headers=signed_headers(raw, "invoice-cashback-wh")).status_code == 200
+    with main.engine().connect() as connection:
+        reward = connection.execute(text("SELECT * FROM cashback_rewards WHERE claim_id=:claim"), {"claim": claim_id}).mappings().one()
+
+    observed = []
+    async def fake_prepare(address: str, amount_sats: int):
+        observed.append((address, amount_sats))
+        return "lnbc790n1testinvoice", "ab" * 32
+
+    monkeypatch.setattr(main, "prepare_lnurl_payment", fake_prepare)
+    monkeypatch.setattr(main, "bolt11_expires_at", lambda _invoice: "2026-08-14T00:00:00+00:00")
+    client.post("/auth/logout")
+    client.post("/campaigns", json={
+        "merchant_pubkey": outsider.public_key().to_bech32(), "name": "Outsider invoice",
+        "commission_bps": 500, "attribution_window_days": 30,
+        "destination_url": "https://outsider.example", "enrollment_mode": "private",
+    })
+    login(client, outsider)
+    hidden = client.post(
+        f"/app/merchant/cashback-rewards/{reward['id']}/prepare-invoice",
+        headers={"Origin": "https://testserver"},
+    )
+    assert hidden.status_code == 404
+    assert observed == []
+
+    client.post("/auth/logout")
+    login(client, merchant)
+    wrong_origin = client.post(
+        f"/app/merchant/cashback-rewards/{reward['id']}/prepare-invoice",
+        headers={"Origin": "https://evil.example"},
+    )
+    assert wrong_origin.status_code == 403
+    prepared = client.post(
+        f"/app/merchant/cashback-rewards/{reward['id']}/prepare-invoice",
+        headers={"Origin": "https://testserver"},
+    )
+    assert prepared.status_code == 200, prepared.text
+    body = prepared.json()
+    assert body["invoice"] == "lnbc790n1testinvoice"
+    assert body["payment_hash"] == "ab" * 32
+    assert body["amount_sats"] == reward["reward_sats"]
+    assert body["lightning_address"] == "buyer@wallet.example"
+    assert body["qr_data_uri"].startswith("data:image/svg+xml;base64,")
+    assert prepared.headers["cache-control"] == "no-store"
+    assert observed == [("buyer@wallet.example", reward["reward_sats"])]
+    with main.engine().connect() as connection:
+        unchanged = connection.execute(text(
+            "SELECT status, paid_at, payment_hash, payment_evidence FROM cashback_rewards WHERE id=:id"
+        ), {"id": reward["id"]}).mappings().one()
+    assert dict(unchanged) == {"status": "pending", "paid_at": None, "payment_hash": None, "payment_evidence": None}
 
 
 def test_shopify_cashback_accepts_legacy_click_only_but_rejects_explicit_wrong_campaign(tmp_path, monkeypatch):
