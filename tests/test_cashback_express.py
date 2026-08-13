@@ -460,9 +460,19 @@ def test_shopify_cashback_reward_is_idempotent_conflict_safe_and_tenant_scoped(t
     monkeypatch.setattr(main, "validate_lightning_address", lambda address: {"callback": "ok"})
     claimed = client.post(f"/x/{campaign['code']}/claim", json={"lightning_address": "buyer@wallet.example"}, follow_redirects=False)
     click_id = parse_qs(urlparse(claimed.headers["location"]).query)["mrt_click_id"][0]
-    payload = {"id": 101, "financial_status": "paid", "total_price": "1.00", "currency": "USD", "note_attributes": [
-        {"name": "mrt_click_id", "value": click_id}, {"name": "mrt_campaign", "value": campaign["code"]}
-    ]}
+    payload = {
+        "id": 101,
+        "financial_status": "paid",
+        "total_price": "1.70",
+        "current_subtotal_price": "1.00",
+        "total_shipping_price_set": {"shop_money": {"amount": "0.60", "currency_code": "USD"}},
+        "total_tax": "0.10",
+        "currency": "USD",
+        "note_attributes": [
+            {"name": "mrt_click_id", "value": click_id},
+            {"name": "mrt_campaign", "value": campaign["code"]},
+        ],
+    }
     raw = json.dumps(payload, separators=(",", ":")).encode()
     first = client.post("/shopify/webhooks/orders-paid", content=raw, headers=signed_headers(raw))
     assert first.status_code == 200, first.text
@@ -479,7 +489,7 @@ def test_shopify_cashback_reward_is_idempotent_conflict_safe_and_tenant_scoped(t
     duplicate = client.post("/shopify/webhooks/orders-paid", content=raw, headers=signed_headers(raw, "cashback-wh-2"))
     assert duplicate.json()["duplicate"] is True
     assert duplicate.json()["reward_id"] == reward["id"]
-    changed = dict(payload, total_price="2.00")
+    changed = dict(payload, current_subtotal_price="2.00")
     changed_raw = json.dumps(changed, separators=(",", ":")).encode()
     conflict = client.post("/shopify/webhooks/orders-paid", content=changed_raw, headers=signed_headers(changed_raw, "cashback-wh-3"))
     assert conflict.json()["conflict"] is True
@@ -492,6 +502,41 @@ def test_shopify_cashback_reward_is_idempotent_conflict_safe_and_tenant_scoped(t
     assert 'data-cashback-prepare-invoice' in page.text
     assert 'data-cashback-invoice-panel hidden' in page.text
     assert "Generar factura Lightning y QR" in page.text
+
+
+def test_cashback_zero_merchandise_subtotal_is_ignored_without_consuming_claim(tmp_path, monkeypatch):
+    merchant = Keys.generate()
+    client = client_for(tmp_path, monkeypatch, merchant)
+    login(client, merchant)
+    campaign = create_cashback(client, merchant, cashback_percent="10").json()
+    monkeypatch.setattr(main, "validate_lightning_address", lambda address: {"callback": "ok"})
+    claim_id = _claim_id(client, campaign["code"], "free@wallet.example")
+    payload = {
+        "id": 106,
+        "total_price": "4.00",
+        "current_subtotal_price": "0.00",
+        "currency": "USD",
+        "note_attributes": [
+            {"name": "mrt_click_id", "value": claim_id},
+            {"name": "mrt_campaign", "value": campaign["code"]},
+        ],
+    }
+    raw = json.dumps(payload, separators=(",", ":")).encode()
+    response = client.post(
+        "/shopify/webhooks/orders-paid", content=raw,
+        headers=signed_headers(raw, "zero-subtotal-wh"),
+    )
+    assert response.status_code == 200
+    assert response.json()["ignored"] is True
+    assert response.json()["reason"] == "zero merchandise subtotal"
+    with main.engine().connect() as connection:
+        assert connection.execute(text("SELECT COUNT(*) FROM cashback_rewards")).scalar_one() == 0
+        assert connection.execute(text("SELECT COUNT(*) FROM shopify_webhook_deliveries")).scalar_one() == 0
+        claim = connection.execute(
+            text("SELECT consumed_at, consumed_order_key FROM cashback_claims WHERE id=:id"),
+            {"id": claim_id},
+        ).mappings().one()
+    assert dict(claim) == {"consumed_at": None, "consumed_order_key": None}
 
 
 def test_cashback_invoice_preparation_is_tenant_scoped_and_non_mutating(tmp_path, monkeypatch):

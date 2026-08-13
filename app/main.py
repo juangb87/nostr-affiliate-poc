@@ -3844,6 +3844,24 @@ def verify_shopify_webhook(
         raise HTTPException(401, "invalid Shopify webhook signature")
 
 
+def shopify_cashback_subtotal(payload: dict[str, Any]) -> Decimal:
+    """Return the post-discount merchandise subtotal, excluding shipping and taxes."""
+    subtotal_field = next(
+        (field for field in ("current_subtotal_price", "subtotal_price") if payload.get(field) is not None),
+        None,
+    )
+    # Signed legacy fixtures and unusually sparse payloads may only contain total_price.
+    # Real Shopify orders/paid payloads include a subtotal field, which always wins.
+    source = subtotal_field or "total_price"
+    try:
+        subtotal = Decimal(str(payload.get(source)))
+    except (InvalidOperation, TypeError, ValueError):
+        raise HTTPException(422, "invalid Shopify merchandise subtotal")
+    if not subtotal.is_finite() or subtotal < 0:
+        raise HTTPException(422, "incomplete Shopify paid order")
+    return subtotal
+
+
 def shopify_note_attributes(payload: dict[str, Any]) -> dict[str, str]:
     attributes: dict[str, str] = {}
     attribution_names = {
@@ -4212,6 +4230,20 @@ async def shopify_orders_paid_webhook(request: Request, background_tasks: Backgr
         raise HTTPException(422, "invalid Shopify order total")
     if not order_id or not currency or not order_total.is_finite() or order_total <= 0:
         raise HTTPException(422, "incomplete Shopify paid order")
+    with engine().connect() as connection:
+        cashback_claim = bool(connection.execute(
+            text("SELECT 1 FROM cashback_claims WHERE id=:id"), {"id": click_id}
+        ).fetchone())
+    if cashback_claim:
+        order_total = shopify_cashback_subtotal(payload)
+        if order_total == 0:
+            record_shopify_webhook_receipt(
+                webhook_id, shop, topic, "ignored", "zero merchandise subtotal"
+            )
+            return {
+                "ok": True, "ignored": True, "reason": "zero merchandise subtotal",
+                "shop": shop, "topic": topic, "webhook_id": webhook_id,
+            }
 
     order_key = sha(f"shopify:{shop}:{order_id}")
     delivery, should_process, conflict = enqueue_shopify_paid_order(
