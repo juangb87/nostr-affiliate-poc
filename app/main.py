@@ -2252,6 +2252,7 @@ class BrowserConversionIn(BaseModel):
     order_name: Optional[str] = None
     checkout_token: Optional[str] = None
     total_price: Optional[float | str] = None
+    subtotal_price: Optional[float | str] = None
     currency: Optional[str] = None
     url: Optional[str] = None
     path: Optional[str] = None
@@ -3368,7 +3369,9 @@ def store_tracking_event(kind: str, body: BrowserEventIn | BrowserConversionIn, 
     user_agent = safe_text(getattr(body, "user_agent", None) or request.headers.get("user-agent", ""), 500)
     order_id = safe_text(getattr(body, "order_id", None), 300)
     checkout_token = safe_text(getattr(body, "checkout_token", None), 300)
-    total_price = getattr(body, "total_price", None)
+    total_price = getattr(body, "subtotal_price", None)
+    if total_price in (None, ""):
+        total_price = getattr(body, "total_price", None)
     try:
         order_total = float(total_price) if total_price not in (None, "") else None
     except (TypeError, ValueError):
@@ -3818,7 +3821,7 @@ def shopify_installation_snippets(base_url: str, shop_domain: str) -> dict[str, 
       mrt_click_id: clickId,
       mrt_campaign: campaignCode,
       order_id: checkout.order && checkout.order.id ? String(checkout.order.id) : null,
-      total_price: checkout.totalPrice && checkout.totalPrice.amount ? checkout.totalPrice.amount : null,
+      subtotal_price: checkout.subtotalPrice && checkout.subtotalPrice.amount ? checkout.subtotalPrice.amount : null,
       currency: checkout.currencyCode || null,
       ts: event.timestamp || new Date().toISOString(),
       metadata: { event_id: event.id || null, source: "shopify_custom_pixel" }

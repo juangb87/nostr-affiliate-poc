@@ -681,6 +681,8 @@ def test_expired_claim_never_creates_reward_and_snippets_carry_no_address(tmp_pa
     assert "mrt_campaign" in snippets["theme_script"] and "mrt_campaign" in snippets["custom_pixel"]
     assert "if (campaignCode) return;" in snippets["theme_script"]
     assert "if (campaignCode) return;" in snippets["custom_pixel"]
+    assert "subtotal_price: checkout.subtotalPrice" in snippets["custom_pixel"]
+    assert "total_price: checkout.totalPrice" not in snippets["custom_pixel"]
     assert "bb_" not in install_code.lower()
     assert "bumbei" not in install_code.lower()
     assert "lightning_address" not in install_code
