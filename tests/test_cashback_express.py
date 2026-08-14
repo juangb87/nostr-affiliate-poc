@@ -142,7 +142,7 @@ def test_public_landing_and_claim_are_private_and_fail_safe(tmp_path, monkeypatc
     assert "Cashback café" in page.text and "7.25%" in page.text
     assert "Cashback" in page.text and "reembolso" in page.text
     assert '/static/cashback-express.css?v=20260805-continue1' in page.text
-    assert '/static/cashback-express.js?v=20260805-status2' in page.text
+    assert '/static/cashback-express.js?v=20260813-declined1' in page.text
     assert f'href="/x/{code}/check"' in page.text
     assert f'href="/x/{code}/continue"' in page.text
     assert "Continuar sin cashback" in page.text
@@ -462,6 +462,7 @@ def test_shopify_cashback_reward_is_idempotent_conflict_safe_and_tenant_scoped(t
     click_id = parse_qs(urlparse(claimed.headers["location"]).query)["mrt_click_id"][0]
     payload = {
         "id": 101,
+        "name": "#1060",
         "financial_status": "paid",
         "total_price": "1.70",
         "current_subtotal_price": "1.00",
@@ -485,10 +486,21 @@ def test_shopify_cashback_reward_is_idempotent_conflict_safe_and_tenant_scoped(t
         assert reward["reward_sats"] == 250
         assert reward["status"] == "pending"
         delivery = connection.execute(text("SELECT * FROM shopify_webhook_deliveries")).mappings().one()
+        assert delivery["shopify_order_name"] == "#1060"
         assert delivery["reward_id"] == reward["id"] and delivery["conversion_id"] is None
     duplicate = client.post("/shopify/webhooks/orders-paid", content=raw, headers=signed_headers(raw, "cashback-wh-2"))
     assert duplicate.json()["duplicate"] is True
     assert duplicate.json()["reward_id"] == reward["id"]
+    with main.engine().begin() as connection:
+        connection.execute(text("UPDATE shopify_webhook_deliveries SET shopify_order_name=NULL"))
+    historical_replay = client.post(
+        "/shopify/webhooks/orders-paid", content=raw, headers=signed_headers(raw, "cashback-wh-historical")
+    )
+    assert historical_replay.status_code == 200
+    assert historical_replay.json()["duplicate"] is True
+    assert historical_replay.json().get("conflict") is not True
+    with main.engine().connect() as connection:
+        assert connection.execute(text("SELECT shopify_order_name FROM shopify_webhook_deliveries")).scalar_one() == "#1060"
     changed = dict(payload, current_subtotal_price="2.00")
     changed_raw = json.dumps(changed, separators=(",", ":")).encode()
     conflict = client.post("/shopify/webhooks/orders-paid", content=changed_raw, headers=signed_headers(changed_raw, "cashback-wh-3"))
@@ -502,6 +514,13 @@ def test_shopify_cashback_reward_is_idempotent_conflict_safe_and_tenant_scoped(t
     assert 'data-cashback-prepare-invoice' in page.text
     assert 'data-cashback-invoice-panel hidden' in page.text
     assert "Generar factura Lightning y QR" in page.text
+    assert "Orden Shopify" in page.text
+    assert "#1060" in page.text
+    assert 'data-cashback-decline' in page.text
+    assert 'class="cashback-activity-sections"' in page.text
+    css = client.get("/static/app.css").text
+    assert ".cashback-activity-sections #cashback-rewards{order:1}" in css
+    assert ".cashback-activity-sections #cashback-clicks{order:2}" in css
 
 
 def test_cashback_zero_merchandise_subtotal_is_ignored_without_consuming_claim(tmp_path, monkeypatch):
@@ -537,6 +556,97 @@ def test_cashback_zero_merchandise_subtotal_is_ignored_without_consuming_claim(t
             {"id": claim_id},
         ).mappings().one()
     assert dict(claim) == {"consumed_at": None, "consumed_order_key": None}
+
+
+def test_cashback_decline_is_tenant_scoped_idempotent_and_releases_budget(tmp_path, monkeypatch):
+    merchant, outsider = Keys.generate(), Keys.generate()
+    client = client_for(tmp_path, monkeypatch, merchant)
+    login(client, merchant)
+    campaign = create_cashback(client, merchant, cashback_percent="10", budget_sats=5000).json()
+    monkeypatch.setattr(main, "validate_lightning_address", lambda address: {"callback": "ok"})
+    claim = client.post(
+        f"/x/{campaign['code']}/claim?response=json",
+        json={"lightning_address": "decline@wallet.example"},
+    )
+    assert claim.status_code == 200
+    status_token = claim.json()["status_token"]
+    claim_id = parse_qs(urlparse(claim.json()["redirect_url"]).query)["mrt_click_id"][0]
+    reward = main.process_cashback_reward(
+        order_key="decline-order", claim_id=claim_id, campaign_code=campaign["code"],
+        order_total=Decimal("1000"), currency="SATS",
+        authorized_merchant_hex=merchant.public_key().to_hex(),
+    )
+    client.post("/auth/logout")
+    client.post("/campaigns", json={
+        "merchant_pubkey": outsider.public_key().to_bech32(), "name": "Outsider decline",
+        "commission_bps": 500, "attribution_window_days": 30,
+        "destination_url": "https://outsider.example", "enrollment_mode": "private",
+    })
+    login(client, outsider)
+    hidden = client.post(
+        f"/app/merchant/cashback-rewards/{reward['id']}/decline",
+        json={"reason": "test order"}, headers={"Origin": "https://testserver"},
+    )
+    assert hidden.status_code == 404
+
+    client.post("/auth/logout")
+    login(client, merchant)
+    wrong_origin = client.post(
+        f"/app/merchant/cashback-rewards/{reward['id']}/decline",
+        json={"reason": "test order"}, headers={"Origin": "https://evil.example"},
+    )
+    assert wrong_origin.status_code == 403
+    with main.engine().begin() as connection:
+        connection.execute(text(
+            "UPDATE cashback_campaigns SET committed_sats=:amount WHERE id=:id"
+        ), {"amount": reward["reward_sats"] - 1, "id": campaign["campaign_id"]})
+    inconsistent = client.post(
+        f"/app/merchant/cashback-rewards/{reward['id']}/decline",
+        json={"reason": "Test purchase"}, headers={"Origin": "https://testserver"},
+    )
+    assert inconsistent.status_code == 409
+    with main.engine().begin() as connection:
+        assert connection.execute(text(
+            "SELECT status FROM cashback_rewards WHERE id=:id"
+        ), {"id": reward["id"]}).scalar_one() == "pending"
+        connection.execute(text(
+            "UPDATE cashback_campaigns SET committed_sats=:amount WHERE id=:id"
+        ), {"amount": reward["reward_sats"], "id": campaign["campaign_id"]})
+    declined = client.post(
+        f"/app/merchant/cashback-rewards/{reward['id']}/decline",
+        json={"reason": "Test purchase"}, headers={"Origin": "https://testserver"},
+    )
+    assert declined.status_code == 200
+    assert declined.json()["status"] == "declined"
+    replay = client.post(
+        f"/app/merchant/cashback-rewards/{reward['id']}/decline",
+        json={"reason": "Test purchase"}, headers={"Origin": "https://testserver"},
+    )
+    assert replay.status_code == 200 and replay.json()["idempotent"] is True
+    conflict = client.post(
+        f"/app/merchant/cashback-rewards/{reward['id']}/decline",
+        json={"reason": "Other reason"}, headers={"Origin": "https://testserver"},
+    )
+    assert conflict.status_code == 409
+    with main.engine().connect() as connection:
+        stored = connection.execute(text(
+            "SELECT status, declined_at, decline_reason FROM cashback_rewards WHERE id=:id"
+        ), {"id": reward["id"]}).mappings().one()
+        committed = connection.execute(text(
+            "SELECT committed_sats FROM cashback_campaigns WHERE id=:id"
+        ), {"id": campaign["campaign_id"]}).scalar_one()
+    assert stored["status"] == "declined" and stored["declined_at"] and stored["decline_reason"] == "Test purchase"
+    assert committed == 0
+
+    main.init_db()
+    with main.engine().connect() as connection:
+        assert connection.execute(text(
+            "SELECT committed_sats FROM cashback_campaigns WHERE id=:id"
+        ), {"id": campaign["campaign_id"]}).scalar_one() == 0
+
+    public_status = client.post(f"/x/{campaign['code']}/check", json={"token": status_token})
+    assert public_status.status_code == 200
+    assert public_status.json()["status"] == "declined"
 
 
 def test_cashback_invoice_preparation_is_tenant_scoped_and_non_mutating(tmp_path, monkeypatch):

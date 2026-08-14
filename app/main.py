@@ -263,6 +263,7 @@ _APP_STATUS_LABELS = {
     "pending": "Pendiente",
     "approved": "Aprobada",
     "rejected": "Rechazada",
+    "declined": "Declinada",
     "terminated": "Finalizada",
     "paid": "Pagado",
     "failed": "Fallido",
@@ -1262,6 +1263,7 @@ def _init_db_unlocked() -> None:
         conversion_id TEXT,
         reward_id TEXT,
         attribution_code TEXT,
+        shopify_order_name TEXT,
         error TEXT,
         created_at TEXT NOT NULL,
         processing_started_at TEXT,
@@ -1319,7 +1321,9 @@ def _init_db_unlocked() -> None:
         destination_revealed_at TEXT,
         paid_at TEXT,
         payment_hash TEXT,
-        payment_evidence TEXT
+        payment_evidence TEXT,
+        declined_at TEXT,
+        decline_reason TEXT
     );
     CREATE TABLE IF NOT EXISTS shopify_webhook_receipts (
         webhook_id TEXT PRIMARY KEY,
@@ -1554,6 +1558,7 @@ def _init_db_unlocked() -> None:
                 "cashback_bps": "INTEGER", "reward_sats": "INTEGER", "status": "TEXT DEFAULT 'pending'",
                 "created_at": "TEXT", "destination_revealed_at": "TEXT", "paid_at": "TEXT",
                 "payment_hash": "TEXT", "payment_evidence": "TEXT",
+                "declined_at": "TEXT", "decline_reason": "TEXT",
             }
             for column, column_type in cashback_reward_column_ddl.items():
                 c.execute(text(f"ALTER TABLE cashback_rewards ADD COLUMN IF NOT EXISTS {column} {column_type}"))
@@ -1577,6 +1582,7 @@ def _init_db_unlocked() -> None:
             c.execute(text("ALTER TABLE shopify_webhook_deliveries ADD COLUMN IF NOT EXISTS attribution_code TEXT"))
             c.execute(text("ALTER TABLE shopify_webhook_deliveries ADD COLUMN IF NOT EXISTS processing_started_at TEXT"))
             c.execute(text("ALTER TABLE shopify_webhook_deliveries ADD COLUMN IF NOT EXISTS merchant_pubkey_hex TEXT"))
+            c.execute(text("ALTER TABLE shopify_webhook_deliveries ADD COLUMN IF NOT EXISTS shopify_order_name TEXT"))
             c.execute(text("ALTER TABLE conversions ADD COLUMN IF NOT EXISTS order_total_sats INTEGER"))
             c.execute(text("ALTER TABLE conversions ADD COLUMN IF NOT EXISTS btc_usd_rate TEXT"))
             c.execute(text("ALTER TABLE conversions ADD COLUMN IF NOT EXISTS sats_per_usd TEXT"))
@@ -1609,6 +1615,8 @@ def _init_db_unlocked() -> None:
             enrollment_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(enrollments)")).fetchall()}
             conversion_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(conversions)")).fetchall()}
             shopify_delivery_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(shopify_webhook_deliveries)")).fetchall()}
+            if "shopify_order_name" not in shopify_delivery_cols:
+                c.execute(text("ALTER TABLE shopify_webhook_deliveries ADD COLUMN shopify_order_name TEXT"))
             payout_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(payouts)")).fetchall()}
             attempt_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(payment_attempts)")).fetchall()}
             challenge_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(auth_challenges)")).fetchall()}
@@ -1633,7 +1641,7 @@ def _init_db_unlocked() -> None:
                 "rate_fetched_at": "TEXT", "rate_stale": "INTEGER", "cashback_bps": "INTEGER",
                 "reward_sats": "INTEGER", "status": "TEXT DEFAULT 'pending'", "created_at": "TEXT",
                 "destination_revealed_at": "TEXT", "paid_at": "TEXT", "payment_hash": "TEXT",
-                "payment_evidence": "TEXT",
+                "payment_evidence": "TEXT", "declined_at": "TEXT", "decline_reason": "TEXT",
             }
             for column, column_type in cashback_reward_column_ddl.items():
                 if column not in cashback_reward_cols:
@@ -1797,10 +1805,6 @@ def _init_db_unlocked() -> None:
             )
         c.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_cashback_rewards_order_key ON cashback_rewards(order_key) WHERE order_key IS NOT NULL"))
         c.execute(text("UPDATE cashback_rewards SET order_total_decimal=CAST(order_total AS TEXT) WHERE order_total_decimal IS NULL AND order_total IS NOT NULL"))
-        c.execute(text("""
-            UPDATE cashback_campaigns
-            SET committed_sats=(SELECT COALESCE(SUM(r.reward_sats),0) FROM cashback_rewards r WHERE r.campaign_id=cashback_campaigns.id)
-        """))
         c.execute(text("""
             UPDATE cashback_claims
             SET consumed_at=COALESCE(consumed_at, (SELECT MIN(r.created_at) FROM cashback_rewards r WHERE r.claim_id=cashback_claims.id)),
@@ -2137,6 +2141,12 @@ class CashbackPaymentIn(BaseModel):
 
     payment_hash: str = Field(..., min_length=64, max_length=64, pattern=r"^[0-9a-fA-F]{64}$")
     evidence: str = Field(..., min_length=1, max_length=500)
+
+
+class CashbackDeclineIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(..., min_length=1, max_length=300)
 
 
 class MerchantProfileIn(BaseModel):
@@ -3915,7 +3925,7 @@ def record_shopify_webhook_receipt(
 def enqueue_shopify_paid_order(
     *, webhook_id: str, order_key: str, shop: str, topic: str, click_id: str,
     order_total: Decimal, currency: str, merchant_pubkey_hex: str,
-    attribution_code: str | None = None
+    attribution_code: str | None = None, shopify_order_name: str | None = None
 ) -> tuple[dict[str, Any], bool, bool]:
     """Persist a minimal webhook inbox row and atomically claim a new Shopify order."""
     init_db()
@@ -3926,9 +3936,9 @@ def enqueue_shopify_paid_order(
                 """
                 INSERT INTO shopify_webhook_deliveries
                 (webhook_id, order_key, shop_domain, merchant_pubkey_hex, topic, click_id, order_total, order_total_decimal, currency,
-                 status, conversion_id, reward_id, attribution_code, error, created_at, processing_started_at, processed_at)
+                 status, conversion_id, reward_id, attribution_code, shopify_order_name, error, created_at, processing_started_at, processed_at)
                 VALUES (:webhook_id, :order_key, :shop_domain, :merchant_pubkey_hex, :topic, :click_id, :order_total, :order_total_decimal,
-                        :currency, 'pending', NULL, NULL, :attribution_code, NULL, :created_at, NULL, NULL)
+                        :currency, 'pending', NULL, NULL, :attribution_code, :shopify_order_name, NULL, :created_at, NULL, NULL)
                 ON CONFLICT(order_key) DO NOTHING
                 """
             ),
@@ -3943,6 +3953,7 @@ def enqueue_shopify_paid_order(
                 "order_total_decimal": decimal_text(order_total),
                 "currency": currency,
                 "attribution_code": attribution_code,
+                "shopify_order_name": safe_text(shopify_order_name, 100) or None,
                 "created_at": created_at,
             },
         ).rowcount == 1
@@ -3956,8 +3967,19 @@ def enqueue_shopify_paid_order(
                 or row["shop_domain"] != shop
                 or row.get("merchant_pubkey_hex") != merchant_pubkey_hex
                 or (row.get("attribution_code") or None) != (attribution_code or None)
+                or (
+                    bool(row.get("shopify_order_name"))
+                    and row.get("shopify_order_name") != (safe_text(shopify_order_name, 100) or None)
+                )
             )
         )
+        normalized_order_name = safe_text(shopify_order_name, 100) or None
+        if row and not row.get("shopify_order_name") and normalized_order_name and not conflict:
+            c.execute(
+                text("UPDATE shopify_webhook_deliveries SET shopify_order_name=:name WHERE order_key=:key AND shopify_order_name IS NULL"),
+                {"name": normalized_order_name, "key": order_key},
+            )
+            row["shopify_order_name"] = normalized_order_name
         should_process = inserted
         stale_before = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
         stale_processing = bool(
@@ -4259,6 +4281,7 @@ async def shopify_orders_paid_webhook(request: Request, background_tasks: Backgr
         currency=currency,
         merchant_pubkey_hex=store.merchant_pubkey_hex,
         attribution_code=attribution_code,
+        shopify_order_name=safe_text(payload.get("name"), 100) or None,
     )
     if conflict:
         record_shopify_webhook_receipt(webhook_id, shop, topic, "conflict", "duplicate order payload mismatch")
@@ -6660,6 +6683,8 @@ def cashback_express_status(request: Request, code: str, body: CashbackStatusIn)
     reward_status = status_row.get("reward_status")
     if reward_status == "paid":
         public_status = "paid"
+    elif reward_status == "declined":
+        public_status = "declined"
     elif reward_status:
         public_status = "pending"
     elif status_row.get("consumed_at"):
@@ -6834,6 +6859,58 @@ def merchant_mark_cashback_paid(reward_id: str, body: CashbackPaymentIn, request
                 return {"ok": True, "reward_id": reward_id, "status": "paid", "paid_at": current.get("paid_at"), "idempotent": True}
             raise HTTPException(409, "Cashback reward settlement conflict.")
     return {"ok": True, "reward_id": reward_id, "status": "paid", "paid_at": paid_at, "idempotent": False}
+
+
+@app.post("/app/merchant/cashback-rewards/{reward_id}/decline", tags=["Accounts"])
+def merchant_decline_cashback_reward(
+    reward_id: str, body: CashbackDeclineIn, request: Request
+) -> dict[str, Any]:
+    session = require_account_session(request, "merchant")
+    _require_same_origin(request)
+    reason = safe_text(body.reason, 300)
+    if not reason:
+        raise HTTPException(422, "Decline reason is required.")
+    init_db()
+    with engine().connect() as lookup:
+        reward = _owned_cashback_reward(lookup, session, reward_id)
+        campaign_id = str(reward["campaign_id"])
+    with merchant_conversion_lock(f"cashback-campaign:{campaign_id}"):
+        with engine().begin() as connection:
+            reward = _owned_cashback_reward(connection, session, reward_id)
+            if reward["status"] == "declined":
+                if reward.get("decline_reason") == reason:
+                    return {
+                        "ok": True, "reward_id": reward_id, "status": "declined",
+                        "declined_at": reward.get("declined_at"), "idempotent": True,
+                    }
+                raise HTTPException(409, "Cashback reward was declined with a different reason.")
+            if reward["status"] != "pending":
+                raise HTTPException(409, "Only pending cashback rewards can be declined.")
+            declined_at = now()
+            updated = connection.execute(text("""
+                UPDATE cashback_rewards
+                SET status='declined', declined_at=:declined_at, decline_reason=:reason
+                WHERE id=:reward_id AND status='pending'
+            """), {
+                "declined_at": declined_at, "reason": reason, "reward_id": reward_id,
+            }).rowcount
+            if updated != 1:
+                raise HTTPException(409, "Cashback reward decline conflict.")
+            released = connection.execute(text("""
+                UPDATE cashback_campaigns
+                SET committed_sats=CASE
+                    WHEN committed_sats >= :reward_sats THEN committed_sats-:reward_sats
+                    ELSE 0 END
+                WHERE id=:campaign_id AND committed_sats >= :reward_sats
+            """), {
+                "reward_sats": int(reward["reward_sats"]), "campaign_id": campaign_id,
+            }).rowcount
+            if released != 1:
+                raise HTTPException(409, "Cashback campaign budget release conflict.")
+    return {
+        "ok": True, "reward_id": reward_id, "status": "declined",
+        "declined_at": declined_at, "idempotent": False,
+    }
 
 
 def _merchant_requested_program(body: MerchantBootstrapIn) -> dict[str, Any]:

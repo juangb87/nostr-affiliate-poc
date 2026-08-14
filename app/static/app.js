@@ -356,6 +356,35 @@ document.addEventListener("click", async (event) => {
     }
     return;
   }
+  const cashbackDecline = event.target.closest("[data-cashback-decline]");
+  if (cashbackDecline) {
+    const record = cashbackDecline.closest("[data-cashback-reward]");
+    const english = document.documentElement.lang === "en";
+    const reason = window.prompt(english
+      ? "Reason for declining this cashback (for the audit record):"
+      : "Motivo para declinar este cashback (quedará en el registro de auditoría):");
+    if (reason === null) return;
+    if (!reason.trim()) {
+      window.alert(english ? "A reason is required." : "El motivo es obligatorio.");
+      return;
+    }
+    const confirmed = window.confirm(english
+      ? "Decline this pending cashback? This cannot be used to reverse a payment."
+      : "¿Declinar este cashback pendiente? Esta acción no sirve para revertir un pago.");
+    if (!confirmed) return;
+    cashbackDecline.disabled = true;
+    try {
+      await jsonFetch(`/app/merchant/cashback-rewards/${encodeURIComponent(record.dataset.cashbackReward)}/decline`, {
+        method: "POST", body: JSON.stringify({reason: reason.trim()})
+      });
+      window.location.reload();
+    } catch (error) {
+      const globalStatus = document.querySelector("[data-global-status]");
+      if (globalStatus) globalStatus.textContent = readableError(error);
+      cashbackDecline.disabled = false;
+    }
+    return;
+  }
   const cashbackReveal = event.target.closest("[data-cashback-reveal]");
   if (cashbackReveal) {
     const record = cashbackReveal.closest("[data-cashback-reward]");

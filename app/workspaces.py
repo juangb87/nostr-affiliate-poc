@@ -98,11 +98,12 @@ def merchant_workspace_data(
         cashback_rewards = _rows(connection, text("""
             SELECT r.id, r.claim_id, r.campaign_id, r.order_total_decimal, r.currency,
                    r.order_total_sats, r.reward_sats, r.status, r.created_at, r.paid_at,
-                   r.payment_hash,
+                   r.payment_hash, r.declined_at, r.decline_reason, d.shopify_order_name,
                    cl.lightning_address, c.name AS campaign_name
             FROM cashback_rewards r
             JOIN cashback_claims cl ON cl.id=r.claim_id
             JOIN cashback_campaigns c ON c.id=r.campaign_id
+            LEFT JOIN shopify_webhook_deliveries d ON d.reward_id=r.id
             WHERE r.campaign_id IN :cashback_ids ORDER BY r.created_at DESC LIMIT 50
         """).bindparams(bindparam("cashback_ids", expanding=True)), {"cashback_ids": cashback_ids})
         pending_cashback_sats = int(connection.execute(text("""
