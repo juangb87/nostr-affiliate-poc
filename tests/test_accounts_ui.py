@@ -13,6 +13,7 @@ from sqlalchemy import text
 
 
 from app import main
+from app.operational_archive import ArchiveRefused, apply_archive, build_archive_preview
 from app.workspaces import affiliate_workspace_data, merchant_workspace_data
 
 
@@ -543,6 +544,139 @@ def test_campaign_archive_hides_workspace_and_preserves_public_history(tmp_path,
     assert campaign_events == 2
     assert preserved_enrollment == 1
     assert keep["campaign_id"] != canary["campaign_id"]
+
+
+def test_operational_archive_refuses_open_payout_then_preserves_history_and_is_idempotent(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    merchant = Keys.generate()
+    affiliate = Keys.generate()
+    campaign = create_campaign(client, merchant, name="Lightning Koffee Affiliate Program")
+    enrollment = create_enrollment(client, campaign["campaign_id"], affiliate)
+    payout_id = seed_payable_payout(campaign, enrollment, affiliate, amount_sats=210)
+    cutoff = main.now().replace("+00:00", "Z")
+    merchant_hex = merchant.public_key().to_hex()
+
+    with main.engine().connect() as connection:
+        blocked = build_archive_preview(
+            connection, campaign_id=campaign["campaign_id"], expected_merchant_hex=merchant_hex,
+            expected_campaign_name="Lightning Koffee Affiliate Program", cutoff=cutoff,
+        )
+    assert blocked["safe_to_apply"] is False
+    assert blocked["blocking_payouts"][0]["payout_id"] == payout_id
+    with pytest.raises(ArchiveRefused, match="non-terminal payouts"):
+        apply_archive(
+            main.engine(), campaign_id=campaign["campaign_id"], expected_merchant_hex=merchant_hex,
+            expected_campaign_name="Lightning Koffee Affiliate Program", cutoff=cutoff,
+            expected_manifest_sha256=blocked["manifest_sha256"], actor="test",
+        )
+
+    with main.engine().begin() as connection:
+        connection.execute(
+            text("UPDATE payouts SET state='CANCELLED', status='reversed', fee_state='CANCELLED', reserved_sats=0 WHERE id=:id"),
+            {"id": payout_id},
+        )
+        click_id = connection.execute(
+            text("SELECT click_id FROM conversions WHERE id=(SELECT conversion_id FROM payouts WHERE id=:id)"),
+            {"id": payout_id},
+        ).scalar_one()
+        connection.execute(
+            text("""
+                INSERT INTO tracking_events
+                  (id, kind, event_type, ref_code, click_id, payload_json, created_at)
+                VALUES ('track-old', 'browser', 'landing', :ref_code, :click_id, '{}', :created_at)
+            """),
+            {"ref_code": enrollment["ref_code"], "click_id": click_id, "created_at": "2020-01-01T00:00:00+00:00"},
+        )
+
+    with main.engine().connect() as connection:
+        preview = build_archive_preview(
+            connection, campaign_id=campaign["campaign_id"], expected_merchant_hex=merchant_hex,
+            expected_campaign_name="Lightning Koffee Affiliate Program", cutoff=cutoff,
+        )
+    assert preview["safe_to_apply"] is True
+    assert preview["counts"] == {
+        "clicks": 1, "conversions": 1, "tracking_events": 1, "payouts": 1,
+        "payment_attempts": 0, "ledger_entries": 2, "reversals": 0,
+    }
+
+    login(client, merchant, "merchant")
+    before = client.get("/app/merchant?view=activity")
+    assert before.status_code == 200
+    assert "210 sats" in before.text
+
+    applied = apply_archive(
+        main.engine(), campaign_id=campaign["campaign_id"], expected_merchant_hex=merchant_hex,
+        expected_campaign_name="Lightning Koffee Affiliate Program", cutoff=cutoff,
+        expected_manifest_sha256=preview["manifest_sha256"], actor="test",
+    )
+    assert applied["duplicate"] is False
+    repeated = apply_archive(
+        main.engine(), campaign_id=campaign["campaign_id"], expected_merchant_hex=merchant_hex,
+        expected_campaign_name="Lightning Koffee Affiliate Program", cutoff=cutoff,
+        expected_manifest_sha256=preview["manifest_sha256"], actor="test",
+    )
+    assert repeated["duplicate"] is True
+    assert repeated["batch_id"] == applied["batch_id"]
+
+    after = client.get("/app/merchant?view=activity")
+    assert after.status_code == 200
+    assert "210 sats" not in after.text
+    public_history = client.get(f"/campaigns/{campaign['campaign_id']}/summary")
+    assert public_history.status_code == 200
+    assert public_history.json()["totals"]["clicks"] == 1
+    assert public_history.json()["totals"]["conversions"] == 1
+    with main.engine().connect() as connection:
+        preserved = connection.execute(
+            text("""
+                SELECT v.merchant_archived_at, v.archive_batch_id, p.state,
+                       (SELECT COUNT(*) FROM clicks WHERE archive_batch_id=:batch_id) AS clicks,
+                       (SELECT COUNT(*) FROM tracking_events WHERE archive_batch_id=:batch_id) AS events
+                FROM conversions v JOIN payouts p ON p.conversion_id=v.id
+                WHERE p.id=:payout_id
+            """),
+            {"payout_id": payout_id, "batch_id": applied["batch_id"]},
+        ).one()._mapping
+        batch_count = connection.execute(
+            text("SELECT COUNT(*) FROM operational_archive_batches WHERE id=:id"),
+            {"id": applied["batch_id"]},
+        ).scalar_one()
+    assert preserved["merchant_archived_at"]
+    assert preserved["archive_batch_id"] == applied["batch_id"]
+    assert preserved["state"] == "CANCELLED"
+    assert preserved["clicks"] == 1
+    assert preserved["events"] == 1
+    assert batch_count == 1
+
+
+def test_operational_archive_rejects_identity_name_and_manifest_drift(tmp_path, monkeypatch):
+    client = configured_client(tmp_path, monkeypatch)
+    merchant = Keys.generate()
+    campaign = create_campaign(client, merchant, name="Lightning Koffee Affiliate Program")
+    cutoff = main.now()
+    merchant_hex = merchant.public_key().to_hex()
+    with main.engine().connect() as connection:
+        with pytest.raises(ArchiveRefused, match="owner"):
+            build_archive_preview(
+                connection, campaign_id=campaign["campaign_id"], expected_merchant_hex="00" * 32,
+                expected_campaign_name="Lightning Koffee Affiliate Program", cutoff=cutoff,
+            )
+        with pytest.raises(ArchiveRefused, match="name"):
+            build_archive_preview(
+                connection, campaign_id=campaign["campaign_id"], expected_merchant_hex=merchant_hex,
+                expected_campaign_name="Wrong campaign", cutoff=cutoff,
+            )
+        preview = build_archive_preview(
+            connection, campaign_id=campaign["campaign_id"], expected_merchant_hex=merchant_hex,
+            expected_campaign_name="Lightning Koffee Affiliate Program", cutoff=cutoff,
+        )
+    assert preview["safe_to_apply"] is True
+    with pytest.raises(ArchiveRefused, match="candidate set changed"):
+        apply_archive(
+            main.engine(), campaign_id=campaign["campaign_id"], expected_merchant_hex=merchant_hex,
+            expected_campaign_name="Lightning Koffee Affiliate Program", cutoff=cutoff,
+            expected_manifest_sha256="0" * 64, actor="test",
+        )
+
 
 
 def test_ops_is_allowlisted_and_dashboard_redirects(tmp_path, monkeypatch):

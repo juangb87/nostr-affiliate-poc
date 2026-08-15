@@ -64,7 +64,7 @@ def merchant_workspace_data(
         SELECT c.*, mp.logo_url, mp.display_name, mp.tagline,
           (SELECT COUNT(*) FROM enrollments e WHERE e.campaign_id=c.id AND e.status='approved') AS affiliates,
           (SELECT COUNT(*) FROM enrollments e WHERE e.campaign_id=c.id AND e.status='pending') AS pending_affiliates,
-          (SELECT COUNT(*) FROM conversions v WHERE v.campaign_id=c.id) AS conversions
+          (SELECT COUNT(*) FROM conversions v WHERE v.campaign_id=c.id AND v.merchant_archived_at IS NULL) AS conversions
         FROM campaigns c
         LEFT JOIN merchant_profiles mp ON mp.merchant_pubkey_hex=c.merchant_pubkey_hex
         WHERE c.archived_at IS NULL
@@ -125,7 +125,7 @@ def merchant_workspace_data(
             SELECT v.id, v.campaign_id, v.order_total, v.currency, v.commission_sats,
                    v.status, v.created_at, c.name AS campaign_name
             FROM conversions v JOIN campaigns c ON c.id=v.campaign_id
-            WHERE v.campaign_id IN :campaign_ids
+            WHERE v.campaign_id IN :campaign_ids AND v.merchant_archived_at IS NULL
             ORDER BY v.created_at DESC LIMIT 30
             """
         ).bindparams(bindparam("campaign_ids", expanding=True))
@@ -138,7 +138,7 @@ def merchant_workspace_data(
             FROM payouts p
             JOIN conversions v ON v.id=p.conversion_id
             JOIN campaigns c ON c.id=v.campaign_id
-            WHERE v.campaign_id IN :campaign_ids
+            WHERE v.campaign_id IN :campaign_ids AND v.merchant_archived_at IS NULL
             ORDER BY p.created_at DESC LIMIT 30
             """
         ).bindparams(bindparam("campaign_ids", expanding=True))
@@ -148,7 +148,7 @@ def merchant_workspace_data(
             SELECT cl.id, cl.ref_code, cl.affiliate_pubkey, cl.landing_url, cl.created_at,
                    c.name AS campaign_name
             FROM clicks cl JOIN campaigns c ON c.id=cl.campaign_id
-            WHERE cl.campaign_id IN :campaign_ids
+            WHERE cl.campaign_id IN :campaign_ids AND cl.merchant_archived_at IS NULL
             ORDER BY cl.created_at DESC LIMIT 50
             """
         ).bindparams(bindparam("campaign_ids", expanding=True))
@@ -169,6 +169,7 @@ def merchant_workspace_data(
             FROM shopify_webhook_deliveries d
             JOIN conversions v ON v.id=d.conversion_id
             WHERE d.status='processed' AND v.status='approved' AND v.campaign_id IN :campaign_ids
+              AND v.merchant_archived_at IS NULL
             ORDER BY d.created_at
             """
         ).bindparams(bindparam("campaign_ids", expanding=True))
@@ -188,19 +189,22 @@ def merchant_workspace_data(
             """
             SELECT
               (SELECT COUNT(DISTINCT e.affiliate_pubkey_hex) FROM enrollments e WHERE e.campaign_id IN :campaign_ids AND e.status='approved') AS affiliates,
-              (SELECT COUNT(*) FROM clicks cl WHERE cl.campaign_id IN :campaign_ids) AS clicks,
-              (SELECT COUNT(*) FROM conversions v WHERE v.campaign_id IN :campaign_ids AND v.status='approved') AS conversions,
-              (SELECT COALESCE(SUM(v.commission_sats),0) FROM conversions v WHERE v.campaign_id IN :campaign_ids AND v.status='approved') AS commission_sats,
+              (SELECT COUNT(*) FROM clicks cl WHERE cl.campaign_id IN :campaign_ids AND cl.merchant_archived_at IS NULL) AS clicks,
+              (SELECT COUNT(*) FROM conversions v WHERE v.campaign_id IN :campaign_ids AND v.status='approved' AND v.merchant_archived_at IS NULL) AS conversions,
+              (SELECT COALESCE(SUM(v.commission_sats),0) FROM conversions v WHERE v.campaign_id IN :campaign_ids AND v.status='approved' AND v.merchant_archived_at IS NULL) AS commission_sats,
               (SELECT COUNT(*) FROM payouts p JOIN conversions v ON v.id=p.conversion_id
-                 WHERE v.campaign_id IN :campaign_ids AND p.state IN ('PAYABLE','ON_HOLD','FAILED','UNKNOWN')) AS actionable_payouts
+                 WHERE v.campaign_id IN :campaign_ids AND v.merchant_archived_at IS NULL
+                   AND p.state IN ('PAYABLE','ON_HOLD','FAILED','UNKNOWN')) AS actionable_payouts
             """
         ).bindparams(bindparam("campaign_ids", expanding=True))
         totals = dict(connection.execute(aggregate_stmt, {"campaign_ids": campaign_ids}).one()._mapping)
         tracking_stmt = text(
             """
             SELECT COUNT(*) FROM tracking_events t
-            WHERE t.ref_code IN (SELECT e.ref_code FROM enrollments e WHERE e.campaign_id IN :campaign_ids)
-               OR t.click_id IN (SELECT cl.id FROM clicks cl WHERE cl.campaign_id IN :campaign_ids)
+            WHERE t.merchant_archived_at IS NULL AND (
+              t.ref_code IN (SELECT e.ref_code FROM enrollments e WHERE e.campaign_id IN :campaign_ids)
+              OR t.click_id IN (SELECT cl.id FROM clicks cl WHERE cl.campaign_id IN :campaign_ids)
+            )
             """
         ).bindparams(bindparam("campaign_ids", expanding=True))
         tracking_events = int(connection.execute(tracking_stmt, {"campaign_ids": campaign_ids}).scalar_one())
