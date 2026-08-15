@@ -1287,6 +1287,7 @@ def _init_db_unlocked() -> None:
         max_reward_sats INTEGER,
         status TEXT NOT NULL DEFAULT 'active',
         archived_at TEXT,
+        archive_batch_id TEXT,
         created_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS cashback_claims (
@@ -1299,9 +1300,12 @@ def _init_db_unlocked() -> None:
         expires_at TEXT NOT NULL,
         destination_revealed_at TEXT,
         consumed_at TEXT,
-        consumed_order_key TEXT
+        consumed_order_key TEXT,
+        merchant_archived_at TEXT,
+        archive_batch_id TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_cashback_claims_campaign ON cashback_claims(campaign_id, created_at);
+
     CREATE TABLE IF NOT EXISTS cashback_rewards (
         id TEXT PRIMARY KEY,
         order_key TEXT UNIQUE NOT NULL,
@@ -1328,6 +1332,23 @@ def _init_db_unlocked() -> None:
         payment_evidence TEXT,
         declined_at TEXT,
         decline_reason TEXT
+    );
+    CREATE TABLE IF NOT EXISTS cashback_archive_batches (
+        id TEXT PRIMARY KEY,
+        operation TEXT NOT NULL,
+        campaign_id TEXT NOT NULL,
+        merchant_pubkey_hex TEXT NOT NULL,
+        campaign_name TEXT NOT NULL,
+        expected_campaign_status TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        actor TEXT NOT NULL,
+        manifest_sha256 TEXT UNIQUE NOT NULL,
+        manifest_json TEXT NOT NULL,
+        claim_count INTEGER NOT NULL,
+        reward_count INTEGER NOT NULL,
+        delivery_count INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        applied_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS shopify_webhook_receipts (
         webhook_id TEXT PRIMARY KEY,
@@ -1572,11 +1593,14 @@ def _init_db_unlocked() -> None:
             c.execute(text(stmt))
         if database_url().startswith("postgresql"):
             c.execute(text("ALTER TABLE cashback_campaigns ADD COLUMN IF NOT EXISTS committed_sats INTEGER NOT NULL DEFAULT 0"))
+            c.execute(text("ALTER TABLE cashback_campaigns ADD COLUMN IF NOT EXISTS archive_batch_id TEXT"))
             c.execute(text("ALTER TABLE cashback_claims ADD COLUMN IF NOT EXISTS destination_revealed_at TEXT"))
             c.execute(text("ALTER TABLE cashback_claims ADD COLUMN IF NOT EXISTS consumed_at TEXT"))
             c.execute(text("ALTER TABLE cashback_claims ADD COLUMN IF NOT EXISTS consumed_order_key TEXT"))
             c.execute(text("ALTER TABLE cashback_claims ADD COLUMN IF NOT EXISTS status_token_hash TEXT"))
             c.execute(text("ALTER TABLE cashback_claims ADD COLUMN IF NOT EXISTS status_access_expires_at TEXT"))
+            c.execute(text("ALTER TABLE cashback_claims ADD COLUMN IF NOT EXISTS merchant_archived_at TEXT"))
+            c.execute(text("ALTER TABLE cashback_claims ADD COLUMN IF NOT EXISTS archive_batch_id TEXT"))
             cashback_reward_column_ddl = {
                 "order_key": "TEXT", "claim_id": "TEXT", "campaign_id": "TEXT",
                 "merchant_pubkey_hex": "TEXT", "order_total": "DOUBLE PRECISION",
@@ -1663,9 +1687,11 @@ def _init_db_unlocked() -> None:
             cashback_reward_cols = {r._mapping["name"] for r in c.execute(text("PRAGMA table_info(cashback_rewards)")).fetchall()}
             if "committed_sats" not in cashback_campaign_cols:
                 c.execute(text("ALTER TABLE cashback_campaigns ADD COLUMN committed_sats INTEGER NOT NULL DEFAULT 0"))
+            if "archive_batch_id" not in cashback_campaign_cols:
+                c.execute(text("ALTER TABLE cashback_campaigns ADD COLUMN archive_batch_id TEXT"))
             for column in (
                 "destination_revealed_at", "consumed_at", "consumed_order_key",
-                "status_token_hash", "status_access_expires_at",
+                "status_token_hash", "status_access_expires_at", "merchant_archived_at", "archive_batch_id",
             ):
                 if column not in cashback_claim_cols:
                     c.execute(text(f"ALTER TABLE cashback_claims ADD COLUMN {column} TEXT"))
@@ -1764,6 +1790,7 @@ def _init_db_unlocked() -> None:
         c.execute(text("CREATE INDEX IF NOT EXISTS idx_clicks_merchant_archive ON clicks(campaign_id, merchant_archived_at, created_at)"))
         c.execute(text("CREATE INDEX IF NOT EXISTS idx_conversions_merchant_archive ON conversions(campaign_id, merchant_archived_at, created_at)"))
         c.execute(text("CREATE INDEX IF NOT EXISTS idx_tracking_merchant_archive ON tracking_events(click_id, merchant_archived_at, created_at)"))
+        c.execute(text("CREATE INDEX IF NOT EXISTS idx_cashback_claims_archive ON cashback_claims(campaign_id, merchant_archived_at, created_at)"))
         for store in shopify_store_configs().values():
             c.execute(
                 text(
@@ -2101,6 +2128,7 @@ def cleanup_expired_cashback_claims(batch_size: int = 500) -> int:
                 SELECT cl.id
                 FROM cashback_claims cl
                 WHERE COALESCE(cl.status_access_expires_at, cl.expires_at) < :cutoff
+                  AND cl.merchant_archived_at IS NULL
                   AND NOT EXISTS (
                       SELECT 1 FROM cashback_rewards reward WHERE reward.claim_id=cl.id
                   )
@@ -4121,6 +4149,7 @@ def _process_cashback_reward_locked(
             return existing
         row = asdict(connection.execute(text("""
             SELECT cl.id AS claim_id, cl.expires_at, cl.consumed_at, cl.consumed_order_key,
+                   cl.merchant_archived_at AS claim_archived_at,
                    c.id AS campaign_id, c.merchant_pubkey_hex, c.cashback_bps,
                    c.short_code, c.status, c.archived_at, c.max_reward_sats, c.budget_sats,
                    c.committed_sats
@@ -4131,6 +4160,8 @@ def _process_cashback_reward_locked(
             raise HTTPException(404, "cashback claim not found")
         if row.get("consumed_at"):
             raise HTTPException(409, "cashback claim already funded another order")
+        if row.get("claim_archived_at"):
+            raise HTTPException(409, "cashback claim is archived")
         if row["merchant_pubkey_hex"] != authorized_merchant_hex:
             raise HTTPException(403, "cashback campaign belongs to another merchant")
         if row["status"] != "active" or row.get("archived_at"):
@@ -4151,13 +4182,14 @@ def _process_cashback_reward_locked(
             UPDATE cashback_campaigns
             SET committed_sats=committed_sats+:reward_sats
             WHERE id=:campaign_id
+              AND status='active' AND archived_at IS NULL
               AND (budget_sats IS NULL OR committed_sats+:reward_sats <= budget_sats)
         """), {"reward_sats": reward_sats, "campaign_id": row["campaign_id"]}).rowcount
         if reserved != 1:
             raise HTTPException(409, "cashback campaign budget exhausted")
         consumed = connection.execute(text("""
             UPDATE cashback_claims SET consumed_at=:consumed_at, consumed_order_key=:order_key
-            WHERE id=:claim_id AND consumed_at IS NULL
+            WHERE id=:claim_id AND consumed_at IS NULL AND merchant_archived_at IS NULL
         """), {"consumed_at": created_at, "order_key": order_key, "claim_id": claim_id}).rowcount
         if consumed != 1:
             raise HTTPException(409, "cashback claim already funded another order")
@@ -6817,6 +6849,7 @@ def merchant_reveal_cashback_claim_destination(claim_id: str, request: Request) 
             FROM cashback_claims cl
             JOIN cashback_campaigns c ON c.id=cl.campaign_id
             WHERE cl.id=:claim_id AND c.archived_at IS NULL
+              AND cl.merchant_archived_at IS NULL
         """), {"claim_id": claim_id}).fetchone())
         if not claim or not _merchant_session_owns(connection, session, claim["merchant_pubkey_hex"]):
             raise HTTPException(404, "Cashback click not found.")

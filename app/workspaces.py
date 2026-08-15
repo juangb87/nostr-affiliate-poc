@@ -75,7 +75,7 @@ def merchant_workspace_data(
     campaigns = _rows(connection, campaign_stmt, {"identities": identity_list})
     cashback_stmt = text("""
         SELECT c.*, mp.logo_url, mp.display_name, mp.tagline,
-          (SELECT COUNT(*) FROM cashback_claims cl WHERE cl.campaign_id=c.id) AS claims,
+          (SELECT COUNT(*) FROM cashback_claims cl WHERE cl.campaign_id=c.id AND cl.merchant_archived_at IS NULL) AS claims,
           (SELECT COUNT(*) FROM cashback_rewards r WHERE r.campaign_id=c.id) AS rewards
         FROM cashback_campaigns c
         LEFT JOIN merchant_profiles mp ON mp.merchant_pubkey_hex=c.merchant_pubkey_hex
@@ -93,7 +93,8 @@ def merchant_workspace_data(
             SELECT cl.id, cl.campaign_id, cl.lightning_address, cl.created_at, cl.expires_at,
                    cl.consumed_at, c.name AS campaign_name
             FROM cashback_claims cl JOIN cashback_campaigns c ON c.id=cl.campaign_id
-            WHERE cl.campaign_id IN :cashback_ids ORDER BY cl.created_at DESC LIMIT 50
+            WHERE cl.campaign_id IN :cashback_ids AND cl.merchant_archived_at IS NULL
+            ORDER BY cl.created_at DESC LIMIT 50
         """).bindparams(ids_param), {"cashback_ids": cashback_ids})
         cashback_rewards = _rows(connection, text("""
             SELECT r.id, r.claim_id, r.campaign_id, r.order_total_decimal, r.currency,
