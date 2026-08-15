@@ -6,7 +6,7 @@
   <meta name="referrer" content="no-referrer">
   <meta name="robots" content="noindex,nofollow">
   <title>{{ campaign.name }} · {% if language == 'en' %}Cashback status{% else %}Estado del cashback{% endif %}</title>
-  <link rel="stylesheet" href="/static/cashback-express.css?v=20260805-continue1">
+  <link rel="stylesheet" href="/static/cashback-express.css?v=20260815-order1">
 </head>
 <body data-cashback-status-page>
 <main class="cashback-shell status-shell">
@@ -34,6 +34,7 @@
       </div>
       <dl class="status-details">
         <div><dt><span lang="es">Destino</span><span lang="en">Destination</span></dt><dd id="status-address"></dd></div>
+        <div id="status-order-row" hidden><dt><span lang="es">Orden</span><span lang="en">Order</span></dt><dd id="status-order"></dd></div>
         <div><dt><span lang="es">Cashback</span><span lang="en">Cashback</span></dt><dd id="status-reward"></dd></div>
         <div><dt><span lang="es">Activado</span><span lang="en">Activated</span></dt><dd id="status-created"></dd></div>
         <div><dt id="status-date-label"><span lang="es">Ventana hasta</span><span lang="en">Window until</span></dt><dd id="status-date"></dd></div>
@@ -58,6 +59,6 @@
     <p class="privacy-note"><span lang="es">Tu Dirección Lightning no se usa como búsqueda pública. El acceso depende de un código aleatorio guardado en este dispositivo.</span><span lang="en">Your Lightning Address is not used as a public lookup. Access relies on a random code stored on this device.</span></p>
   </section>
 </main>
-<script src="/static/cashback-express.js?v=20260813-declined1" defer></script>
+<script src="/static/cashback-express.js?v=20260815-order1" defer></script>
 </body>
 </html>

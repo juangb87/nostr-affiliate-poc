@@ -185,6 +185,11 @@
     document.getElementById('status-title').textContent = stateCopy[0];
     document.getElementById('status-copy').textContent = stateCopy[1];
     document.getElementById('status-address').textContent = currentResult.lightning_address_masked;
+    const orderRow = document.getElementById('status-order-row');
+    const orderReference = typeof currentResult.order_reference === 'string'
+      ? currentResult.order_reference.trim() : '';
+    document.getElementById('status-order').textContent = orderReference;
+    orderRow.hidden = !orderReference;
     document.getElementById('status-reward').textContent = currentResult.reward_sats == null
       ? copy.noReward : copy.sats(currentResult.reward_sats);
     document.getElementById('status-created').textContent = formatDate(currentResult.created_at);

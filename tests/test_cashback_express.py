@@ -256,6 +256,11 @@ def test_private_cashback_status_lifecycle_uses_capability_token_not_address(tmp
     assert page.status_code == 200
     assert "Check your cashback" in page.text
     assert "Dirección Lightning" in page.text
+    assert "<span lang=\"es\">Orden</span><span lang=\"en\">Order</span>" in page.text
+    assert 'id="status-order-row"' in page.text
+    assert 'id="status-order"' in page.text
+    assert '/static/cashback-express.css?v=20260815-order1' in page.text
+    assert '/static/cashback-express.js?v=20260815-order1' in page.text
     assert "buyer@wallet.example" not in page.text
     assert page.headers["cache-control"] == "no-store"
     assert page.headers["referrer-policy"] == "no-referrer"
@@ -467,8 +472,13 @@ def test_shopify_cashback_reward_is_idempotent_conflict_safe_and_tenant_scoped(t
     login(client, merchant)
     campaign = create_cashback(client, merchant, cashback_percent="10").json()
     monkeypatch.setattr(main, "validate_lightning_address", lambda address: {"callback": "ok"})
-    claimed = client.post(f"/x/{campaign['code']}/claim", json={"lightning_address": "buyer@wallet.example"}, follow_redirects=False)
-    click_id = parse_qs(urlparse(claimed.headers["location"]).query)["mrt_click_id"][0]
+    claimed = client.post(
+        f"/x/{campaign['code']}/claim?response=json",
+        json={"lightning_address": "buyer@wallet.example"},
+    )
+    assert claimed.status_code == 200
+    click_id = parse_qs(urlparse(claimed.json()["redirect_url"]).query)["mrt_click_id"][0]
+    status_token = claimed.json()["status_token"]
     payload = {
         "id": 101,
         "name": "#1060",
@@ -497,6 +507,13 @@ def test_shopify_cashback_reward_is_idempotent_conflict_safe_and_tenant_scoped(t
         delivery = connection.execute(text("SELECT * FROM shopify_webhook_deliveries")).mappings().one()
         assert delivery["shopify_order_name"] == "#1060"
         assert delivery["reward_id"] == reward["id"] and delivery["conversion_id"] is None
+    private_status = client.post(
+        f"/x/{campaign['code']}/check", json={"token": status_token}
+    )
+    assert private_status.status_code == 200
+    assert private_status.json()["order_reference"] == "#1060"
+    assert "order_key" not in private_status.json()
+    assert str(payload["id"]) not in json.dumps(private_status.json())
     duplicate = client.post("/shopify/webhooks/orders-paid", content=raw, headers=signed_headers(raw, "cashback-wh-2"))
     assert duplicate.json()["duplicate"] is True
     assert duplicate.json()["reward_id"] == reward["id"]

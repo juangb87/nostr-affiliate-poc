@@ -6786,10 +6786,12 @@ def cashback_express_status(request: Request, code: str, body: CashbackStatusIn)
         status_row = asdict(connection.execute(text("""
             SELECT cl.lightning_address, cl.created_at, cl.expires_at, cl.consumed_at,
                    r.reward_sats, r.status AS reward_status, r.created_at AS reward_created_at,
-                   r.paid_at, r.payment_hash
+                   r.paid_at, r.payment_hash,
+                   d.shopify_order_name AS order_reference
             FROM cashback_claims cl
             JOIN cashback_campaigns c ON c.id=cl.campaign_id
             LEFT JOIN cashback_rewards r ON r.claim_id=cl.id
+            LEFT JOIN shopify_webhook_deliveries d ON d.order_key=r.order_key
             WHERE c.id=:campaign_id AND c.short_code=:code
               AND cl.status_token_hash=:token_hash
               AND cl.status_access_expires_at IS NOT NULL
@@ -6829,6 +6831,9 @@ def cashback_express_status(request: Request, code: str, body: CashbackStatusIn)
         "reward_sats": status_row.get("reward_sats"),
         "paid_at": status_row.get("paid_at"),
     }
+    order_reference = safe_text(status_row.get("order_reference"), 100)
+    if order_reference:
+        payload["order_reference"] = order_reference
     if public_status == "paid":
         payload["payment_evidence"] = "merchant_attested"
         payload["payment_hash_short"] = (
