@@ -6,7 +6,7 @@
   <meta name="referrer" content="no-referrer">
   <meta name="robots" content="noindex,nofollow">
   <title>{{ campaign.name }} · Cashback Express</title>
-  <link rel="stylesheet" href="/static/cashback-express.css?v=20260805-continue1">
+  <link rel="stylesheet" href="/static/cashback-express.css?v=20260815-claim1">
 </head>
 <body>
 <main class="cashback-shell">
@@ -17,21 +17,20 @@
   </header>
   <section class="cashback-card">
     <p class="eyebrow"><span lang="es">Cashback Express</span><span lang="en">Cashback Express</span></p>
-    <h1><span lang="es">Recibí <em>{{ campaign.cashback_percent }}%</em> de reembolso en sats.</span><span lang="en">Get <em>{{ campaign.cashback_percent }}%</em> cashback in sats.</span></h1>
-    <p><span lang="es">Ingresá tu Dirección Lightning. Validamos su formato y la guardamos durante la ventana de atribución; nunca la agregamos al enlace de compra.</span><span lang="en">Enter your Lightning Address. We validate its format and retain it for the attribution window; it is never added to your shopping link.</span></p>
+    <h1><span lang="es">Recibí <em>{{ campaign.cashback_percent }}%</em> en sats.</span><span lang="en">Get <em>{{ campaign.cashback_percent }}%</em> back in sats.</span></h1>
+    <p class="intro"><span lang="es">Ingresá tu Lightning Address, activá tu cashback y hacé tu compra.</span><span lang="en">Enter your Lightning Address, activate your cashback, and shop.</span></p>
     <form id="cashback-claim" action="/x/{{ campaign.short_code }}/claim" method="post" novalidate>
-      <label for="lightning-address"><span lang="es">Dirección Lightning</span><span lang="en">Lightning Address</span></label>
-      <input id="lightning-address" type="email" autocomplete="email" inputmode="email" placeholder="vos@wallet.example" required maxlength="320">
-      <button type="submit"><span lang="es">Activar cashback y comprar</span><span lang="en">Activate cashback and shop</span></button>
-      <small id="claim-status" role="status" aria-live="polite"><span lang="es">Sin cuenta. Sin custodia. El pago no es automático en este MVP.</span><span lang="en">No account. No custody. Payment is not automatic in this MVP.</span></small>
+      <label for="lightning-address"><span lang="es">¿Dónde recibís tus sats?</span><span lang="en">Where should we send your sats?</span></label>
+      <input id="lightning-address" type="email" autocomplete="email" inputmode="email" placeholder="name@wallet.com" required maxlength="320">
+      <button type="submit"><span lang="es">Activar y comprar</span><span lang="en">Activate &amp; shop</span> <span aria-hidden="true">→</span></button>
+      <small id="claim-status" role="status" aria-live="polite"><span lang="es">Sin cuenta · Sin custodia</span><span lang="en">No account · Non-custodial</span></small>
     </form>
-    <aside class="skip-cashback">
-      <p><span lang="es">¿No tenés Dirección Lightning o preferís comprar sin cashback?</span><span lang="en">No Lightning Address, or prefer to shop without cashback?</span></p>
+    <nav class="secondary-actions" aria-label="Cashback">
+      <a class="check-link" href="/x/{{ campaign.short_code }}/check"><span lang="es">Ya lo activé · Ver estado</span><span lang="en">Already activated · Check status</span></a>
       <a class="continue-link" href="/x/{{ campaign.short_code }}/continue"><span lang="es">Continuar sin cashback</span><span lang="en">Continue without cashback</span> <span aria-hidden="true">→</span></a>
-    </aside>
-    <a class="check-link" href="/x/{{ campaign.short_code }}/check"><span lang="es">¿Ya activaste tu cashback? Revisar estado</span><span lang="en">Already activated cashback? Check status</span> <span aria-hidden="true">→</span></a>
+    </nav>
   </section>
 </main>
-<script src="/static/cashback-express.js?v=20260813-declined1" defer></script>
+<script src="/static/cashback-express.js?v=20260815-claim1" defer></script>
 </body>
 </html>

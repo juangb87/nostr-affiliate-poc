@@ -140,9 +140,18 @@ def test_public_landing_and_claim_are_private_and_fail_safe(tmp_path, monkeypatc
     page = short_client.get(f"/x/{code}?lang=en")
     assert page.status_code == 200
     assert "Cashback café" in page.text and "7.25%" in page.text
-    assert "Cashback" in page.text and "reembolso" in page.text
-    assert '/static/cashback-express.css?v=20260805-continue1' in page.text
-    assert '/static/cashback-express.js?v=20260813-declined1' in page.text
+    assert "Recibí" in page.text and "Get" in page.text
+    assert "Ingresá tu Lightning Address, activá tu cashback y hacé tu compra." in page.text
+    assert "Enter your Lightning Address, activate your cashback, and shop." in page.text
+    assert 'placeholder="name@wallet.com"' in page.text
+    assert "¿Dónde recibís tus sats?" in page.text
+    assert "Where should we send your sats?" in page.text
+    assert "Sin cuenta · Sin custodia" in page.text
+    assert "No account · Non-custodial" in page.text
+    assert "El pago no es automático en este MVP" not in page.text
+    assert "Payment is not automatic in this MVP" not in page.text
+    assert '/static/cashback-express.css?v=20260815-claim1' in page.text
+    assert '/static/cashback-express.js?v=20260815-claim1' in page.text
     assert f'href="/x/{code}/check"' in page.text
     assert f'href="/x/{code}/continue"' in page.text
     assert "Continuar sin cashback" in page.text
