@@ -53,6 +53,7 @@ from app.account_auth import (
     random_token,
     verify_auth_event,
 )
+from app.account_erasure import ERASURE_MESSAGE, is_nostr_identity_erased, lock_nostr_identity
 from app.i18n import (
     LANGUAGE_COOKIE,
     SUPPORTED_LANGUAGES,
@@ -1513,6 +1514,13 @@ def _init_db_unlocked() -> None:
         updated_at TEXT NOT NULL,
         last_login_at TEXT
     );
+    CREATE TABLE IF NOT EXISTS erased_nostr_identities (
+        identity_hmac TEXT PRIMARY KEY,
+        anonymous_pubkey TEXT UNIQUE NOT NULL,
+        anonymous_pubkey_hex TEXT UNIQUE NOT NULL,
+        erased_at TEXT NOT NULL,
+        reason TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS account_roles (
         account_id TEXT NOT NULL,
         role TEXT NOT NULL,
@@ -2490,6 +2498,12 @@ def _auth_event_challenge(event_json: dict[str, Any]) -> str:
     return values[0]
 
 
+def _reject_erased_identity(c: Any, pubkey_hex: str) -> None:
+    lock_nostr_identity(c, pubkey_hex)
+    if is_nostr_identity_erased(c, pubkey_hex):
+        raise HTTPException(403, ERASURE_MESSAGE)
+
+
 def _grant_role_if_authorized(c: Any, account_id: str, pubkey_hex: str, role: str) -> bool:
     authorized = False
     if role == "affiliate":
@@ -2662,6 +2676,7 @@ def verify_auth_login(body: AuthVerifyIn, response: Response) -> dict[str, Any]:
             )
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
+        _reject_erased_identity(c, identity["hex"])
         consumed = c.execute(
             text("UPDATE auth_challenges SET consumed_at=:now WHERE id=:id AND consumed_at IS NULL"),
             {"now": now(), "id": challenge_row["id"]},
@@ -8131,6 +8146,7 @@ def campaign_join(campaign_id: str, body: CampaignJoinIn, request: Request, resp
                 identity = verify_auth_event(body.event, expected_challenge=challenge, expected_role=expected_role, expected_relay=challenge_row["relay"])
             except ValueError as exc:
                 raise HTTPException(400, str(exc)) from exc
+            _reject_erased_identity(c, identity["hex"])
             if c.engine.dialect.name == "postgresql":
                 c.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"), {"key": f"campaign-state:{campaign_id}"})
                 c.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"), {"key": f"affiliate-enrollment:{campaign_id}:{identity['hex']}"})
@@ -8255,6 +8271,7 @@ def resolve_affiliate_invitation(request: Request, response: Response, body: Aff
 
 
 def _create_affiliate_session(c: Any, identity: dict[str, str]) -> tuple[str, str]:
+    _reject_erased_identity(c, identity["hex"])
     existing = asdict(c.execute(text("SELECT * FROM accounts WHERE nostr_pubkey_hex=:hex"), {"hex": identity["hex"]}).fetchone())
     account_id = existing["id"] if existing else hid("acct")
     if existing and existing.get("status") != "active":
@@ -8337,6 +8354,7 @@ def accept_affiliate_invitation(request: Request, response: Response, body: Affi
     duplicate = False
     with _INVITATION_ACCEPT_LOCK:
         with engine().begin() as c:
+            _reject_erased_identity(c, identity["hex"])
             _lock_affiliate_destination(c, identity["hex"])
             verified_destination = _verified_affiliate_destination(c, identity["hex"])
             if database_url().startswith("postgresql"):
